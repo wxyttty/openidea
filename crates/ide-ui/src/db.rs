@@ -36,6 +36,13 @@ struct RowEditor {
     fields: Vec<(String, Entity<InputState>, bool, bool)>,
 }
 
+struct CellEditor {
+    row: usize,
+    column: String,
+    input: Entity<InputState>,
+    _submit: Subscription,
+}
+
 pub struct DbPanel {
     host: Arc<Host>,
     project: Option<Arc<Project>>,
@@ -54,6 +61,7 @@ pub struct DbPanel {
     mode: Mode,
     table_details: Vec<ColumnInfo>,
     row_editor: Option<RowEditor>,
+    cell_editor: Option<CellEditor>,
     row_editor_row: Option<usize>,
     row_editor_insert: bool,
     result: Option<QueryResult>,
@@ -97,6 +105,7 @@ impl DbPanel {
             mode: Mode::Sql,
             table_details: Vec::new(),
             row_editor: None,
+            cell_editor: None,
             row_editor_row: None,
             row_editor_insert: false,
             result: None,
@@ -507,6 +516,62 @@ impl DbPanel {
         self.row_editor_row = None;
         self.row_editor_insert = true;
         cx.notify();
+    }
+
+    fn open_cell_editor(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only_grid {
+            self.message = Some("Views are read-only in the table editor".into());
+            cx.notify();
+            return;
+        }
+        let Some(result) = self.result.clone() else { return };
+        let Some(column) = result.columns.get(col) else { return };
+        let value = result.rows.get(row).and_then(|row| row.get(col)).cloned().flatten().unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+        let submit = cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.save_cell_editor(cx);
+            }
+        });
+        self.cell_editor = Some(CellEditor { row, column: column.name.clone(), input, _submit: submit });
+        cx.notify();
+        let entity = cx.entity();
+        window.on_next_frame(move |window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                if let Some(editor) = &this.cell_editor {
+                    let handle = editor.input.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+            });
+        });
+    }
+
+    fn save_cell_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.cell_editor.take() else { return };
+        let Some(result) = self.result.clone() else { return };
+        let key: Vec<CellValue> = result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                self.table_details.iter().any(|detail| detail.name == column.name && detail.primary_key)
+            })
+            .map(|(index, column)| CellValue {
+                column: column.name.clone(),
+                value: result.rows.get(editor.row).and_then(|row| row.get(index)).cloned().flatten(),
+            })
+            .collect();
+        if key.is_empty() {
+            self.message = Some("This table has no primary key; cells cannot be edited".into());
+            cx.notify();
+            return;
+        }
+        let text = editor.input.read(cx).value().trim().to_owned();
+        let nullable =
+            self.table_details.iter().find(|column| column.name == editor.column).is_some_and(|column| column.nullable);
+        let value =
+            CellValue { column: editor.column, value: if text.is_empty() && nullable { None } else { Some(text) } };
+        self.apply_row_edit(DbRowEdit::Update { key, values: vec![value] }, cx);
     }
 
     fn row_key(
@@ -995,6 +1060,10 @@ impl Render for DbPanel {
                         Rc::new(cx.processor(|this: &mut Self, index: usize, window, cx| {
                             this.open_row_editor(index, window, cx)
                         }));
+                    let on_cell: Rc<dyn Fn((usize, usize), &mut Window, &mut App)> =
+                        Rc::new(cx.processor(|this: &mut Self, (row, col): (usize, usize), window, cx| {
+                            this.open_cell_editor(row, col, window, cx)
+                        }));
                     let row_list = uniform_list("db-rows", rows.len(), move |range, _window, _cx| {
                         range
                             .map(|index| {
@@ -1008,20 +1077,29 @@ impl Render for DbPanel {
                                     .border_b_1()
                                     .border_color(list_theme.border)
                                     .text_size(px(11.));
-                                for value in row {
+                                for (col_index, value) in row.iter().enumerate() {
                                     let (text, color) = match value {
                                         Some(value) => (value.clone(), list_theme.foreground),
                                         None => ("NULL".to_owned(), list_theme.fg_muted()),
                                     };
-                                    element = element.child(
-                                        div()
-                                            .w(px(CELL_WIDTH))
-                                            .flex_shrink_0()
-                                            .px_2()
-                                            .truncate()
-                                            .text_color(color)
-                                            .child(text),
-                                    );
+                                    let mut cell = div()
+                                        .id(ElementId::Name(format!("db-cell-{index}-{col_index}").into()))
+                                        .w(px(CELL_WIDTH))
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .truncate()
+                                        .text_color(color)
+                                        .child(text);
+                                    if editable {
+                                        let on_cell = on_cell.clone();
+                                        cell = cell.cursor_pointer().on_mouse_down(
+                                            MouseButton::Right,
+                                            move |_: &MouseDownEvent, window, cx| {
+                                                on_cell((index, col_index), window, cx)
+                                            },
+                                        );
+                                    }
+                                    element = element.child(cell);
                                 }
                                 if editable {
                                     let on_row = on_row.clone();
@@ -1296,7 +1374,110 @@ impl Render for DbPanel {
                     .into_any_element(),
             );
         }
-        let overlay = overlay.or(ddl_overlay);
+        let mut cell_overlay = None;
+        if let Some(editor) = self.cell_editor.as_ref() {
+            let cell_hover = theme.list_hover;
+            let column = editor.column.clone();
+            let input = editor.input.clone();
+            let save = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.save_cell_editor(cx));
+            let cancel = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.cell_editor = None;
+                cx.notify();
+            });
+            let backdrop = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
+                this.cell_editor = None;
+                cx.notify();
+            });
+            cell_overlay = Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("db-cell-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .bg(theme.overlay)
+                            .on_mouse_down(MouseButton::Left, backdrop),
+                    )
+                    .child(
+                        div()
+                            .w(px(460.))
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .bg(theme.popover)
+                            .border_1()
+                            .border_color(theme.border_strong())
+                            .rounded(px(8.))
+                            .shadow_xl()
+                            .occlude()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(format!("Edit cell · {column}")),
+                            )
+                            .child(Input::new(&input))
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(theme.fg_muted())
+                                    .child("Right-click a cell to edit it; empty nullable values become NULL."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("db-cell-cancel")
+                                            .h(px(24.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .hover(move |this| this.bg(cell_hover))
+                                            .on_click(cancel)
+                                            .text_size(px(11.))
+                                            .text_color(theme.fg_secondary())
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("db-cell-save")
+                                            .h(px(24.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .bg(theme.primary)
+                                            .hover(move |this| this.opacity(0.9))
+                                            .on_click(save)
+                                            .text_size(px(11.))
+                                            .text_color(theme.primary_foreground)
+                                            .child("Save"),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let overlay = overlay.or(ddl_overlay).or(cell_overlay);
 
         let mut sidebar = div()
             .id("db-sidebar")

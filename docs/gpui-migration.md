@@ -113,6 +113,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Database cell editing: right-clicking the `id` cell of row 0 opened the
+  auto-focused cell editor; replacing `1` with `10` and pressing Enter ran the
+  UPDATE (key `id=1`, value `10`) and SQLite showed `10|alpha|1`.
 - Database views: a SQLite source with `items` + `CREATE VIEW item_names` showed
   `tables=["items"], views=["item_names"]`; clicking the view row logged
   `db: open view item_names` and opened its read-only grid (the + Row button
@@ -388,7 +391,7 @@ Status of the Tauri shell's features in the native app.
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop | P1 (gutter dots, hit counts) |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
 | Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
-| Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit) |
+| Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
