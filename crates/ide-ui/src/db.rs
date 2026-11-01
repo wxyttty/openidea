@@ -12,7 +12,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ide_db::{CellValue, ColumnInfo, DataSource, DbDriver, DbRowEdit, QueryResult, SortKey, TableDetails, TablePage};
+use ide_db::{
+    CellValue, ColumnInfo, DataSource, DbDriver, DbRowEdit, DbTableKind, QueryResult, SortKey, TableDetails, TablePage,
+};
 use ide_host::{Host, Project};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -40,6 +42,8 @@ pub struct DbPanel {
     sources: Vec<DataSource>,
     selected: usize,
     tables: Vec<String>,
+    views: Vec<String>,
+    read_only_grid: bool,
     schemas: Vec<String>,
     current_schema: String,
     expanded_tables: HashSet<String>,
@@ -81,6 +85,8 @@ impl DbPanel {
             sources: Vec::new(),
             selected: 0,
             tables: Vec::new(),
+            views: Vec::new(),
+            read_only_grid: false,
             schemas: Vec::new(),
             current_schema: String::new(),
             expanded_tables: HashSet::new(),
@@ -137,12 +143,9 @@ impl DbPanel {
             let result = async {
                 db.pool(&id).await.map_err(|err| err.to_string())?;
                 let schemas = db.schemas(&id).await.unwrap_or_default();
-                let tables = db
-                    .tables(&id, &schema)
-                    .await
-                    .map(|tables| tables.into_iter().map(|table| table.name).collect::<Vec<_>>())
-                    .map_err(|err| err.to_string())?;
-                Ok::<_, String>((schemas, tables))
+                let infos = db.tables(&id, &schema).await.map_err(|err| err.to_string())?;
+                let (tables, views) = split_relations(infos);
+                Ok::<_, String>((schemas, tables, views))
             }
             .await;
             let _ = tx.unbounded_send(result);
@@ -151,9 +154,10 @@ impl DbPanel {
             while let Some(result) = rx.next().await {
                 let _ = this.update(cx, |this, cx| {
                     match result {
-                        Ok((schemas, tables)) => {
+                        Ok((schemas, tables, views)) => {
                             this.schemas = schemas;
                             this.tables = tables;
+                            this.views = views;
                             this.message = None;
                         }
                         Err(err) => this.message = Some(err.into()),
@@ -248,19 +252,16 @@ impl DbPanel {
         let db = project.db.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
-            let result = db
-                .tables(&id, &schema)
-                .await
-                .map(|tables| tables.into_iter().map(|table| table.name).collect::<Vec<_>>())
-                .map_err(|err| err.to_string());
+            let result = db.tables(&id, &schema).await.map(split_relations).map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.task = Some(cx.spawn(async move |this, cx| {
             while let Some(result) = rx.next().await {
                 let _ = this.update(cx, |this, cx| {
                     match result {
-                        Ok(tables) => {
+                        Ok((tables, views)) => {
                             this.tables = tables;
+                            this.views = views;
                             this.message = Some(format!("schema {}", this.current_schema).into());
                         }
                         Err(err) => this.message = Some(err.into()),
@@ -278,6 +279,7 @@ impl DbPanel {
         }
         self.current_schema = schema;
         self.tables.clear();
+        self.views.clear();
         self.expanded_tables.clear();
         self.table_meta.clear();
         self.mode = Mode::Sql;
@@ -407,6 +409,13 @@ impl DbPanel {
     }
 
     fn open_table(&mut self, name: String, cx: &mut Context<Self>) {
+        self.read_only_grid = false;
+        self.mode = Mode::Table { name, offset: 0, sort: Vec::new() };
+        self.load_page(cx);
+    }
+
+    fn open_view(&mut self, name: String, cx: &mut Context<Self>) {
+        self.read_only_grid = true;
         self.mode = Mode::Table { name, offset: 0, sort: Vec::new() };
         self.load_page(cx);
     }
@@ -435,6 +444,11 @@ impl DbPanel {
     }
 
     fn open_row_editor(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only_grid {
+            self.message = Some("Views are read-only in the table editor".into());
+            cx.notify();
+            return;
+        }
         let Some(result) = self.result.clone() else { return };
         let Some(values) = result.rows.get(row).cloned() else { return };
         let columns: Vec<(String, bool, bool)> = result
@@ -462,6 +476,11 @@ impl DbPanel {
     }
 
     fn open_new_row_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only_grid {
+            self.message = Some("Views are read-only in the table editor".into());
+            cx.notify();
+            return;
+        }
         let Mode::Table { name, .. } = self.mode.clone() else { return };
         let mut columns: Vec<(String, bool, bool)> = self
             .table_details
@@ -663,6 +682,19 @@ impl DbPanel {
     }
 }
 
+fn split_relations(infos: Vec<ide_db::TableInfo>) -> (Vec<String>, Vec<String>) {
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    for info in infos {
+        if matches!(info.kind, DbTableKind::Table) {
+            tables.push(info.name);
+        } else {
+            views.push(info.name);
+        }
+    }
+    (tables, views)
+}
+
 fn csv_field(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -695,6 +727,7 @@ impl Render for DbPanel {
         let list_theme = theme.clone();
         let hover_bg = theme.list_hover;
         let select_theme = theme.clone();
+        let read_only_grid = self.read_only_grid;
         let table_mode = match &self.mode {
             Mode::Table { name, offset, sort } => Some((name.clone(), *offset, sort.clone())),
             Mode::Sql => None,
@@ -714,6 +747,7 @@ impl Render for DbPanel {
             let select = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
                 this.selected = index.min(this.sources.len().saturating_sub(1));
                 this.tables.clear();
+                this.views.clear();
                 this.schemas.clear();
                 this.current_schema.clear();
                 this.expanded_tables.clear();
@@ -806,23 +840,25 @@ impl Render for DbPanel {
                 .child(div().text_size(px(11.)).text_color(theme.foreground).child(name.clone()))
                 .child(div().w(px(60.)).text_size(px(9.5)).text_color(theme.fg_muted()).child("FILTER"))
                 .child(div().flex_1().min_w_0().child(Input::new(&self.filter_input)))
-                .child(
-                    div()
-                        .id("db-new-row")
-                        .h(px(20.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(theme.border)
-                        .hover(move |this| this.bg(hover_bg))
-                        .on_click(new_row)
-                        .text_size(px(10.))
-                        .text_color(theme.fg_secondary())
-                        .child("+ Row"),
-                )
+                .when(!read_only_grid, |this| {
+                    this.child(
+                        div()
+                            .id("db-new-row")
+                            .h(px(20.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(move |this| this.bg(hover_bg))
+                            .on_click(new_row)
+                            .text_size(px(10.))
+                            .text_color(theme.fg_secondary())
+                            .child("+ Row"),
+                    )
+                })
                 .child(
                     div()
                         .id("db-export-csv")
@@ -1583,6 +1619,48 @@ impl Render for DbPanel {
                         );
                     }
                 }
+            }
+        }
+        if !self.views.is_empty() {
+            sidebar = sidebar.child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .pt_2()
+                    .pb(px(2.))
+                    .text_size(px(9.))
+                    .text_color(theme.fg_muted())
+                    .child(format!("VIEWS · {}", self.views.len())),
+            );
+            let view_names = self.views.clone();
+            let view_hover = theme.list_hover;
+            let active_view =
+                if self.read_only_grid { table_mode.as_ref().map(|(name, _, _)| name.clone()) } else { None };
+            for view in view_names {
+                let active = active_view.as_ref() == Some(&view);
+                let pick_name = view.clone();
+                let pick = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    this.open_view(pick_name.clone(), cx);
+                });
+                sidebar = sidebar.child(
+                    div()
+                        .id(ElementId::Name(format!("db-view-{view}").into()))
+                        .h(px(20.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .w_full()
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .when(active, |this| this.bg(theme.list_active).text_color(theme.fg_strong()))
+                        .when(!active, |this| {
+                            this.text_color(theme.fg_secondary()).hover(move |this| this.bg(view_hover))
+                        })
+                        .on_click(pick)
+                        .child(Icon::new(IconName::Eye).xsmall())
+                        .child(div().min_w_0().truncate().child(view)),
+                );
             }
         }
         let body = div().flex_1().min_h_0().flex().flex_row().child(sidebar).child(main_col);
