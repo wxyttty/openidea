@@ -46,6 +46,10 @@ pub struct TerminalPanel {
     project: Option<Arc<ide_host::Project>>,
     sessions: Vec<Session>,
     active: usize,
+    /// Two panes side by side; `input` chooses which one receives keys.
+    split: bool,
+    input: usize,
+    split_index: usize,
     grid: (u16, u16),
     /// Content area (width, height) of the terminal panel, set by the workbench.
     viewport: Rc<Cell<(f32, f32)>>,
@@ -61,6 +65,9 @@ impl TerminalPanel {
             project: None,
             sessions: Vec::new(),
             active: 0,
+            split: false,
+            input: 0,
+            split_index: 0,
             grid: (COLS, ROWS),
             viewport,
             notice: None,
@@ -226,8 +233,32 @@ impl TerminalPanel {
         }
     }
 
+    fn keys_target(&self) -> usize {
+        if self.split { self.input.min(self.sessions.len().saturating_sub(1)) } else { self.active }
+    }
+
+    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split {
+            self.split = false;
+            self.input = self.active;
+        } else {
+            if self.sessions.len() < 2 {
+                self.start(window, cx);
+            }
+            if self.sessions.len() < 2 {
+                return;
+            }
+            self.input = self.active;
+            self.split_index = if self.active == 0 { 1 } else { 0 };
+            self.split = true;
+        }
+        let handle = self.focus_handle.clone();
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get(self.active) else { return };
+        let Some(session) = self.sessions.get(self.keys_target()) else { return };
         let id = session.id;
         let keystroke = &event.keystroke;
         let mut bytes = String::new();
@@ -274,13 +305,36 @@ impl TerminalPanel {
     }
 
     fn scroll(&mut self, lines: i32, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get(self.active) else { return };
+        let target = self.keys_target();
+        let Some(session) = self.sessions.get(target) else { return };
         let Ok(mut parser) = session.parser.lock() else { return };
         let current = parser.screen().scrollback() as i32;
         let max = parser.screen().scrollback_capacity() as i32;
         let next = (current + lines).clamp(0, max) as usize;
         parser.screen_mut().set_scrollback(next);
         cx.notify();
+    }
+}
+
+impl TerminalPanel {
+    /// The rendered VT rows and scrollback depth of one session.
+    fn pane_rows(
+        &self,
+        index: usize,
+        theme: &gpui_kit::component::Theme,
+        row_height: f32,
+    ) -> Option<(Vec<AnyElement>, usize, bool)> {
+        let session = self.sessions.get(index)?;
+        let parser = session.parser.lock().ok()?;
+        let screen = parser.screen();
+        let (row_count, col_count) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let cursor = if screen.hide_cursor() { None } else { Some((cursor_row, cursor_col)) };
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(row_count.get() as usize);
+        for row in 0..row_count.get() {
+            rows.push(render_row(screen, row, col_count.get(), cursor, theme, row_height));
+        }
+        Some((rows, screen.scrollback(), !session.exited.load(Ordering::Acquire)))
     }
 }
 
@@ -304,28 +358,58 @@ impl Render for TerminalPanel {
             if viewport_w > 0. { (viewport_w, viewport_h) } else { (fallback.width.as_f32() - 340., 366.) };
         let avail_w = (viewport_w - 10.).max(160.0_f32);
         let avail_h = (viewport_h - 26. - 8.).max(80.0_f32);
+        let pane_w = if self.split { ((avail_w - 10.) / 2.).max(160.0_f32) } else { avail_w };
         let cell_w = (font_size * 0.6019_f32).max(4.0_f32);
-        let cols = ((avail_w / cell_w).floor() as u16).clamp(20, 300);
+        let cols = ((pane_w / cell_w).floor() as u16).clamp(20, 300);
         let rows_count = ((avail_h / row_height).floor() as u16).clamp(4, 120);
         self.resize(cols, rows_count);
 
-        let (rows, scrollback) = match self.sessions.get(self.active) {
-            Some(session) => {
-                let Ok(parser) = session.parser.lock() else {
-                    return div().into_any_element();
-                };
-                let screen = parser.screen();
-                let (row_count, col_count) = screen.size();
-                let (cursor_row, cursor_col) = screen.cursor_position();
-                let cursor = if screen.hide_cursor() { None } else { Some((cursor_row, cursor_col)) };
-                let mut rows: Vec<AnyElement> = Vec::with_capacity(row_count.get() as usize);
-                for row in 0..row_count.get() {
-                    rows.push(render_row(screen, row, col_count.get(), cursor, &theme, row_height));
-                }
-                (rows, screen.scrollback())
-            }
-            None => (Vec::new(), 0),
+        let sessions_len = self.sessions.len();
+        let pane_indexes: Vec<usize> = if sessions_len == 0 {
+            Vec::new()
+        } else if self.split {
+            let second = self.split_index.min(sessions_len.saturating_sub(1));
+            vec![self.active, second]
+        } else {
+            vec![self.active]
         };
+        let mut panes: Vec<AnyElement> = Vec::new();
+        let mut scrollback = 0;
+        let input_index = self.keys_target();
+        for (position, index) in pane_indexes.into_iter().enumerate() {
+            let Some((rows, pane_scrollback, _running)) = self.pane_rows(index, &theme, row_height) else { continue };
+            scrollback = scrollback.max(pane_scrollback);
+            let focused = self.split && input_index == index;
+            let pick = cx.listener(move |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                this.input = index;
+                let handle = this.focus_handle.clone();
+                window.focus(&handle, cx);
+                cx.notify();
+            });
+            let wheel = cx.listener(move |this: &mut Self, event: &ScrollEvent, _window, cx| {
+                this.input = index;
+                let lines = match event.delta {
+                    ScrollDelta::Lines(point) => point.y as i32,
+                    ScrollDelta::Pixels(point) => (point.y / px(row_height)).round() as i32,
+                };
+                this.scroll(-lines, cx);
+            });
+            let mut pane = div()
+                .id(ElementId::Name(format!("terminal-pane-{position}-{index}").into()))
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .p_1()
+                .overflow_hidden()
+                .when(focused, |this| this.border_1().border_color(theme.accent))
+                .on_mouse_down(MouseButton::Left, pick)
+                .on_scroll(wheel)
+                .child(div().flex().flex_col().children(rows));
+            if sessions_len == 1 {
+                pane = pane.child(div().flex_1());
+            }
+            panes.push(pane.into_any_element());
+        }
         let running = self.sessions.get(self.active).is_some_and(|session| !session.exited.load(Ordering::Acquire));
         let title: SharedString =
             self.sessions.get(self.active).map(|session| session.title.clone()).unwrap_or_else(|| "Terminal".into());
@@ -336,6 +420,7 @@ impl Render for TerminalPanel {
             .map(|(index, session)| (index, session.title.clone(), index == self.active))
             .collect();
         let restart = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.restart(window, cx));
+        let split = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.toggle_split(window, cx));
         let kill = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.kill(cx));
         let new_tab = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.start(window, cx));
         let start = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.ensure(window, cx));
@@ -360,6 +445,7 @@ impl Render for TerminalPanel {
         for (index, label, active) in tabs {
             let activate = cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
                 this.active = index.min(this.sessions.len().saturating_sub(1));
+                this.input = this.active;
                 let handle = this.focus_handle.clone();
                 window.focus(&handle, cx);
                 cx.notify();
@@ -429,6 +515,24 @@ impl Render for TerminalPanel {
             })
             .child(
                 div()
+                    .id("terminal-split")
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .when(self.split, |this| this.bg(theme.background))
+                    .hover(move |this| this.bg(hover_bg))
+                    .on_click(split)
+                    .child(Icon::new(IconName::Columns2).xsmall().text_color(if self.split {
+                        theme.accent
+                    } else {
+                        theme.fg_muted()
+                    })),
+            )
+            .child(
+                div()
                     .id("terminal-new")
                     .size(px(20.))
                     .flex()
@@ -485,13 +589,6 @@ impl Render for TerminalPanel {
                     )
                     .on_click(focus)
                     .on_key_down(cx.listener(Self::on_key))
-                    .on_scroll(cx.listener(move |this: &mut Self, event: &ScrollEvent, _window, cx| {
-                        let lines = match event.delta {
-                            ScrollDelta::Lines(point) => point.y as i32,
-                            ScrollDelta::Pixels(point) => (point.y / px(row_height)).round() as i32,
-                        };
-                        this.scroll(-lines, cx);
-                    }))
                     .when(self.sessions.is_empty(), |this| {
                         this.child(
                             div()
@@ -512,7 +609,9 @@ impl Render for TerminalPanel {
                                 ),
                         )
                     })
-                    .when(!self.sessions.is_empty(), move |this| this.child(div().flex().flex_col().children(rows))),
+                    .when(!self.sessions.is_empty(), move |this| {
+                        this.child(div().flex().h_full().w_full().gap_1().children(panes))
+                    }),
             )
             .into_any_element()
     }

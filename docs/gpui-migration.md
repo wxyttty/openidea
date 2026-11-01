@@ -113,6 +113,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Terminal split: the split button spawned a second shell and rendered two
+  panes with their own prompts; clicking the left pane routed keys to
+  `TerminalId(2)` (keys log target 1) and the right pane to `TerminalId(1)`
+  (target 0), and a typed `pwd > /tmp/tp4.txt` executed in the shell.
 - Notebook: a 3-cell `sample.ipynb` opened with `Alt+8`; the panel rendered
   the markdown cell, two code cells (`CODE [2]`, `CODE`), their sources and
   outputs (`hello from notebook`, `42`) with the notebook tab active.
@@ -173,6 +177,8 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   letters/colours, refresh on `VcsChanged`, branch in the status bar, and
   *Stage All* / *Commit* controls backed by `Repo::stage` / `Repo::commit`.
 - **Terminal**: `ide-terminal` PTY + a native VT grid (`vt100`): zsh prompt,
+  split panes (the split button starts a second shell and renders both VT grids
+  side by side at half width; clicking a pane routes keys to that session),
   ANSI colours, block cursor, arrow/control keys, scrollback, restart/kill.
   No xterm.js and no webview. Multiple tabs each own a PTY; the grid is
   derived from the window width and the font size (columns × rows are pushed
@@ -347,7 +353,7 @@ Status of the Tauri shell's features in the native app.
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop | P1 (gutter dots, hit counts) |
-| Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, auto PTY resize, font size | P2 (splits) |
+| Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
 | Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
 | Database tool window | yes | sources, sidebar with columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit, views) |
 | Notebook | yes | read-only native viewer (cells, outputs, nbformat); Alt+8 | P2 (edit cells, kernel execution) |
