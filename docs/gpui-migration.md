@@ -113,6 +113,8 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Find highlights: searching `alpha` in a 4-line file tinted 1678 pixels
+  (four matches); Esc cleared them to 3 residual pixels.
 - Agents: the panel listed the built-in providers with OpenCode marked
   installed; picking OpenCode and pressing Enter created a task through
   `ops::agent::create` (`status: Starting`) and the subscription streamed
@@ -172,9 +174,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - **Go to Line** (`Ctrl+G`, Navigate menu): modal input accepting `line` or
   `line:column` (1-based), jumps the active editor caret and focuses it.
 - **Find in File** (`Ctrl+F`, Navigate menu): floating bar over the editor with
-  live match count, case-insensitive search over the active tab, Enter/next,
-  prev and close (Esc or ×); jumps focus the editor so typing continues at the
-  match.
+  live match count, case-insensitive search over the active tab, every match
+  highlighted with a warning fill (RangeDecoration), Enter/next, prev and close
+  (Esc or ×, which also clears the highlights); jumps focus the editor so typing
+  continues at the match.
 - **Zoom**: View › Zoom In / Zoom Out / Reset Zoom change the editor font size
   in 1 px steps and persist it to `settings.toml` (`editor.fontSize`).
 - **Find in Path** (`Ctrl+Shift+F`): streams `ide-search` results from a worker
@@ -354,7 +357,7 @@ Status of the Tauri shell's features in the native app.
 | Syntax highlighting | CodeMirror/Lezer | syntect | tree-sitter in P1 |
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
-| Find in file | yes | Ctrl+F bar with count, next/prev, Esc | P2 (regex, highlights) |
+| Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc | P2 (regex) |
 | Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
 | Menu bar | native `menu.rs` (1.6k lines) | 6 menus, core actions | P2 (full menu set) |
 | Command palette | yes | yes (13 commands) | grows with actions |

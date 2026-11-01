@@ -365,6 +365,7 @@ pub struct Workbench {
     goto_submit: bool,
     find_open: bool,
     find_entered: bool,
+    find_highlight_dirty: bool,
     find_index: usize,
     find_searched: bool,
     settings_open: bool,
@@ -421,6 +422,7 @@ impl Workbench {
                 InputEvent::Change => {
                     this.find_searched = false;
                     this.find_index = 0;
+                    this.find_highlight_dirty = true;
                 }
                 InputEvent::PressEnter { .. } => {
                     this.find_entered = true;
@@ -502,6 +504,7 @@ impl Workbench {
             goto_submit: false,
             find_open: false,
             find_entered: false,
+            find_highlight_dirty: false,
             find_index: 0,
             find_searched: false,
             settings_open: false,
@@ -707,6 +710,7 @@ impl Workbench {
                 self.find_open = true;
                 self.find_searched = false;
                 self.find_index = 0;
+                self.find_highlight_dirty = true;
                 cx.notify();
                 let entity = cx.entity();
                 window.on_next_frame(move |window, cx| {
@@ -1772,6 +1776,11 @@ impl Render for Workbench {
             self.find_entered = false;
             self.find_step(1, window, cx);
         }
+        if self.find_highlight_dirty {
+            self.find_highlight_dirty = false;
+            let query = if self.find_open { self.find_input.read(cx).value().trim().to_owned() } else { String::new() };
+            self.editor.update(cx, |editor, cx| editor.highlight_find(&query, cx));
+        }
         let theme = cx.theme().clone();
         let menu_bar = self.render_menu_bar(&theme, cx);
         let stripe = self.render_stripe(&theme, cx);
@@ -2572,6 +2581,7 @@ impl Render for Workbench {
             let next = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.find_step(1, window, cx));
             let close = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
                 this.find_open = false;
+                this.find_highlight_dirty = true;
                 this.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
                 cx.notify();
             });
@@ -2738,6 +2748,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
                 if this.find_open {
                     this.find_open = false;
+                    this.find_highlight_dirty = true;
                     this.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
                     cx.notify();
                 }

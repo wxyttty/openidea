@@ -44,6 +44,8 @@ struct Tab {
     _change: Option<Subscription>,
     /// Breakpoint line highlights, adjusted automatically across edits.
     breakpoint_decorations: Option<RangeDecorationCollection>,
+    /// Find-in-file match highlights.
+    find_decorations: Option<RangeDecorationCollection>,
 }
 
 impl Tab {
@@ -198,6 +200,7 @@ impl EditorArea {
             read_only: info.read_only,
             _change: None,
             breakpoint_decorations: None,
+            find_decorations: None,
         });
         self.active = Some(self.tabs.len() - 1);
         let index = self.tabs.len() - 1;
@@ -423,6 +426,49 @@ impl EditorArea {
             }
         }
         out
+    }
+
+    /// Highlight every case-insensitive occurrence of `query` in the active
+    /// tab (empty clears them).
+    pub fn highlight_find(&mut self, query: &str, cx: &mut Context<Self>) {
+        let Some(index) = self.active else { return };
+        let ranges = {
+            let state = self.tabs[index].state.read(cx);
+            let text = state.text().to_string();
+            let mut ranges = Vec::new();
+            if !query.is_empty() {
+                let lower = text.to_lowercase();
+                let needle = query.to_lowercase();
+                if lower.len() == text.len() && !needle.is_empty() {
+                    let mut start = 0;
+                    while let Some(offset) = lower[start..].find(&needle) {
+                        let at = start + offset;
+                        ranges.push(at..at + needle.len());
+                        if ranges.len() >= 2000 {
+                            break;
+                        }
+                        start = at + needle.len();
+                    }
+                }
+            }
+            ranges
+        };
+        let mut tint = cx.theme().warning;
+        tint.a = 0.26;
+        let decorations = ranges
+            .into_iter()
+            .map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(tint))
+            .collect::<Vec<_>>();
+        match self.tabs[index].find_decorations.clone() {
+            Some(collection) => collection.set(decorations, cx),
+            None => {
+                let collection = self.tabs[index]
+                    .state
+                    .update(cx, |state, cx| state.create_range_decorations_collection(decorations, cx));
+                self.tabs[index].find_decorations = Some(collection);
+            }
+        }
+        cx.notify();
     }
 
     /// Move the caret of the active tab to a 0-based line/column and focus it.
