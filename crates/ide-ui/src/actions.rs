@@ -51,6 +51,8 @@ gpui_kit::actions!(
         ViewBreakpoints,
         Settings,
         GoToLine,
+        FindInEditor,
+        CloseFind,
     ]
 );
 
@@ -96,5 +98,7 @@ pub fn install(cx: &mut App) {
     bind("ctrl-shift-f8", Box::new(ViewBreakpoints));
     bind("ctrl-alt-s", Box::new(Settings));
     bind("secondary-g", Box::new(GoToLine));
+    bind("secondary-f", Box::new(FindInEditor));
+    bind("escape", Box::new(CloseFind));
     cx.bind_keys(bindings);
 }

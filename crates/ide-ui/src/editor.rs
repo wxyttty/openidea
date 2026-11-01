@@ -385,6 +385,46 @@ impl EditorArea {
         });
     }
 
+    /// Case-insensitive occurrences of `query` in the active tab as 0-based
+    /// (line, column); capped at 2000 so a one-letter query stays cheap.
+    pub fn find_matches(&self, query: &str) -> Vec<(u32, u32)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) else {
+            return Vec::new();
+        };
+        let text = &tab.text;
+        let mut out = Vec::new();
+        fn position(text: &str, offset: usize) -> (u32, u32) {
+            let line = text[..offset].matches('\n').count() as u32;
+            let line_start = text[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+            let col = text[line_start..offset].encode_utf16().count() as u32;
+            (line, col)
+        }
+        let lower = text.to_lowercase();
+        let needle = query.to_lowercase();
+        if lower.len() == text.len() && !needle.is_empty() {
+            let mut start = 0;
+            while let Some(offset) = lower[start..].find(&needle) {
+                let at = start + offset;
+                out.push(position(text, at));
+                if out.len() >= 2000 {
+                    break;
+                }
+                start = at + needle.len();
+            }
+        } else {
+            for (at, _) in text.match_indices(query) {
+                out.push(position(text, at));
+                if out.len() >= 2000 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Move the caret of the active tab to a 0-based line/column and focus it.
     pub fn goto_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };

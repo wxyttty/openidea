@@ -110,6 +110,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Go to Line: `Ctrl+G` → `3` → Enter placed the caret at the start of line 3;
   typed `//GOTO ` and `Ctrl+S` saved it into that line. View › Zoom In wrote
   `editor.fontSize = 14.0`, Reset Zoom wrote `13.0`.
+- Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
+  `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
+  next-frame focus and the editor hand-off were verified through tracing).
 - Recent Projects modal: seeded `recent.json` with `ra-proj` (active) and
   `ra-proj2`, File › Open Recent Project… rendered both rows with the active
   one highlighted; clicking `ra-proj2` opened it (`opened /tmp/ra-proj2 in
@@ -155,6 +158,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   first, keyboard navigation and Enter to open.
 - **Go to Line** (`Ctrl+G`, Navigate menu): modal input accepting `line` or
   `line:column` (1-based), jumps the active editor caret and focuses it.
+- **Find in File** (`Ctrl+F`, Navigate menu): floating bar over the editor with
+  live match count, case-insensitive search over the active tab, Enter/next,
+  prev and close (Esc or ×); jumps focus the editor so typing continues at the
+  match.
 - **Zoom**: View › Zoom In / Zoom Out / Reset Zoom change the editor font size
   in 1 px steps and persist it to `settings.toml` (`editor.fontSize`).
 - **Find in Path** (`Ctrl+Shift+F`): streams `ide-search` results from a worker
@@ -320,6 +327,7 @@ Status of the Tauri shell's features in the native app.
 | Syntax highlighting | CodeMirror/Lezer | syntect | tree-sitter in P1 |
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
+| Find in file | yes | Ctrl+F bar with count, next/prev, Esc | P2 (regex, highlights) |
 | Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
 | Menu bar | native `menu.rs` (1.6k lines) | 6 menus, core actions | P2 (full menu set) |
 | Command palette | yes | yes (13 commands) | grows with actions |

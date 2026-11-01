@@ -81,6 +81,7 @@ enum Cmd {
     OpenProject,
     RecentProjects,
     GoToLine,
+    FindInEditor,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -161,6 +162,7 @@ const VIEW_MENU: &[MenuEntry] = &[
 const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Go to File…", shortcut: Some("Ctrl+P"), cmd: Cmd::QuickOpen },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
+    MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
     MenuEntry { label: "Command Palette…", shortcut: Some("Ctrl+Shift+P"), cmd: Cmd::CommandPalette },
     MenuEntry { label: "Next Tab", shortcut: Some("Ctrl+Tab"), cmd: Cmd::NextTab },
@@ -231,6 +233,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Open Recent Project…", shortcut: None, cmd: Cmd::RecentProjects },
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
+    MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
     MenuEntry { label: "Command Palette…", shortcut: Some("Ctrl+Shift+P"), cmd: Cmd::CommandPalette },
     MenuEntry { label: "Save File", shortcut: Some("Ctrl+S"), cmd: Cmd::Save },
@@ -345,6 +348,10 @@ pub struct Workbench {
     recent_open: bool,
     goto_open: bool,
     goto_submit: bool,
+    find_open: bool,
+    find_entered: bool,
+    find_index: usize,
+    find_searched: bool,
     settings_open: bool,
     editor_font_size: f32,
     terminal_font_size: f32,
@@ -354,10 +361,12 @@ pub struct Workbench {
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
     goto_input: Entity<InputState>,
+    find_input: Entity<InputState>,
     selected_breakpoint: Option<(PathBuf, u32)>,
     _condition_subscription: Subscription,
     _log_subscription: Subscription,
     _goto_subscription: Subscription,
+    _find_subscription: Subscription,
 }
 
 impl Workbench {
@@ -390,6 +399,20 @@ impl Workbench {
                 this.goto_submit = true;
                 cx.notify();
             }
+        });
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in file…"));
+        let find_subscription = cx.subscribe(&find_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Change => {
+                    this.find_searched = false;
+                    this.find_index = 0;
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.find_entered = true;
+                }
+                _ => {}
+            }
+            cx.notify();
         });
         let log_input = cx.new(|cx| InputState::new(window, cx).placeholder("Log message, e.g. x={x}"));
         let log_subscription = cx.subscribe(&log_input, |this: &mut Self, _input, event: &InputEvent, cx| {
@@ -458,6 +481,10 @@ impl Workbench {
             recent_open: false,
             goto_open: false,
             goto_submit: false,
+            find_open: false,
+            find_entered: false,
+            find_index: 0,
+            find_searched: false,
             settings_open: false,
             editor_font_size,
             terminal_font_size,
@@ -467,10 +494,12 @@ impl Workbench {
             condition_input,
             log_input,
             goto_input,
+            find_input,
             selected_breakpoint: None,
             _condition_subscription: condition_subscription,
             _log_subscription: log_subscription,
             _goto_subscription: goto_subscription,
+            _find_subscription: find_subscription,
         };
 
         // Backend events arrive on any thread; apply them on the GPUI thread,
@@ -653,6 +682,22 @@ impl Workbench {
                 window.focus(&handle, cx);
                 cx.notify();
             }
+            Cmd::FindInEditor => {
+                self.find_open = true;
+                self.find_searched = false;
+                self.find_index = 0;
+                cx.notify();
+                let entity = cx.entity();
+                window.on_next_frame(move |window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if this.find_open {
+                            let handle = this.find_input.read(cx).focus_handle(cx);
+                            window.focus(&handle, cx);
+                            cx.notify();
+                        }
+                    });
+                });
+            }
             Cmd::ZoomIn => self.change_editor_font_size(1., cx),
             Cmd::ZoomOut => self.change_editor_font_size(-1., cx),
             Cmd::ZoomReset => {
@@ -832,6 +877,34 @@ impl Workbench {
         let size = (self.terminal_font_size + delta).clamp(8., 28.);
         self.apply_terminal_font_size(size, cx);
         self.persist_setting("terminal.fontSize", serde_json::json!(size));
+    }
+
+    fn find_step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.find_input.read(cx).value().trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let matches = self.editor.read(cx).find_matches(&query);
+        if matches.is_empty() {
+            self.status = format!("No matches for \"{query}\"").into();
+            self.find_searched = false;
+            cx.notify();
+            return;
+        }
+        let len = matches.len();
+        let index = if !self.find_searched {
+            if delta < 0 { len - 1 } else { 0 }
+        } else if delta < 0 {
+            (self.find_index + len - 1) % len
+        } else {
+            (self.find_index + 1) % len
+        };
+        self.find_index = index;
+        self.find_searched = true;
+        let (line, col) = matches[index];
+        self.status = format!("{}/{} · line {}", index + 1, len, line + 1).into();
+        self.editor.update(cx, |editor, cx| editor.goto_line(line, col, window, cx));
+        cx.notify();
     }
 
     fn persist_setting(&mut self, key: &str, value: serde_json::Value) {
@@ -1644,6 +1717,10 @@ impl Render for Workbench {
             }
             cx.notify();
         }
+        if self.find_entered {
+            self.find_entered = false;
+            self.find_step(1, window, cx);
+        }
         let theme = cx.theme().clone();
         let menu_bar = self.render_menu_bar(&theme, cx);
         let stripe = self.render_stripe(&theme, cx);
@@ -2429,6 +2506,84 @@ impl Render for Workbench {
                     .into_any_element(),
             );
         }
+        if self.find_open {
+            let find_hover = theme.list_hover;
+            let query = self.find_input.read(cx).value().trim().to_owned();
+            let count = if query.is_empty() { 0 } else { self.editor.read(cx).find_matches(&query).len() };
+            let label = if count == 0 {
+                "0".to_owned()
+            } else if self.find_searched {
+                format!("{}/{}", self.find_index + 1, count)
+            } else {
+                format!("{count}")
+            };
+            let prev = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.find_step(-1, window, cx));
+            let next = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.find_step(1, window, cx));
+            let close = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                this.find_open = false;
+                this.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
+                cx.notify();
+            });
+            overlays.push(
+                div()
+                    .absolute()
+                    .top(px(36.))
+                    .right(px(18.))
+                    .w(px(380.))
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .bg(theme.popover)
+                    .border_1()
+                    .border_color(theme.border_strong())
+                    .rounded(px(6.))
+                    .shadow_lg()
+                    .occlude()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.find_input)))
+                    .child(div().text_size(px(10.)).text_color(theme.fg_muted()).child(label))
+                    .child(
+                        div()
+                            .id("find-prev")
+                            .h(px(20.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(find_hover))
+                            .on_click(prev)
+                            .child(Icon::new(IconName::ChevronUp).xsmall().text_color(theme.fg_secondary())),
+                    )
+                    .child(
+                        div()
+                            .id("find-next")
+                            .h(px(20.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(find_hover))
+                            .on_click(next)
+                            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(theme.fg_secondary())),
+                    )
+                    .child(
+                        div()
+                            .id("find-close")
+                            .h(px(20.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(find_hover))
+                            .on_click(close)
+                            .child(Icon::new(IconName::X).xsmall().text_color(theme.fg_secondary())),
+                    )
+                    .into_any_element(),
+            );
+        }
         if self.about_open {
             let close = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
                 this.about_open = false;
@@ -2526,6 +2681,14 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &ViewBreakpoints, window, cx| this.run(Cmd::ViewBreakpoints, window, cx)))
             .on_action(cx.listener(|this, _: &Settings, window, cx| this.run(Cmd::Settings, window, cx)))
             .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.run(Cmd::GoToLine, window, cx)))
+            .on_action(cx.listener(|this, _: &FindInEditor, window, cx| this.run(Cmd::FindInEditor, window, cx)))
+            .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
+                if this.find_open {
+                    this.find_open = false;
+                    this.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &Quit, _window, cx| this.run(Cmd::Quit, _window, cx)))
             .on_action(cx.listener(|this, _: &About, _window, cx| this.run(Cmd::About, _window, cx)))
             .child(menu_bar)
