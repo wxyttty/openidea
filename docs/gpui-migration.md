@@ -113,6 +113,12 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Agents: the panel listed the built-in providers with OpenCode marked
+  installed; picking OpenCode and pressing Enter created a task through
+  `ops::agent::create` (`status: Starting`) and the subscription streamed
+  task/entry events into the panel; a second task run showed the task list and
+  conversation rendering (opencode itself exited without auth, surfaced as the
+  task status/error).
 - Terminal split: the split button spawned a second shell and rendered two
   panes with their own prompts; clicking the left pane routed keys to
   `TerminalId(2)` (keys log target 1) and the right pane to `TerminalId(1)`
@@ -226,6 +232,13 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   execution counts, stream/result/error outputs, dirty state and nbformat in
   a bottom tool window; opened from the active `.ipynb` tab. Editing and
   kernel execution still require the Tauri shell (no `ipykernel` here).
+- **Agents** (`Alt+9`, View menu, Bot in the tool stripe): provider list from
+  `ops::agent::providers` (installed dot, PATH status), persisted tasks with
+  their status, a streamed conversation (user/agent/thought/tool/plan/message/
+  permission/error entries) from `ops::agent::subscribe`, task creation through
+  `ops::agent::create` (local checkout) and prompt/cancel controls. The MVP
+  renders and drives the ACP task lifecycle; permissions, worktree isolation,
+  agent settings and registry installs stay with the Tauri shell for now.
 - **HTTP Client** (`Alt+7`): method/URL/header/body fields assembled into the
   `.http` text format and sent through `ide_http::run` (proxies and variables
   included), with a status line (colour by class, protocol, ms, size), response
@@ -357,6 +370,7 @@ Status of the Tauri shell's features in the native app.
 | Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
 | Database tool window | yes | sources, sidebar with columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit, views) |
 | Notebook | yes | read-only native viewer (cells, outputs, nbformat); Alt+8 | P2 (edit cells, kernel execution) |
+| Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret | P2 (gutter run icons, response tools) |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |

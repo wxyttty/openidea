@@ -20,6 +20,7 @@
 //! Migration status and the phase plan live in `docs/gpui-migration.md`.
 
 pub mod actions;
+pub mod agents;
 pub mod breakpoints;
 pub mod db;
 pub mod debug;

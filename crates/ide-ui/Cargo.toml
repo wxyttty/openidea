@@ -20,6 +20,7 @@ ide-search.workspace = true
 ide-vcs.workspace = true
 ide-run.workspace = true
 ide-dap.workspace = true
+ide-agent.workspace = true
 ide-db.workspace = true
 ide-http.workspace = true
 ide-terminal.workspace = true

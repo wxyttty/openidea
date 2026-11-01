@@ -7,6 +7,7 @@
 //! elements; opening a project goes straight to `ide-host::Host`, with no IPC.
 
 use crate::actions::{self, *};
+use crate::agents::AgentPanel;
 use crate::breakpoints::Breakpoints;
 use crate::db::DbPanel;
 use crate::debug::{DebugAction, DebugPanel};
@@ -124,7 +125,7 @@ enum Cmd {
     Appearance,
     TrustProject,
     About,
-    AgentNotPorted,
+    ShowAgents,
     Quit,
 }
 
@@ -157,6 +158,7 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Database", shortcut: Some("Alt+3"), cmd: Cmd::ShowDb },
     MenuEntry { label: "HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
+    MenuEntry { label: "Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Zoom In", shortcut: None, cmd: Cmd::ZoomIn },
     MenuEntry { label: "Zoom Out", shortcut: None, cmd: Cmd::ZoomOut },
     MenuEntry { label: "Reset Zoom", shortcut: None, cmd: Cmd::ZoomReset },
@@ -175,6 +177,7 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
 const GIT_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
     MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
+    MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Refresh Status", shortcut: None, cmd: Cmd::RefreshVcs },
 ];
 
@@ -249,6 +252,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Show Project", shortcut: Some("Alt+1"), cmd: Cmd::ShowProject },
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
     MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
+    MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -269,6 +273,7 @@ enum BottomTab {
     Db,
     Http,
     Notebook,
+    Agents,
 }
 
 impl BottomTab {
@@ -282,6 +287,7 @@ impl BottomTab {
             BottomTab::Db => 5,
             BottomTab::Http => 6,
             BottomTab::Notebook => 7,
+            BottomTab::Agents => 8,
         }
     }
 }
@@ -326,6 +332,7 @@ pub struct Workbench {
     db: Entity<DbPanel>,
     http: Entity<HttpPanel>,
     notebook: Entity<NotebookPanel>,
+    agents: Entity<AgentPanel>,
     diff: Entity<DiffPanel>,
     search: Entity<SearchPanel>,
     vcs: Entity<VcsPanel>,
@@ -436,6 +443,7 @@ impl Workbench {
         let db = cx.new(|cx| DbPanel::new(host.clone(), window, cx));
         let http = cx.new(|cx| HttpPanel::new(host.clone(), window, cx));
         let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
+        let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let diff = cx.new(|cx| DiffPanel::new(cx));
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
         terminal.update(cx, |terminal, cx| terminal.set_font_size(terminal_font_size, cx));
@@ -461,6 +469,7 @@ impl Workbench {
             db,
             http,
             notebook,
+            agents,
             diff,
             search,
             vcs,
@@ -661,6 +670,7 @@ impl Workbench {
                 self.db.update(cx, |db, cx| db.set_project(&project, cx));
                 self.http.update(cx, |http, cx| http.set_project(&project, cx));
                 self.notebook.update(cx, |notebook, cx| notebook.set_project(&project, cx));
+                self.agents.update(cx, |agents, cx| agents.set_project(&project, cx));
                 self.breakpoints = Breakpoints::load(&self.config_dir, &project.root);
                 let map = self.breakpoints.map();
                 self.editor.update(cx, |editor, cx| editor.set_breakpoints(map, cx));
@@ -875,7 +885,12 @@ impl Workbench {
                 self.about_open = true;
                 cx.notify();
             }
-            Cmd::AgentNotPorted => self.set_status("Agents tool window: not ported to GPUI yet", cx),
+            Cmd::ShowAgents => {
+                self.show_bottom = true;
+                self.bottom = BottomTab::Agents;
+                self.agents.update(cx, |agents, cx| agents.ensure(window, cx));
+                cx.notify();
+            }
             Cmd::Quit => cx.quit(),
         }
     }
@@ -1339,7 +1354,14 @@ impl Workbench {
                 cx,
                 Cmd::ShowVcs,
             ))
-            .child(self.tool_button("tool-agents", IconName::Bot, false, theme, cx, Cmd::AgentNotPorted))
+            .child(self.tool_button(
+                "tool-agents",
+                IconName::Bot,
+                self.show_bottom && self.bottom == BottomTab::Agents,
+                theme,
+                cx,
+                Cmd::ShowAgents,
+            ))
             .child(div().flex_1())
             .child(self.tool_button(
                 "tool-problems",
@@ -1430,7 +1452,8 @@ impl Workbench {
                     .child(tab("Debug", self.bottom == BottomTab::Debug, BottomTab::Debug, cx))
                     .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, cx))
                     .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, cx))
-                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, cx)),
+                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, cx))
+                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, cx)),
             )
             .child(match self.bottom {
                 BottomTab::Problems => div().flex_1().min_h_0().child(self.problems.clone()),
@@ -1441,6 +1464,7 @@ impl Workbench {
                 BottomTab::Db => div().flex_1().min_h_0().child(self.db.clone()),
                 BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
                 BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
+                BottomTab::Agents => div().flex_1().min_h_0().child(self.agents.clone()),
             })
             .into_any_element()
     }
@@ -2696,6 +2720,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &ShowDb, window, cx| this.run(Cmd::ShowDb, window, cx)))
             .on_action(cx.listener(|this, _: &ShowHttp, window, cx| this.run(Cmd::ShowHttp, window, cx)))
             .on_action(cx.listener(|this, _: &ShowNotebook, window, cx| this.run(Cmd::ShowNotebook, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAgents, window, cx| this.run(Cmd::ShowAgents, window, cx)))
             .on_action(cx.listener(|this, _: &RunHttpAtCaret, window, cx| this.run(Cmd::RunHttpAtCaret, window, cx)))
             .on_action(cx.listener(|this, _: &StopDebug, window, cx| this.run(Cmd::StopDebug, window, cx)))
             .on_action(cx.listener(|this, _: &ResumeDebug, window, cx| this.run(Cmd::ResumeDebug, window, cx)))
