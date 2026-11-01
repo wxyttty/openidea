@@ -13,9 +13,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ide_core::CancellationToken;
-use ide_host::Project;
-use ide_search::{FileMatches, SearchContext, SearchQuery, SearchScope};
+use ide_core::{CancellationToken, Pos, RequestId};
+use ide_host::{Host, Project};
+use ide_search::{FileMatches, ReplaceEvent, ReplaceTarget, SearchContext, SearchQuery, SearchScope};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,9 +36,11 @@ struct SearchRow {
 }
 
 pub struct SearchPanel {
+    host: Arc<Host>,
     project: Option<Arc<Project>>,
     editor: Entity<EditorArea>,
     query: Entity<InputState>,
+    replace: Entity<InputState>,
     files: Vec<FileMatches>,
     running: bool,
     truncated: bool,
@@ -46,27 +48,39 @@ pub struct SearchPanel {
     cancel: CancellationToken,
     generation: u64,
     focus_handle: FocusHandle,
+    request_task: Option<Task<()>>,
     _submit: Subscription,
+    _replace_submit: Subscription,
 }
 
 impl SearchPanel {
-    pub fn new(editor: Entity<EditorArea>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(host: Arc<Host>, editor: Entity<EditorArea>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search in project…"));
         let submit = cx.subscribe(&query, |this: &mut Self, _query, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.run(cx);
             }
         });
+        let replace = cx.new(|cx| InputState::new(window, cx).placeholder("Replace with…"));
+        let replace_submit = cx.subscribe(&replace, |this: &mut Self, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.replace_all(cx);
+            }
+        });
         Self {
+            host,
             project: None,
             editor,
             query,
+            replace,
             files: Vec::new(),
             running: false,
             truncated: false,
             message: None,
             cancel: CancellationToken::new(),
             generation: 0,
+            request_task: None,
+            _replace_submit: replace_submit,
             focus_handle: cx.focus_handle(),
             _submit: submit,
         }
@@ -166,6 +180,98 @@ impl SearchPanel {
         .detach();
     }
 
+    fn replace_all(&mut self, cx: &mut Context<Self>) {
+        let pattern = self.query.read(cx).value().trim().to_owned();
+        if pattern.is_empty() {
+            self.message = Some("Enter a search pattern first".into());
+            cx.notify();
+            return;
+        }
+        if self.files.is_empty() {
+            self.message = Some("Search first, then replace".into());
+            cx.notify();
+            return;
+        }
+        let replacement = self.replace.read(cx).value().to_string();
+        let query = SearchQuery {
+            pattern,
+            is_regex: false,
+            case_sensitive: false,
+            whole_word: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            scope: SearchScope::Project,
+            max_matches: 10_000,
+            context: SearchContext::Any,
+        };
+        let targets: Vec<ReplaceTarget> = self
+            .files
+            .iter()
+            .map(|file| {
+                let only: Vec<Pos> = file
+                    .matches
+                    .iter()
+                    .flat_map(|line| {
+                        line.ranges.iter().map(move |(start, _)| Pos { line: line.line, col: line.text_offset + start })
+                    })
+                    .collect();
+                ReplaceTarget { path: file.path.clone(), only: Some(only) }
+            })
+            .collect();
+        self.message = Some("Replacing…".into());
+        let host = self.host.clone();
+        let summary = Arc::new(std::sync::Mutex::new(None));
+        let (tx, mut rx) = unbounded::<Result<(u32, u32), String>>();
+        self.host.runtime.spawn(async move {
+            let slot = summary.clone();
+            let channel = ide_host::ops::Channel::new(move |event: ReplaceEvent| {
+                if let ReplaceEvent::Done { summary } = event
+                    && let Ok(mut slot) = slot.lock()
+                {
+                    *slot = Some(summary);
+                }
+            });
+            let request = RequestId::next();
+            let result = ide_host::ops::search::replace_in_files(
+                &host,
+                "main",
+                request,
+                query,
+                replacement,
+                false,
+                targets,
+                channel,
+            )
+            .await;
+            let message = match result {
+                Ok(()) => {
+                    let summary = summary.lock().ok().and_then(|slot| slot.clone());
+                    let (replacements, files) =
+                        summary.map(|summary| (summary.replacements, summary.files)).unwrap_or((0, 0));
+                    Ok((replacements, files))
+                }
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.unbounded_send(message);
+        });
+        self.request_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok((replacements, files)) => {
+                            this.message = Some(format!("{replacements} replacements in {files} files").into());
+                            this.run(cx);
+                            return;
+                        }
+                        Err(err) => this.message = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
     fn rows(&self) -> Vec<SearchRow> {
         let mut rows = Vec::new();
         for file in &self.files {
@@ -216,6 +322,8 @@ impl Render for SearchPanel {
                 if self.truncated { " (first 500 files)" } else { "" }
             )
         };
+        let replace_all = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.replace_all(cx));
+        let replace_hover = theme.list_hover;
         let on_open: Rc<dyn Fn((PathBuf, u32, u32), &mut Window, &mut App)> =
             Rc::new(cx.processor(|this: &mut Self, (path, line, col): (PathBuf, u32, u32), window, cx| {
                 let editor = this.editor.clone();
@@ -249,7 +357,34 @@ impl Render for SearchPanel {
                     )
                     .child(div().text_size(px(10.5)).text_color(theme.fg_muted()).child(summary.clone())),
             )
-            .child(div().p_2().border_b_1().border_color(theme.border).child(Input::new(&self.query)))
+            .child(
+                div()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.query)))
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.replace)))
+                    .child(
+                        div()
+                            .id("search-replace-all")
+                            .h(px(24.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(move |this| this.bg(replace_hover))
+                            .on_click(replace_all)
+                            .text_size(px(10.))
+                            .text_color(theme.fg_secondary())
+                            .child("Replace All"),
+                    ),
+            )
             .child(
                 div()
                     .flex_1()

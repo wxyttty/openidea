@@ -400,7 +400,7 @@ impl Workbench {
         let tree = cx.new(|cx| ProjectTree::new(editor.clone(), cx));
         let diagnostics = shared_diagnostics();
         let problems = cx.new(|cx| ProblemsPanel::new(diagnostics.clone(), editor.clone(), cx));
-        let search = cx.new(|cx| SearchPanel::new(editor.clone(), window, cx));
+        let search = cx.new(|cx| SearchPanel::new(host.clone(), editor.clone(), window, cx));
         let vcs = cx.new(|cx| VcsPanel::new(editor.clone(), window, cx));
         let condition_input = cx.new(|cx| InputState::new(window, cx).placeholder("Condition, e.g. x > 0"));
         let condition_subscription =

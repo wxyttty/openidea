@@ -113,6 +113,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Replace in Files: searching `alpha` found two files; the replace input
+  `omega` + Replace All rewrote `src/a.rs` (both occurrences) and
+  `src/b.rs` on disk through Documents.
 - Find highlights: searching `alpha` in a 4-line file tinted 1678 pixels
   (four matches); Esc cleared them to 3 residual pixels.
 - Agents: the panel listed the built-in providers with OpenCode marked
@@ -181,7 +184,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - **Zoom**: View › Zoom In / Zoom Out / Reset Zoom change the editor font size
   in 1 px steps and persist it to `settings.toml` (`editor.fontSize`).
 - **Find in Path** (`Ctrl+Shift+F`): streams `ide-search` results from a worker
-  thread, grouped by file, click opens at the matching line.
+  thread, grouped by file, click opens at the matching line. A second input and
+  **Replace All** run `ops::search::replace_in_files` over the result targets
+  (0-based match positions), so open editors update live through `Documents`
+  and the search refreshes with the replacements/files summary.
 - **Git** tool window: changed files of every repository (`ide-vcs`), status
   letters/colours, refresh on `VcsChanged`, branch in the status bar, and
   *Stage All* / *Commit* controls backed by `Repo::stage` / `Repo::commit`.
@@ -358,6 +364,7 @@ Status of the Tauri shell's features in the native app.
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
 | Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc | P2 (regex) |
+| Replace in files | yes | Replace All over the search results, Documents-backed | P2 (preview, per-match replace) |
 | Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
 | Menu bar | native `menu.rs` (1.6k lines) | 6 menus, core actions | P2 (full menu set) |
 | Command palette | yes | yes (13 commands) | grows with actions |
