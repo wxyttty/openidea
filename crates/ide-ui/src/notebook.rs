@@ -11,19 +11,27 @@ use std::sync::Arc;
 use crate::theme::IdeColors as _;
 use futures::StreamExt;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Editor, EditorState, InputContent};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_host::Host;
-use ide_notebook::NotebookSnapshot;
+use ide_notebook::{NotebookCell, NotebookEdit, NotebookSnapshot};
+
+struct CellEditor {
+    cell: String,
+    state: Entity<EditorState>,
+}
 
 pub struct NotebookPanel {
-    _host: Arc<Host>,
+    host: Arc<Host>,
     project: Option<Arc<ide_host::Project>>,
     path: Option<PathBuf>,
     snapshot: Option<NotebookSnapshot>,
     notice: Option<SharedString>,
+    cell_editor: Option<CellEditor>,
     task: Option<Task<()>>,
+    cell_task: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -56,12 +64,14 @@ fn output_text(output: &serde_json::Value) -> (String, bool) {
 impl NotebookPanel {
     pub fn new(host: Arc<Host>, cx: &mut Context<Self>) -> Self {
         Self {
-            _host: host,
+            host,
             project: None,
             path: None,
             snapshot: None,
             notice: None,
+            cell_editor: None,
             task: None,
+            cell_task: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -112,13 +122,83 @@ impl NotebookPanel {
         cx.notify();
     }
 
+    fn open_cell_editor(&mut self, cell: &NotebookCell, window: &mut Window, cx: &mut Context<Self>) {
+        let source = cell.source.clone();
+        let language: SharedString = if cell.cell_type == "code" { "python".into() } else { "markdown".into() };
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx);
+            state.set_value(InputContent::new(source), window, cx);
+            state.set_highlighter(language, cx);
+            state
+        });
+        self.cell_editor = Some(CellEditor { cell: cell.id.clone(), state });
+        cx.notify();
+    }
+
+    fn save_cell(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.cell_editor.take() else { return };
+        let source = editor.state.read(cx).value().to_string();
+        let Some(snapshot) = self.snapshot.clone() else { return };
+        let edit = NotebookEdit::SetSource { cell: editor.cell, source };
+        let id = snapshot.id.clone();
+        let version = snapshot.version;
+        let host = self.host.clone();
+        let save_id = id.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result = async {
+                ide_host::ops::notebook::edit(&host, "main", id, version, edit).await.map_err(|err| err.to_string())?;
+                ide_host::ops::notebook::save(&host, "main", save_id).await.map_err(|err| err.to_string())
+            }
+            .await;
+            let _ = tx.unbounded_send(result);
+        });
+        self.cell_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(snapshot) => {
+                            this.snapshot = Some(snapshot);
+                            this.notice = None;
+                        }
+                        Err(err) => this.notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    fn save_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else { return };
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result = ide_host::ops::notebook::save(&host, "main", snapshot.id).await.map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        self.cell_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(snapshot) => this.snapshot = Some(snapshot),
+                        Err(err) => this.notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.path.clone() {
             self.open_path(path, cx);
         }
     }
 
-    fn render_cells(&self, theme: &gpui_kit::component::Theme) -> AnyElement {
+    fn render_cells(&self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = &self.snapshot else {
             return div()
                 .size_full()
@@ -136,7 +216,19 @@ impl NotebookPanel {
         for cell in &snapshot.cells {
             let code = cell.cell_type == "code";
             let count = cell.execution_count.map(|count| format!("[{count}]")).unwrap_or_default();
+            let cell_id = cell.id.clone();
+            let open = cx.listener(move |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                if let Some(cell) =
+                    this.snapshot.as_ref().and_then(|snapshot| snapshot.cells.iter().find(|cell| cell.id == cell_id))
+                {
+                    let cell = cell.clone();
+                    this.open_cell_editor(&cell, window, cx);
+                }
+            });
             let mut card = div()
+                .id(ElementId::Name(format!("notebook-cell-{}", cell.id).into()))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, open)
                 .w_full()
                 .flex()
                 .flex_col()
@@ -215,6 +307,7 @@ impl Render for NotebookPanel {
         });
 
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -256,9 +349,129 @@ impl Render for NotebookPanel {
                             .text_size(px(10.))
                             .text_color(theme.fg_secondary())
                             .child("Reload"),
-                    ),
+                    )
+                    .when(self.snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty), |this| {
+                        this.child(
+                            div()
+                                .id("notebook-save")
+                                .h(px(20.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .bg(theme.primary)
+                                .hover(move |this| this.opacity(0.9))
+                                .on_click(
+                                    cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.save_snapshot(cx)),
+                                )
+                                .text_size(px(10.))
+                                .text_color(theme.primary_foreground)
+                                .child("Save"),
+                        )
+                    }),
             )
-            .child(self.render_cells(&theme))
+            .child(self.render_cells(&theme, cx))
+            .children(self.cell_editor.as_ref().map(|editor| {
+                let state = editor.state.clone();
+                let hover = theme.list_hover;
+                let save = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.save_cell(cx));
+                let cancel = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                    this.cell_editor = None;
+                    cx.notify();
+                });
+                let backdrop = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
+                    this.cell_editor = None;
+                    cx.notify();
+                });
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("notebook-cell-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .bg(theme.overlay)
+                            .on_mouse_down(MouseButton::Left, backdrop),
+                    )
+                    .child(
+                        div()
+                            .w(px(720.))
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .bg(theme.popover)
+                            .border_1()
+                            .border_color(theme.border_strong())
+                            .rounded(px(8.))
+                            .shadow_xl()
+                            .occlude()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child("Edit cell"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(300.))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .rounded(px(4.))
+                                    .child(Editor::new(&state).text_size(px(11.)).size_full()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("notebook-cell-cancel")
+                                            .h(px(24.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .hover(move |this| this.bg(hover))
+                                            .on_click(cancel)
+                                            .text_size(px(11.))
+                                            .text_color(theme.fg_secondary())
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("notebook-cell-save")
+                                            .h(px(24.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .bg(theme.primary)
+                                            .hover(move |this| this.opacity(0.9))
+                                            .on_click(save)
+                                            .text_size(px(11.))
+                                            .text_color(theme.primary_foreground)
+                                            .child("Save"),
+                                    ),
+                            ),
+                    )
+                    .into_any_element()
+            }))
             .child(
                 div()
                     .h(px(20.))

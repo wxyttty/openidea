@@ -131,6 +131,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Notebook: a 3-cell `sample.ipynb` opened with `Alt+8`; the panel rendered
   the markdown cell, two code cells (`CODE [2]`, `CODE`), their sources and
   outputs (`hello from notebook`, `42`) with the notebook tab active.
+  Clicking a cell opened the edit modal; replacing its source and saving
+  called `notebook_edit` (version 2) then `notebook_save`, and the on-disk
+  cells became `['# Demo'], ['EDITED CELL']`.
 - Recent Projects modal: seeded `recent.json` with `ra-proj` (active) and
   `ra-proj2`, File › Open Recent Project… rendered both rows with the active
   one highlighted; clicking `ra-proj2` opened it (`opened /tmp/ra-proj2 in
@@ -236,11 +239,14 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   `execute`, 300-row limit), a results grid with column types, `NULL` values,
   affected-row/elapsed summaries, and a table strip that fills
   `SELECT * FROM "table" LIMIT 100` (populated after a successful connect).
-- **Notebook** (`Alt+8`, View menu): read-only native viewer over
+- **Notebook** (`Alt+8`, View menu): native viewer/editor over
   `Project.notebooks` (`ide-notebook`): markdown and code cells with sources,
   execution counts, stream/result/error outputs, dirty state and nbformat in
-  a bottom tool window; opened from the active `.ipynb` tab. Editing and
-  kernel execution still require the Tauri shell (no `ipykernel` here).
+  a bottom tool window; opened from the active `.ipynb` tab. Clicking a cell
+  opens a modal `EditorState`; Save applies `NotebookEdit::SetSource` and then
+  `notebook_save` (so the `.ipynb` on disk changes), and a header Save writes
+  any dirty snapshot. Kernel execution still requires a Python env with
+  `ipykernel` (not installed here).
 - **Agents** (`Alt+9`, View menu, Bot in the tool stripe): provider list from
   `ops::agent::providers` (installed dot, PATH status), persisted tasks with
   their status, a streamed conversation (user/agent/thought/tool/plan/message/
@@ -379,7 +385,7 @@ Status of the Tauri shell's features in the native app.
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
 | Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
 | Database tool window | yes | sources, sidebar with columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit, views) |
-| Notebook | yes | read-only native viewer (cells, outputs, nbformat); Alt+8 | P2 (edit cells, kernel execution) |
+| Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret | P2 (gutter run icons, response tools) |
 | Notebooks, agents | yes | no | P3 |
