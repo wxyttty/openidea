@@ -87,6 +87,8 @@ enum Cmd {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    FloatBottom,
+    DockBottom,
     Save,
     SaveAll,
     CloseTab,
@@ -159,6 +161,8 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
+    MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
+    MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Zoom In", shortcut: None, cmd: Cmd::ZoomIn },
     MenuEntry { label: "Zoom Out", shortcut: None, cmd: Cmd::ZoomOut },
     MenuEntry { label: "Reset Zoom", shortcut: None, cmd: Cmd::ZoomReset },
@@ -168,6 +172,8 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Go to File…", shortcut: Some("Ctrl+P"), cmd: Cmd::QuickOpen },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
+    MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
+    MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
     MenuEntry { label: "Command Palette…", shortcut: Some("Ctrl+Shift+P"), cmd: Cmd::CommandPalette },
     MenuEntry { label: "Next Tab", shortcut: Some("Ctrl+Tab"), cmd: Cmd::NextTab },
@@ -221,6 +227,13 @@ fn parse_goto(text: &str) -> Option<(u32, u32)> {
     Some((line - 1, col - 1))
 }
 
+/// Default floating tool-window geometry inside a window of `width` × `height`.
+fn float_bounds(width: f32, height: f32) -> FloatPanel {
+    let w = 720_f32.min((width - 40.).max(200.));
+    let h = 480_f32.min((height - 80.).max(160.));
+    FloatPanel { x: ((width - w) / 2.).max(10.), y: 80., w, h }
+}
+
 fn menu_entries(kind: MenuKind) -> &'static [MenuEntry] {
     match kind {
         MenuKind::File => FILE_MENU,
@@ -241,6 +254,8 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
+    MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
+    MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
     MenuEntry { label: "Command Palette…", shortcut: Some("Ctrl+Shift+P"), cmd: Cmd::CommandPalette },
     MenuEntry { label: "Save File", shortcut: Some("Ctrl+S"), cmd: Cmd::Save },
@@ -277,6 +292,20 @@ enum BottomTab {
 }
 
 impl BottomTab {
+    fn label(self) -> &'static str {
+        match self {
+            BottomTab::Problems => "Problems",
+            BottomTab::Terminal => "Terminal",
+            BottomTab::Diff => "Diff",
+            BottomTab::Run => "Run",
+            BottomTab::Debug => "Debug",
+            BottomTab::Db => "Database",
+            BottomTab::Http => "HTTP Client",
+            BottomTab::Notebook => "Notebook",
+            BottomTab::Agents => "Agents",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             BottomTab::Problems => 0,
@@ -296,6 +325,14 @@ impl BottomTab {
 enum ResizeTarget {
     Left,
     Bottom,
+}
+
+#[derive(Clone, Copy)]
+struct FloatPanel {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -383,6 +420,8 @@ pub struct Workbench {
     layout: Layout,
     terminal_viewport: Rc<Cell<(f32, f32)>>,
     resize_drag: Option<ResizeDrag>,
+    float_panel: Option<FloatPanel>,
+    float_drag: Option<(f32, f32, f32, f32)>,
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
     goto_input: Entity<InputState>,
@@ -525,6 +564,8 @@ impl Workbench {
             layout,
             terminal_viewport,
             resize_drag: None,
+            float_panel: None,
+            float_drag: None,
             condition_input,
             log_input,
             goto_input,
@@ -735,6 +776,13 @@ impl Workbench {
                     });
                 });
             }
+            Cmd::FloatBottom => {
+                if !self.show_bottom {
+                    self.show_bottom = true;
+                }
+                self.float_bottom(window, cx);
+            }
+            Cmd::DockBottom => self.dock_bottom(cx),
             Cmd::ZoomIn => self.change_editor_font_size(1., cx),
             Cmd::ZoomOut => self.change_editor_font_size(-1., cx),
             Cmd::ZoomReset => {
@@ -967,6 +1015,22 @@ impl Workbench {
         match &self.project {
             Some(project) => project.settings.effective(),
             None => self.host.global_settings.effective(),
+        }
+    }
+
+    fn float_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.bounds();
+        self.float_panel = Some(float_bounds(bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+        self.float_drag = None;
+        self.status = format!("{} floated", self.bottom.label()).into();
+        cx.notify();
+    }
+
+    fn dock_bottom(&mut self, cx: &mut Context<Self>) {
+        if self.float_panel.take().is_some() {
+            self.float_drag = None;
+            self.status = "Tool window docked".into();
+            cx.notify();
         }
     }
 
@@ -1483,20 +1547,46 @@ impl Workbench {
                     .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, cx))
                     .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, cx))
                     .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, cx))
-                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, cx)),
+                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, cx))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("bottom-float")
+                            .h_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(theme.list_hover))
+                            .on_click(
+                                cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                                    this.float_bottom(window, cx)
+                                }),
+                            )
+                            .text_size(px(10.))
+                            .text_color(theme.fg_secondary())
+                            .child(Icon::new(IconName::Maximize2).xsmall())
+                            .child("Float"),
+                    ),
             )
-            .child(match self.bottom {
-                BottomTab::Problems => div().flex_1().min_h_0().child(self.problems.clone()),
-                BottomTab::Terminal => div().flex_1().min_h_0().child(self.terminal.clone()),
-                BottomTab::Diff => div().flex_1().min_h_0().child(self.diff.clone()),
-                BottomTab::Run => div().flex_1().min_h_0().child(self.run.clone()),
-                BottomTab::Debug => div().flex_1().min_h_0().child(self.debug.clone()),
-                BottomTab::Db => div().flex_1().min_h_0().child(self.db.clone()),
-                BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
-                BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
-                BottomTab::Agents => div().flex_1().min_h_0().child(self.agents.clone()),
-            })
+            .child(self.render_bottom_tab())
             .into_any_element()
+    }
+
+    fn render_bottom_tab(&self) -> AnyElement {
+        match self.bottom {
+            BottomTab::Problems => div().flex_1().min_h_0().child(self.problems.clone()),
+            BottomTab::Terminal => div().flex_1().min_h_0().child(self.terminal.clone()),
+            BottomTab::Diff => div().flex_1().min_h_0().child(self.diff.clone()),
+            BottomTab::Run => div().flex_1().min_h_0().child(self.run.clone()),
+            BottomTab::Debug => div().flex_1().min_h_0().child(self.debug.clone()),
+            BottomTab::Db => div().flex_1().min_h_0().child(self.db.clone()),
+            BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
+            BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
+            BottomTab::Agents => div().flex_1().min_h_0().child(self.agents.clone()),
+        }
+        .into_any_element()
     }
 
     fn render_status_bar(&mut self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -1835,6 +1925,68 @@ impl Render for Workbench {
         let bottom = self.render_bottom(&theme, cx);
         let status_bar = self.render_status_bar(&theme, cx);
         let mut overlays = Vec::new();
+        if let Some(bounds) = self.float_panel {
+            let float_hover = theme.list_hover;
+            let dock = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.dock_bottom(cx));
+            let drag = cx.listener(|this: &mut Self, event: &MouseDownEvent, _window, cx| {
+                if let Some(panel) = this.float_panel {
+                    this.float_drag = Some((event.position.x.as_f32(), event.position.y.as_f32(), panel.x, panel.y));
+                }
+                cx.notify();
+            });
+            overlays.push(
+                div()
+                    .absolute()
+                    .left(px(bounds.x))
+                    .top(px(bounds.y))
+                    .w(px(bounds.w))
+                    .h(px(bounds.h))
+                    .flex()
+                    .flex_col()
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.border_strong())
+                    .rounded(px(6.))
+                    .shadow_xl()
+                    .occlude()
+                    .child(
+                        div()
+                            .id("float-header")
+                            .h(px(26.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .bg(theme.muted)
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, drag)
+                            .child(Icon::new(IconName::PanelsLeftBottom).xsmall().text_color(theme.info))
+                            .child(div().text_size(px(11.)).text_color(theme.foreground).child(self.bottom.label()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("float-dock")
+                                    .h(px(18.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .hover(move |this| this.bg(float_hover))
+                                    .on_click(dock)
+                                    .text_size(px(9.5))
+                                    .text_color(theme.fg_secondary())
+                                    .child("Dock"),
+                            ),
+                    )
+                    .child(div().flex_1().min_h_0().child(self.render_bottom_tab()))
+                    .into_any_element(),
+            );
+        }
         if let Some(kind) = self.open_menu {
             let dismiss = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
                 this.open_menu = None;
@@ -2982,7 +3134,7 @@ impl Render for Workbench {
                                         .flex()
                                         .flex_col()
                                         .child(div().flex_1().min_h_0().child(editor))
-                                        .when(show_bottom, |this| {
+                                        .when(show_bottom && self.float_panel.is_none(), |this| {
                                             this.child(
                                                 div()
                                                     .id("bottom-splitter")
@@ -3014,6 +3166,16 @@ impl Render for Workbench {
             )
             .child(status_bar)
             .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, _window, cx| {
+                if let Some((start_x, start_y, panel_x, panel_y)) = this.float_drag {
+                    if let Some(panel) = this.float_panel.as_mut() {
+                        let dx = event.position.x.as_f32() - start_x;
+                        let dy = event.position.y.as_f32() - start_y;
+                        panel.x = (panel_x + dx).clamp(-200., 2000.);
+                        panel.y = (panel_y + dy).clamp(-50., 2000.);
+                        cx.notify();
+                    }
+                    return;
+                }
                 let Some(drag) = this.resize_drag else { return };
                 let dx = event.position.x.as_f32() - drag.start.x.as_f32();
                 let dy = event.position.y.as_f32() - drag.start.y.as_f32();
@@ -3031,6 +3193,7 @@ impl Render for Workbench {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this: &mut Self, _: &MouseUpEvent, _window, cx| {
+                    this.float_drag = None;
                     if this.resize_drag.take().is_some() {
                         this.layout.save(&this.config_dir);
                         this.status = format!(
@@ -3044,5 +3207,20 @@ impl Render for Workbench {
                 }),
             )
             .children(overlays)
+    }
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::float_bounds;
+
+    #[test]
+    fn float_bounds_center_and_clamp() {
+        let panel = float_bounds(1600., 1000.);
+        assert_eq!((panel.x, panel.y, panel.w, panel.h), (440., 80., 720., 480.));
+
+        let small = float_bounds(600., 300.);
+        assert!(small.w <= 560. && small.h <= 220.);
+        assert!(small.x >= 10.);
     }
 }

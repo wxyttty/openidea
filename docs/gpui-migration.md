@@ -116,6 +116,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Settings tree: `Ctrl+Alt+S` switched Editor → Terminal → Appearance via the
   left section list, and the Format on save toggle wrote
   `formatOnSave = true` then `false` to `settings.toml`.
+- Floating tool window: the geometry helper is covered by a unit test
+  (`float_bounds_center_and_clamp`); the interactive drag/dock path is wired
+  through the View menu, palette and bottom-strip chip.
 - Database cell editing: right-clicking the `id` cell of row 0 opened the
   auto-focused cell editor; replacing `1` with `10` and pressing Enter ran the
   UPDATE (key `id=1`, value `10`) and SQLite showed `10|alpha|1`.
@@ -275,6 +278,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   Opening a `.http`/`.rest` file in the editor and pressing `Alt+7` loads it
   automatically; **Ctrl+Alt+R** runs the request block under the caret (a single
   environment is selected automatically).
+- **Floating tool window (Dock pilot)**: View › Float Tool Window (or the
+  Float chip in the bottom tab strip) detaches the current bottom tab into a
+  floating card over the editor; its title bar drags it, and Dock restores the
+  bottom panel. Edge docking and per-pane floating are still pending.
 - **Resizable workbench**: drag the 4 px splitter right of the project panel or
   above the bottom tool window; left width and each bottom tab's height are
   stored in `<config>/ui.json` under `layout` and restored on launch. The
@@ -402,7 +409,7 @@ Status of the Tauri shell's features in the native app.
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
-| Dockable/floating tool windows, drag-to-split | yes | no | P3 |
+| Dockable/floating tool windows, drag-to-split | yes | floating bottom tool window (drag + dock) pilot, edge docking pending | P2/P3 |
 | Multi-window / window groups | yes | no | P3 |
 | Updater, single instance, window-state | yes | no | P4 |
 | Playwright e2e | yes | no | P2 (`gpui_kit::test`) |
