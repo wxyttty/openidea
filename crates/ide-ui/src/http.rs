@@ -35,6 +35,7 @@ pub struct HttpPanel {
     headers: Entity<InputState>,
     body: Entity<InputState>,
     response: Option<HttpResponse>,
+    notice: Option<SharedString>,
     error: Option<SharedString>,
     running: bool,
     task: Option<Task<()>>,
@@ -78,6 +79,7 @@ impl HttpPanel {
             headers,
             body,
             response: None,
+            notice: None,
             error: None,
             running: false,
             task: None,
@@ -234,6 +236,37 @@ impl HttpPanel {
         }));
         cx.notify();
     }
+    fn save_response(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else { return };
+        let Some(response) = self.response.clone() else { return };
+        match save_response_body(&project.root, &response) {
+            Ok(path) => {
+                self.notice = Some(format!("Saved {}", path.display()).into());
+                self.error = None;
+            }
+            Err(err) => self.error = Some(format!("Save failed: {err}").into()),
+        }
+        cx.notify();
+    }
+}
+
+/// Writes the response body into `<project>/.openidea/exports/http-<ms>.<json|txt>`
+/// and returns the path. Binary (missing body) responses are rejected.
+fn save_response_body(root: &std::path::Path, response: &HttpResponse) -> std::io::Result<PathBuf> {
+    let body = response
+        .body
+        .clone()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "binary response body"))?;
+    let extension = if response.content_type.as_deref().unwrap_or("").contains("json") { "json" } else { "txt" };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let dir = root.join(".openidea").join("exports");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("http-{stamp}.{extension}"));
+    std::fs::write(&path, body)?;
+    Ok(path)
 }
 
 impl Focusable for HttpPanel {
@@ -274,6 +307,8 @@ impl Render for HttpPanel {
             } else {
                 format!("{:.0} B", response.size)
             };
+            let save_response = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.save_response(cx));
+            let save_hover = theme.list_hover;
             response_area = response_area.child(
                 div()
                     .h(px(26.))
@@ -295,7 +330,28 @@ impl Render for HttpPanel {
                     .child(div().text_size(px(10.)).text_color(theme.fg_muted()).child(size))
                     .when(response.truncated, |this| {
                         this.child(div().text_size(px(10.)).text_color(theme.warning).child("truncated"))
-                    }),
+                    })
+                    .when_some(self.notice.clone(), |this, notice| {
+                        this.child(div().truncate().text_size(px(9.5)).text_color(theme.fg_muted()).child(notice))
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("http-save")
+                            .h(px(18.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(move |this| this.bg(save_hover))
+                            .on_click(save_response)
+                            .text_size(px(9.5))
+                            .text_color(theme.fg_secondary())
+                            .child("Save"),
+                    ),
             );
             if !response.headers.is_empty() {
                 let mut headers = div().px_3().py_1().flex().flex_col().border_b_1().border_color(theme.border);
@@ -584,5 +640,44 @@ impl Render for HttpPanel {
             })
             .child(response_area)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_response_body;
+    use ide_http::HttpResponse;
+
+    fn response(content_type: Option<&str>, body: Option<&str>) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            status_text: "OK".into(),
+            version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            content_type: content_type.map(str::to_owned),
+            body: body.map(str::to_owned),
+            size: body.map_or(0., |body| body.len() as f64),
+            truncated: false,
+            ttfb_ms: 1.,
+            total_ms: 2.,
+        }
+    }
+
+    #[test]
+    fn writes_json_and_text_bodies_into_exports() {
+        let root = std::env::temp_dir().join(format!("openidea-http-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let json = save_response_body(&root, &response(Some("application/json"), Some("{\"a\":1}"))).unwrap();
+        assert!(json.extension().is_some_and(|extension| extension == "json"));
+        assert_eq!(std::fs::read_to_string(&json).unwrap(), "{\"a\":1}");
+
+        let text = save_response_body(&root, &response(Some("text/plain"), Some("hello"))).unwrap();
+        assert!(text.extension().is_some_and(|extension| extension == "txt"));
+        assert_eq!(std::fs::read_to_string(&text).unwrap(), "hello");
+
+        assert!(save_response_body(&root, &response(Some("image/png"), None)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

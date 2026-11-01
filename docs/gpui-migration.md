@@ -391,7 +391,7 @@ Status of the Tauri shell's features in the native app.
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit) |
 | Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
-| HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret | P2 (gutter run icons, response tools) |
+| HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
 | Settings windows | yes | editor/terminal font size + theme; read-only fields | P2 (full tree, keymap editor) |
