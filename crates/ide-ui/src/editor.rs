@@ -80,6 +80,7 @@ pub struct EditorArea {
     tabs: Vec<Tab>,
     /// 0-based breakpoint lines by file, mirrored from the workbench store.
     breakpoints: BTreeMap<PathBuf, Vec<u32>>,
+    soft_wrap: bool,
     /// Code font size in px (Settings › Editor › Font size).
     font_size: f32,
     active: Option<usize>,
@@ -93,6 +94,7 @@ impl EditorArea {
             project: None,
             tabs: Vec::new(),
             breakpoints: BTreeMap::new(),
+            soft_wrap: false,
             font_size: 13.,
             active: None,
             notice: None,
@@ -172,6 +174,9 @@ impl EditorArea {
             state.set_readonly(info.read_only, cx);
             state
         });
+        if self.soft_wrap {
+            state.update(cx, |state, cx| state.set_soft_wrap(true, window, cx));
+        }
         // Completion, hover and go-to-definition are answered from the same
         // document buffer the server watches.
         let provider = std::rc::Rc::new(crate::lsp::IdeLspProvider::new(project.clone(), info.id));
@@ -208,6 +213,15 @@ impl EditorArea {
         // The subscription must live as long as the tab.
         self.tabs[index]._change = Some(change);
         self.apply_breakpoints(index, cx);
+        cx.notify();
+    }
+
+    /// Apply Editor › Soft wrap to every tab and to files opened later.
+    pub fn set_soft_wrap_default(&mut self, wrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.soft_wrap = wrap;
+        for tab in &self.tabs {
+            tab.state.update(cx, |state, cx| state.set_soft_wrap(wrap, window, cx));
+        }
         cx.notify();
     }
 

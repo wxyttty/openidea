@@ -113,6 +113,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Settings tree: `Ctrl+Alt+S` switched Editor → Terminal → Appearance via the
+  left section list, and the Format on save toggle wrote
+  `formatOnSave = true` then `false` to `settings.toml`.
 - Database cell editing: right-clicking the `id` cell of row 0 opened the
   auto-focused cell editor; replacing `1` with `10` and pressing Enter ran the
   UPDATE (key `id=1`, value `10`) and SQLite showed `10|alpha|1`.
@@ -397,7 +400,7 @@ Status of the Tauri shell's features in the native app.
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
-| Settings windows | yes | editor/terminal font size + theme; read-only fields | P2 (full tree, keymap editor) |
+| Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | no | P3 |
 | Multi-window / window groups | yes | no | P3 |

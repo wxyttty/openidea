@@ -312,6 +312,14 @@ enum LeftPanel {
     Vcs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSection {
+    Editor,
+    Terminal,
+    Appearance,
+    General,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaletteMode {
     Commands,
@@ -369,6 +377,7 @@ pub struct Workbench {
     find_index: usize,
     find_searched: bool,
     settings_open: bool,
+    settings_section: SettingsSection,
     editor_font_size: f32,
     terminal_font_size: f32,
     layout: Layout,
@@ -448,6 +457,8 @@ impl Workbench {
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let diff = cx.new(|cx| DiffPanel::new(cx));
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
+        let initial_soft_wrap = initial_settings.editor.soft_wrap;
+        editor.update(cx, |editor, cx| editor.set_soft_wrap_default(initial_soft_wrap, window, cx));
         terminal.update(cx, |terminal, cx| terminal.set_font_size(terminal_font_size, cx));
         cx.subscribe(&vcs, |this: &mut Self, _vcs, event: &crate::vcs::OpenDiffRequest, cx| {
             this.show_bottom = true;
@@ -508,6 +519,7 @@ impl Workbench {
             find_index: 0,
             find_searched: false,
             settings_open: false,
+            settings_section: SettingsSection::Editor,
             editor_font_size,
             terminal_font_size,
             layout,
@@ -948,6 +960,20 @@ impl Workbench {
         let (line, col) = matches[index];
         self.status = format!("{}/{} · line {}", index + 1, len, line + 1).into();
         self.editor.update(cx, |editor, cx| editor.goto_line(line, col, window, cx));
+        cx.notify();
+    }
+
+    fn current_settings(&self) -> ide_core::settings::Settings {
+        match &self.project {
+            Some(project) => project.settings.effective(),
+            None => self.host.global_settings.effective(),
+        }
+    }
+
+    fn change_tab_size(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let settings = self.current_settings();
+        let next = (settings.editor.tab_size as i32 + delta).clamp(1, 8) as u32;
+        self.persist_setting("editor.tabSize", serde_json::json!(next));
         cx.notify();
     }
 
@@ -1922,12 +1948,212 @@ impl Render for Workbench {
                             .child("+"),
                     )
             };
+            let soft = settings.editor.soft_wrap;
+            let insert_spaces = settings.editor.insert_spaces;
+            let format_on_save = settings.editor.format_on_save;
+            let copy_on_selection = settings.terminal.copy_on_selection;
+            let soft_click = cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                this.persist_setting("editor.softWrap", serde_json::json!(!soft));
+                this.editor.update(cx, |editor, cx| editor.set_soft_wrap_default(!soft, window, cx));
+                cx.notify();
+            });
+            let insert_click = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.persist_setting("editor.insertSpaces", serde_json::json!(!insert_spaces));
+                cx.notify();
+            });
+            let format_click = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.persist_setting("editor.formatOnSave", serde_json::json!(!format_on_save));
+                cx.notify();
+            });
+            let copy_click = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.persist_setting("terminal.copyOnSelection", serde_json::json!(!copy_on_selection));
+                cx.notify();
+            });
+            let tab_minus = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.change_tab_size(-1, cx));
+            let tab_plus = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.change_tab_size(1, cx));
+            let header = |label: &'static str| {
+                div()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.fg_muted())
+                    .child(label)
+            };
+            let toggle = |label: &'static str,
+                          on: bool,
+                          id: &'static str,
+                          click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>| {
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(190.)).text_size(px(12.)).text_color(theme.fg_secondary()).child(label))
+                    .child(
+                        div()
+                            .id(id)
+                            .h(px(20.))
+                            .min_w(px(44.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(10.))
+                            .cursor_pointer()
+                            .when(on, |this| this.bg(theme.primary).text_color(theme.primary_foreground))
+                            .when(!on, |this| this.bg(theme.muted).text_color(theme.fg_muted()))
+                            .hover(move |this| this.opacity(0.9))
+                            .on_click(click)
+                            .text_size(px(9.5))
+                            .child(if on { "On" } else { "Off" }),
+                    )
+            };
+            let mut sidecar = div().w(px(150.)).flex_shrink_0().flex().flex_col().gap_1();
+            for (section, label) in [
+                (SettingsSection::Editor, "Editor"),
+                (SettingsSection::Terminal, "Terminal"),
+                (SettingsSection::Appearance, "Appearance"),
+                (SettingsSection::General, "General"),
+            ] {
+                let selected = self.settings_section == section;
+                let hover = list_hover;
+                let pick = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    this.settings_section = section;
+                    cx.notify();
+                });
+                sidecar = sidecar.child(
+                    div()
+                        .id(ElementId::Name(format!("settings-section-{label}").into()))
+                        .h(px(26.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .when(selected, |this| this.bg(theme.list_active).text_color(theme.accent_foreground))
+                        .when(!selected, |this| this.text_color(theme.fg_secondary()).hover(move |this| this.bg(hover)))
+                        .on_click(pick)
+                        .child(label),
+                );
+            }
+            let mut pane = div().flex_1().min_w_0().flex().flex_col().gap_1();
+            match self.settings_section {
+                SettingsSection::Editor => {
+                    pane = pane
+                        .child(header("Editor"))
+                        .child(stepper(
+                            "Font size",
+                            Box::new(editor_minus),
+                            Box::new(editor_plus),
+                            self.editor_font_size,
+                            "settings-editor-minus",
+                            "settings-editor-plus",
+                        ))
+                        .child(stepper(
+                            "Tab size",
+                            Box::new(tab_minus),
+                            Box::new(tab_plus),
+                            settings.editor.tab_size as f32,
+                            "settings-tab-minus",
+                            "settings-tab-plus",
+                        ))
+                        .child(toggle("Soft wrap", soft, "settings-soft-wrap", Box::new(soft_click)))
+                        .child(toggle("Insert spaces", insert_spaces, "settings-insert-spaces", Box::new(insert_click)))
+                        .child(toggle(
+                            "Format on save",
+                            format_on_save,
+                            "settings-format-save",
+                            Box::new(format_click),
+                        ));
+                }
+                SettingsSection::Terminal => {
+                    pane = pane
+                        .child(header("Terminal"))
+                        .child(stepper(
+                            "Font size",
+                            Box::new(terminal_minus),
+                            Box::new(terminal_plus),
+                            self.terminal_font_size,
+                            "settings-terminal-minus",
+                            "settings-terminal-plus",
+                        ))
+                        .child(toggle(
+                            "Copy on selection",
+                            copy_on_selection,
+                            "settings-copy-selection",
+                            Box::new(copy_click),
+                        ))
+                        .child(info(
+                            "Shell",
+                            if settings.terminal.shell_path.trim().is_empty() {
+                                "Login shell".to_owned()
+                            } else {
+                                settings.terminal.shell_path.clone()
+                            },
+                        ));
+                }
+                SettingsSection::Appearance => {
+                    pane = pane
+                        .child(header("Appearance"))
+                        .child(
+                            div()
+                                .h(px(30.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(190.))
+                                        .text_size(px(12.))
+                                        .text_color(theme.fg_secondary())
+                                        .child("Theme"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .child(self.theme.label()),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-theme")
+                                        .px_2()
+                                        .py(px(2.))
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .hover(move |this| this.bg(list_hover))
+                                        .on_click(appearance)
+                                        .text_size(px(11.))
+                                        .text_color(theme.link)
+                                        .child("Change…"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.fg_muted())
+                                .child("Seven built-in schemes from src/styles/tokens.css."),
+                        );
+                }
+                SettingsSection::General => {
+                    pane = pane
+                        .child(header("General"))
+                        .child(info("Settings file", file.clone()))
+                        .child(info("Config directory", self.config_dir.display().to_string()))
+                        .child(info("Data directory", self.data_dir.display().to_string()))
+                        .child(info("Version", env!("CARGO_PKG_VERSION").to_owned()));
+                }
+            }
             let card = div()
-                .w(px(520.))
+                .w(px(760.))
                 .p_4()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_3()
                 .bg(theme.popover)
                 .border_1()
                 .border_color(theme.border_strong())
@@ -1942,81 +2168,7 @@ impl Render for Workbench {
                         .child("Settings"),
                 )
                 .child(div().text_size(px(10.5)).text_color(theme.fg_muted()).child(format!("User settings · {file}")))
-                .child(div().h(px(8.)))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.fg_muted())
-                        .child("EDITOR"),
-                )
-                .child(stepper(
-                    "Font size",
-                    Box::new(editor_minus),
-                    Box::new(editor_plus),
-                    self.editor_font_size,
-                    "settings-editor-minus",
-                    "settings-editor-plus",
-                ))
-                .child(info("Tab size", format!("{}", settings.editor.tab_size)))
-                .child(info("Insert spaces", if settings.editor.insert_spaces { "On".into() } else { "Off".into() }))
-                .child(div().h(px(8.)))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.fg_muted())
-                        .child("TERMINAL"),
-                )
-                .child(stepper(
-                    "Font size",
-                    Box::new(terminal_minus),
-                    Box::new(terminal_plus),
-                    self.terminal_font_size,
-                    "settings-terminal-minus",
-                    "settings-terminal-plus",
-                ))
-                .child(info(
-                    "Shell",
-                    if settings.terminal.shell_path.trim().is_empty() {
-                        "Login shell".to_owned()
-                    } else {
-                        settings.terminal.shell_path.clone()
-                    },
-                ))
-                .child(div().h(px(8.)))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.fg_muted())
-                        .child("APPEARANCE"),
-                )
-                .child(
-                    div()
-                        .h(px(30.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(170.)).text_size(px(12.)).text_color(theme.fg_secondary()).child("Theme"))
-                        .child(div().flex_1().text_size(px(12.)).text_color(theme.foreground).child(self.theme.label()))
-                        .child(
-                            div()
-                                .id("settings-theme")
-                                .px_2()
-                                .py(px(2.))
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(theme.border)
-                                .hover(move |this| this.bg(list_hover))
-                                .on_click(appearance)
-                                .text_size(px(11.))
-                                .text_color(theme.link)
-                                .child("Change…"),
-                        ),
-                )
-                .child(div().h(px(10.)))
+                .child(div().flex().gap_4().child(sidecar).child(pane))
                 .child(
                     div()
                         .flex()
