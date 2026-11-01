@@ -314,3 +314,16 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE
 ```
+
+## GPUI ecosystem (native shell, `crates/ide-ui`, `crates/openidea-gpui`)
+
+The native workbench links these Cargo dependencies; none of their source is
+vendored into this repository. All are Apache-2.0, except the Lucide icons
+(ISC) embedded by `gpui-kit-assets`.
+
+- [GPUI](https://github.com/zed-industries/zed) (`gpui-pre` 0.3.10,
+  Apache-2.0), Copyright Zed Industries, Inc. and contributors.
+- [gpui-kit](https://github.com/longbridge/gpui-kit) (`gpui-kit`,
+  `gpui-base`, `gpui-component`, `gpui-kit-assets`, Apache-2.0), Copyright
+  Longbridge and contributors.
+- [Lucide](https://lucide.dev) icons (ISC), Copyright Lucide Contributors.

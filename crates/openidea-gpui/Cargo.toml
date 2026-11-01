@@ -1,0 +1,28 @@
+[package]
+name = "openidea-gpui"
+description = "OpenIDEA desktop app: GPUI shell (replaces the Tauri shell)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openidea-gpui"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+ide-ui.workspace = true
+ide-core.workspace = true
+ide-host.workspace = true
+ide-language.workspace = true
+ide-syntax.workspace = true
+ide-workspace.workspace = true
+ide-tools.workspace = true
+ide-dap.workspace = true
+ide-sdk.workspace = true
+ide-ssh.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true

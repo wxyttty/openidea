@@ -22,6 +22,8 @@
     "gen:theme-docs": "node scripts/theme/gen-docs.ts",
     "theme:import-intellij": "node scripts/theme/import-intellij-theme.ts",
     "dev:app": "node scripts/tauri.ts dev --config src-tauri/tauri.dev.conf.json",
+    "dev:gpui": "cargo run -p openidea-gpui",
+    "build:gpui": "cargo build --release -p openidea-gpui",
     "dev:status": "node scripts/dev-status.ts",
     "e2e": "playwright test",
     "perf": "node perf/run.ts",

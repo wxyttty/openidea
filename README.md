@@ -49,6 +49,32 @@ both sides. Both are measured from the outside, the same way: see
 
 ## Build
 
+### Native shell (GPUI) — in progress
+
+The desktop shell is being rebuilt on the GPUI ecosystem: no webview, no IPC.
+`crates/openidea-gpui` is a real app today: project tree, editor with syntax
+highlighting over the shared document buffers, language-server diagnostics and
+completion/hover/definition, Problems panel, Go to File, Find in Path, Git
+tool window with diff/stage/commit, a native terminal, Run and Debug tool
+windows (F5/Shift+F5 console; Shift+F9 DAP session with call stack, variables,
+watches and step/line breakpoints), tabs, command palette, menus, trust flow,
+seven themes, an Appearance dialog, a Settings dialog for editor/terminal
+fonts, resizable persisted panel layout, a Database tool window for
+SQLite/PostgreSQL/MySQL and an HTTP client with `.http` files — all on the
+same Rust backend as the Tauri shell, with no webview and no IPC. See [`docs/gpui-migration.md`](docs/gpui-migration.md)
+for status and the phase plan.
+
+```sh
+cargo run -p openidea-gpui                 # welcome screen
+cargo run -p openidea-gpui -- path/to/dir  # open a project
+cargo run -p openidea-gpui -- path/to/file # open a file in its project
+```
+
+Needs a GPU (Vulkan/Metal/DX12) and the usual Linux windowing libraries
+(Wayland or X11, xkbcommon, fontconfig). No Node or Tauri prerequisites.
+
+### Tauri shell (current shipped app)
+
 ```sh
 pnpm install
 pnpm tauri dev
