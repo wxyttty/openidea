@@ -6339,6 +6339,7 @@ dependencies = [
  "ide-host",
  "ide-http",
  "ide-lsp",
+ "ide-notebook",
  "ide-run",
  "ide-search",
  "ide-terminal",

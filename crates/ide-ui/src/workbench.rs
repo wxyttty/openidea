@@ -14,6 +14,7 @@ use crate::diff::DiffPanel;
 use crate::editor::{EditorArea, TabInfo};
 use crate::http::HttpPanel;
 use crate::layout::Layout;
+use crate::notebook::NotebookPanel;
 use crate::problems::{ProblemsPanel, SharedDiagnostics, shared_diagnostics};
 use crate::project_tree::ProjectTree;
 use crate::run::RunPanel;
@@ -112,6 +113,7 @@ enum Cmd {
     ShowDebug,
     ShowDb,
     ShowHttp,
+    ShowNotebook,
     RunHttpAtCaret,
     StopDebug,
     ResumeDebug,
@@ -154,6 +156,7 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Toggle Theme", shortcut: None, cmd: Cmd::ToggleTheme },
     MenuEntry { label: "Database", shortcut: Some("Alt+3"), cmd: Cmd::ShowDb },
     MenuEntry { label: "HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
+    MenuEntry { label: "Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Zoom In", shortcut: None, cmd: Cmd::ZoomIn },
     MenuEntry { label: "Zoom Out", shortcut: None, cmd: Cmd::ZoomOut },
     MenuEntry { label: "Reset Zoom", shortcut: None, cmd: Cmd::ZoomReset },
@@ -171,6 +174,7 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
 
 const GIT_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
+    MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Refresh Status", shortcut: None, cmd: Cmd::RefreshVcs },
 ];
 
@@ -244,6 +248,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Previous Tab", shortcut: Some("Ctrl+Shift+Tab"), cmd: Cmd::PrevTab },
     MenuEntry { label: "Show Project", shortcut: Some("Alt+1"), cmd: Cmd::ShowProject },
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
+    MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -263,6 +268,7 @@ enum BottomTab {
     Debug,
     Db,
     Http,
+    Notebook,
 }
 
 impl BottomTab {
@@ -275,6 +281,7 @@ impl BottomTab {
             BottomTab::Debug => 4,
             BottomTab::Db => 5,
             BottomTab::Http => 6,
+            BottomTab::Notebook => 7,
         }
     }
 }
@@ -318,6 +325,7 @@ pub struct Workbench {
     debug: Entity<DebugPanel>,
     db: Entity<DbPanel>,
     http: Entity<HttpPanel>,
+    notebook: Entity<NotebookPanel>,
     diff: Entity<DiffPanel>,
     search: Entity<SearchPanel>,
     vcs: Entity<VcsPanel>,
@@ -427,6 +435,7 @@ impl Workbench {
         let debug = cx.new(|cx| DebugPanel::new(host.clone(), window, cx));
         let db = cx.new(|cx| DbPanel::new(host.clone(), window, cx));
         let http = cx.new(|cx| HttpPanel::new(host.clone(), window, cx));
+        let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
         let diff = cx.new(|cx| DiffPanel::new(cx));
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
         terminal.update(cx, |terminal, cx| terminal.set_font_size(terminal_font_size, cx));
@@ -451,6 +460,7 @@ impl Workbench {
             debug,
             db,
             http,
+            notebook,
             diff,
             search,
             vcs,
@@ -650,6 +660,7 @@ impl Workbench {
                 self.debug.update(cx, |debug, cx| debug.set_project(&project, cx));
                 self.db.update(cx, |db, cx| db.set_project(&project, cx));
                 self.http.update(cx, |http, cx| http.set_project(&project, cx));
+                self.notebook.update(cx, |notebook, cx| notebook.set_project(&project, cx));
                 self.breakpoints = Breakpoints::load(&self.config_dir, &project.root);
                 let map = self.breakpoints.map();
                 self.editor.update(cx, |editor, cx| editor.set_breakpoints(map, cx));
@@ -814,6 +825,20 @@ impl Workbench {
                 self.bottom = BottomTab::Http;
                 if let (Some((path, text, index)), Some(project)) = (self.active_http_file(cx), self.project.clone()) {
                     self.http.update(cx, |http, cx| http.use_file(path, text, &project.root, index, Some(window), cx));
+                }
+                cx.notify();
+            }
+            Cmd::ShowNotebook => {
+                self.show_bottom = true;
+                self.bottom = BottomTab::Notebook;
+                if let Some(info) = self.editor.read(cx).active_info()
+                    && info.path.extension().and_then(|ext| ext.to_str()) == Some("ipynb")
+                {
+                    let path = info.path.clone();
+                    let changed = self.notebook.read(cx).path() != Some(&path);
+                    if changed {
+                        self.notebook.update(cx, |notebook, cx| notebook.open_path(path, cx));
+                    }
                 }
                 cx.notify();
             }
@@ -1404,7 +1429,8 @@ impl Workbench {
                     .child(tab("Run", self.bottom == BottomTab::Run, BottomTab::Run, cx))
                     .child(tab("Debug", self.bottom == BottomTab::Debug, BottomTab::Debug, cx))
                     .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, cx))
-                    .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, cx)),
+                    .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, cx))
+                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, cx)),
             )
             .child(match self.bottom {
                 BottomTab::Problems => div().flex_1().min_h_0().child(self.problems.clone()),
@@ -1414,6 +1440,7 @@ impl Workbench {
                 BottomTab::Debug => div().flex_1().min_h_0().child(self.debug.clone()),
                 BottomTab::Db => div().flex_1().min_h_0().child(self.db.clone()),
                 BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
+                BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
             })
             .into_any_element()
     }
@@ -2668,6 +2695,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &ShowDebug, window, cx| this.run(Cmd::ShowDebug, window, cx)))
             .on_action(cx.listener(|this, _: &ShowDb, window, cx| this.run(Cmd::ShowDb, window, cx)))
             .on_action(cx.listener(|this, _: &ShowHttp, window, cx| this.run(Cmd::ShowHttp, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowNotebook, window, cx| this.run(Cmd::ShowNotebook, window, cx)))
             .on_action(cx.listener(|this, _: &RunHttpAtCaret, window, cx| this.run(Cmd::RunHttpAtCaret, window, cx)))
             .on_action(cx.listener(|this, _: &StopDebug, window, cx| this.run(Cmd::StopDebug, window, cx)))
             .on_action(cx.listener(|this, _: &ResumeDebug, window, cx| this.run(Cmd::ResumeDebug, window, cx)))

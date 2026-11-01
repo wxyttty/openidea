@@ -38,6 +38,7 @@ gpui_kit::actions!(
         ShowRun,
         ShowDb,
         ShowHttp,
+        ShowNotebook,
         RunHttpAtCaret,
         Debug,
         ShowDebug,
@@ -86,6 +87,7 @@ pub fn install(cx: &mut App) {
     bind("alt-4", Box::new(ShowRun));
     bind("alt-3", Box::new(ShowDb));
     bind("alt-7", Box::new(ShowHttp));
+    bind("alt-8", Box::new(ShowNotebook));
     bind("ctrl-alt-r", Box::new(RunHttpAtCaret));
     bind("shift-f9", Box::new(Debug));
     bind("alt-5", Box::new(ShowDebug));

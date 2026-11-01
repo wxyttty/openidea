@@ -113,6 +113,9 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Notebook: a 3-cell `sample.ipynb` opened with `Alt+8`; the panel rendered
+  the markdown cell, two code cells (`CODE [2]`, `CODE`), their sources and
+  outputs (`hello from notebook`, `42`) with the notebook tab active.
 - Recent Projects modal: seeded `recent.json` with `ra-proj` (active) and
   `ra-proj2`, File › Open Recent Project… rendered both rows with the active
   one highlighted; clicking `ra-proj2` opened it (`opened /tmp/ra-proj2 in
@@ -212,6 +215,11 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   `execute`, 300-row limit), a results grid with column types, `NULL` values,
   affected-row/elapsed summaries, and a table strip that fills
   `SELECT * FROM "table" LIMIT 100` (populated after a successful connect).
+- **Notebook** (`Alt+8`, View menu): read-only native viewer over
+  `Project.notebooks` (`ide-notebook`): markdown and code cells with sources,
+  execution counts, stream/result/error outputs, dirty state and nbformat in
+  a bottom tool window; opened from the active `.ipynb` tab. Editing and
+  kernel execution still require the Tauri shell (no `ipykernel` here).
 - **HTTP Client** (`Alt+7`): method/URL/header/body fields assembled into the
   `.http` text format and sent through `ide_http::run` (proxies and variables
   included), with a status line (colour by class, protocol, ms, size), response
@@ -342,6 +350,7 @@ Status of the Tauri shell's features in the native app.
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, auto PTY resize, font size | P2 (splits) |
 | Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
 | Database tool window | yes | sources, sidebar with columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row edit/delete/insert, CSV export, auto-connect | P2 (inline cell edit, views) |
+| Notebook | yes | read-only native viewer (cells, outputs, nbformat); Alt+8 | P2 (edit cells, kernel execution) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret | P2 (gutter run icons, response tools) |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
