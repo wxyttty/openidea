@@ -31,7 +31,7 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 
 `pnpm dev:gpui` and `pnpm build:gpui` wrap the same commands.
 
-### Verified end-to-end (this machine, Linux/Wayland + Xwayland, stable 1.95)
+### Verified end-to-end (this machine, Linux/Wayland + Xwayland, stable 1.96)
 
 - Window opens with the OpenIDEA palette (Islands Dark / Light, taken from
   `src/styles/tokens.css`), menu bar, tool-window stripe, project tree, editor
@@ -113,6 +113,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Find in File: `Ctrl+F` → `beta` → Enter jumped to the match on line 2; typed
   `XX` and `Ctrl+S`, the file line became `fn XXbeta() {}` (the bar's
   next-frame focus and the editor hand-off were verified through tracing).
+- Plugins: with a static test package in `<data>/plugins`, View › Plugins…
+  listed `test-static · Static`; Disable ran `set_enabled`, wrote
+  `state.json` (`disabled: ["test-static"]`) and the refreshed list showed
+  `Disabled`.
 - Settings tree: `Ctrl+Alt+S` switched Editor → Terminal → Appearance via the
   left section list, and the Format on save toggle wrote
   `formatOnSave = true` then `false` to `settings.toml`.
@@ -278,6 +282,12 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   Opening a `.http`/`.rest` file in the editor and pressing `Alt+7` loads it
   automatically; **Ctrl+Alt+R** runs the request block under the caret (a single
   environment is selected automatically).
+- **Plugins** (View › Plugins…): native dialog over `ide-plugin`'s
+  `PluginHost` (same `<data>/plugins` directory and per-project dev plugins):
+  installed plugins with version/status/description, Enable/Disable, Reload,
+  Remove, Install from folder…, persisted in the plugin host's `state.json`
+  (an existing plugin manager is reused; plugin events such as insert-text
+  are not routed to the native UI yet).
 - **Floating tool window (Dock pilot)**: View › Float Tool Window (or the
   Float chip in the bottom tab strip) detaches the current bottom tab into a
   floating card over the editor; its title bar drags it, and Dock restores the
@@ -410,6 +420,7 @@ Status of the Tauri shell's features in the native app.
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | floating bottom tool window (drag + dock) pilot, edge docking pending | P2/P3 |
+| Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder | P2 (commands, insert-text events, marketplace) |
 | Multi-window / window groups | yes | no | P3 |
 | Updater, single instance, window-state | yes | no | P4 |
 | Playwright e2e | yes | no | P2 (`gpui_kit::test`) |

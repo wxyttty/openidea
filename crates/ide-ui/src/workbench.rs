@@ -34,6 +34,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_core::IdeEvent;
 use ide_host::Host;
+use ide_plugin::{Limits, PluginHost, PluginInfo, PluginStatus};
 use ide_workspace::{RecentProjects, SettingsScope};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -89,6 +90,7 @@ enum Cmd {
     ZoomReset,
     FloatBottom,
     DockBottom,
+    Plugins,
     Save,
     SaveAll,
     CloseTab,
@@ -161,6 +163,8 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Zoom In", shortcut: None, cmd: Cmd::ZoomIn },
@@ -172,6 +176,8 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Go to File…", shortcut: Some("Ctrl+P"), cmd: Cmd::QuickOpen },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
@@ -254,6 +260,8 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
+    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
@@ -422,6 +430,11 @@ pub struct Workbench {
     resize_drag: Option<ResizeDrag>,
     float_panel: Option<FloatPanel>,
     float_drag: Option<(f32, f32, f32, f32)>,
+    plugins: Option<Arc<PluginHost>>,
+    plugins_open: bool,
+    plugins_list: Vec<PluginInfo>,
+    plugins_notice: Option<SharedString>,
+    plugin_task: Option<Task<()>>,
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
     goto_input: Entity<InputState>,
@@ -507,6 +520,16 @@ impl Workbench {
         })
         .detach();
         let recent = RecentProjects::load(&config.config_dir);
+        let plugin_sink: Arc<dyn ide_plugin::PluginEventSink> =
+            Arc::new(|_: Option<&str>, _: ide_plugin::PluginEvent| {});
+        let plugins =
+            PluginHost::new(config.data_dir.join("plugins"), plugin_sink, Limits::default()).ok().map(Arc::new);
+        if let Some(plugin_host) = &plugins {
+            let trust = host.clone();
+            plugin_host.set_project_policy(Arc::new(move |root| trust.trust.trusted(root).unwrap_or(false)));
+            let loader = plugin_host.clone();
+            let _ = std::thread::Builder::new().name("plugin-load".into()).spawn(move || loader.load_all());
+        }
         let mut this = Self {
             host,
             config_dir: config.config_dir,
@@ -566,6 +589,11 @@ impl Workbench {
             resize_drag: None,
             float_panel: None,
             float_drag: None,
+            plugins,
+            plugins_open: false,
+            plugins_list: Vec::new(),
+            plugins_notice: None,
+            plugin_task: None,
             condition_input,
             log_input,
             goto_input,
@@ -775,6 +803,10 @@ impl Workbench {
                         }
                     });
                 });
+            }
+            Cmd::Plugins => {
+                self.plugins_open = true;
+                self.refresh_plugins(cx);
             }
             Cmd::FloatBottom => {
                 if !self.show_bottom {
@@ -1016,6 +1048,53 @@ impl Workbench {
             Some(project) => project.settings.effective(),
             None => self.host.global_settings.effective(),
         }
+    }
+
+    fn refresh_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(plugins) = self.plugins.clone() else {
+            self.plugins_notice = Some("Plugin host unavailable".into());
+            cx.notify();
+            return;
+        };
+        let root = self.project.as_ref().map(|project| project.root.clone());
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        std::thread::spawn(move || {
+            plugins.wait_initial_load(std::time::Duration::from_secs(3));
+            if let Some(root) = &root {
+                plugins.sync_project(root);
+            }
+            let snapshot = plugins.list(root.as_deref());
+            let _ = tx.unbounded_send(snapshot);
+        });
+        self.plugin_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(snapshot) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.plugins_list = snapshot.plugins;
+                    this.plugins_notice = None;
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    fn plugin_action(&mut self, action: impl FnOnce() -> Result<(), String> + Send + 'static, cx: &mut Context<Self>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        std::thread::spawn(move || {
+            let _ = tx.unbounded_send(action());
+        });
+        self.plugin_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| match result {
+                    Ok(()) => this.refresh_plugins(cx),
+                    Err(err) => {
+                        this.plugins_notice = Some(err.into());
+                        cx.notify();
+                    }
+                });
+            }
+        }));
+        cx.notify();
     }
 
     fn float_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2946,6 +3025,256 @@ impl Render for Workbench {
                             .on_click(close)
                             .child(Icon::new(IconName::X).xsmall().text_color(theme.fg_secondary())),
                     )
+                    .into_any_element(),
+            );
+        }
+        if self.plugins_open {
+            let backdrop = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
+                this.plugins_open = false;
+                cx.notify();
+            });
+            let close = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.plugins_open = false;
+                cx.notify();
+            });
+            let plugin_hover = theme.list_hover;
+            let install = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                let Some(plugins) = this.plugins.clone() else { return };
+                if let Some(dir) = rfd::FileDialog::new().set_title("Install Plugin").pick_folder() {
+                    this.plugin_action(
+                        move || plugins.install_from_dir(&dir).map(|_| ()).map_err(|err| err.to_string()),
+                        cx,
+                    );
+                }
+            });
+            let mut list = div().id("plugins-list").flex_1().min_h_0().flex().flex_col().gap_1().overflow_y_scroll();
+            if self.plugins_list.is_empty() {
+                list = list
+                    .child(div().py_6().text_size(px(11.5)).text_color(theme.fg_muted()).child("No plugins installed"));
+            }
+            for plugin in &self.plugins_list {
+                let id = plugin.id.clone();
+                let enabled = plugin.enabled;
+                let status = match plugin.status {
+                    PluginStatus::Active => ("active", theme.success),
+                    PluginStatus::Static => ("static", theme.info),
+                    PluginStatus::Disabled => ("disabled", theme.fg_muted()),
+                    PluginStatus::Failed => ("failed", theme.danger),
+                };
+                let plugins = self.plugins.clone();
+                let toggle_id = id.clone();
+                let toggle = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    if let Some(plugins) = plugins.clone() {
+                        let id = toggle_id.clone();
+                        let enabled = enabled;
+                        this.plugin_action(
+                            move || plugins.set_enabled(&id, !enabled).map(|_| ()).map_err(|err| err.to_string()),
+                            cx,
+                        );
+                    }
+                });
+                let plugins = self.plugins.clone();
+                let reload_id = id.clone();
+                let reload = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    if let Some(plugins) = plugins.clone() {
+                        let id = reload_id.clone();
+                        this.plugin_action(move || plugins.reload(&id).map(|_| ()).map_err(|err| err.to_string()), cx);
+                    }
+                });
+                let plugins = self.plugins.clone();
+                let remove_id = id.clone();
+                let remove = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    if let Some(plugins) = plugins.clone() {
+                        let id = remove_id.clone();
+                        this.plugin_action(move || plugins.uninstall(&id).map_err(|err| err.to_string()), cx);
+                    }
+                });
+                list = list.child(
+                    div()
+                        .w_full()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child(format!("{} {}", plugin.name, plugin.version)),
+                                )
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .rounded(px(2.))
+                                        .bg(theme.background)
+                                        .text_size(px(8.5))
+                                        .text_color(status.1)
+                                        .child(status.0),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("plugin-toggle-{}", plugin.id).into()))
+                                        .h(px(18.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .hover(move |this| this.bg(plugin_hover))
+                                        .on_click(toggle)
+                                        .text_size(px(9.))
+                                        .text_color(theme.fg_secondary())
+                                        .child(if enabled { "Disable" } else { "Enable" }),
+                                )
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("plugin-reload-{}", plugin.id).into()))
+                                        .h(px(18.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .hover(move |this| this.bg(plugin_hover))
+                                        .on_click(reload)
+                                        .text_size(px(9.))
+                                        .text_color(theme.fg_secondary())
+                                        .child("Reload"),
+                                )
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("plugin-remove-{}", plugin.id).into()))
+                                        .h(px(18.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .hover(move |this| this.bg(plugin_hover))
+                                        .on_click(remove)
+                                        .text_size(px(9.))
+                                        .text_color(theme.danger)
+                                        .child("Remove"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(theme.fg_muted())
+                                .child(format!("{} · {}", plugin.id, plugin.description)),
+                        )
+                        .when_some(plugin.error.clone(), |this, error| {
+                            this.child(div().text_size(px(9.5)).text_color(theme.danger).child(error))
+                        }),
+                );
+            }
+            let plugins_dir = self
+                .config_dir
+                .parent()
+                .map(|_| self.data_dir.join("plugins").display().to_string())
+                .unwrap_or_else(|| "plugins".to_owned());
+            let card = div()
+                .w(px(780.))
+                .h(px(520.))
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.border_strong())
+                .rounded(px(8.))
+                .shadow_xl()
+                .occlude()
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child("Plugins"),
+                )
+                .child(div().text_size(px(10.)).text_color(theme.fg_muted()).child(plugins_dir))
+                .child(list)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when_some(self.plugins_notice.clone(), |this, notice| {
+                            this.child(div().flex_1().text_size(px(10.)).text_color(theme.warning).child(notice))
+                        })
+                        .when(self.plugins_notice.is_none(), |this| this.child(div().flex_1()))
+                        .child(
+                            div()
+                                .id("plugins-install")
+                                .h(px(24.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(theme.border)
+                                .hover(move |this| this.bg(plugin_hover))
+                                .on_click(install)
+                                .text_size(px(10.5))
+                                .text_color(theme.fg_secondary())
+                                .child("Install from folder…"),
+                        )
+                        .child(
+                            div()
+                                .id("plugins-close")
+                                .h(px(24.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .bg(theme.primary)
+                                .hover(move |this| this.opacity(0.9))
+                                .on_click(close)
+                                .text_size(px(10.5))
+                                .text_color(theme.primary_foreground)
+                                .child("Close"),
+                        ),
+                );
+            overlays.push(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("plugins-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .bg(theme.overlay)
+                            .on_mouse_down(MouseButton::Left, backdrop),
+                    )
+                    .child(card)
                     .into_any_element(),
             );
         }
