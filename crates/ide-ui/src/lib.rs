@@ -31,6 +31,7 @@ pub mod http;
 pub mod layout;
 pub mod lsp;
 pub mod notebook;
+pub mod notifications;
 pub mod problems;
 pub mod project_tree;
 pub mod run;

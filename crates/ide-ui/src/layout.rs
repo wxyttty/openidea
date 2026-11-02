@@ -10,13 +10,15 @@ const FILE: &str = "ui.json";
 #[derive(Clone, Copy)]
 pub struct Layout {
     pub left_width: f32,
-    /// Problems, Terminal, Diff, Run, Debug, Database, HTTP, Notebook, Agents.
-    pub heights: [f32; 9],
+    /// Problems, Terminal, Diff, Run, Debug, Database, HTTP, Notebook, Agents,
+    /// Notifications. Indices are stable; new tabs append at the end so saved
+    /// layouts keep their meaning.
+    pub heights: [f32; 10],
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { left_width: 280., heights: [180., 366., 420., 320., 420., 420., 420., 420., 420.] }
+        Self { left_width: 280., heights: [180., 366., 420., 320., 420., 420., 420., 420., 420., 320.] }
     }
 }
 
@@ -61,7 +63,18 @@ impl Layout {
     }
 }
 
-const KEYS: [&str; 9] = ["problems", "terminal", "diff", "run", "debug", "database", "http", "notebook", "agents"];
+const KEYS: [&str; 10] = [
+    "problems",
+    "terminal",
+    "diff",
+    "run",
+    "debug",
+    "database",
+    "http",
+    "notebook",
+    "agents",
+    "notifications",
+];
 
 fn read(config_dir: &Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(config_dir.join(FILE)).ok()?;

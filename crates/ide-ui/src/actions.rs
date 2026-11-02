@@ -40,6 +40,7 @@ gpui_kit::actions!(
         ShowHttp,
         ShowNotebook,
         ShowAgents,
+        ShowNotifications,
         RunHttpAtCaret,
         Debug,
         ShowDebug,

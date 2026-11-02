@@ -16,6 +16,7 @@ use crate::editor::{EditorArea, TabInfo};
 use crate::http::HttpPanel;
 use crate::layout::Layout;
 use crate::notebook::NotebookPanel;
+use crate::notifications::NotificationLog;
 use crate::problems::{ProblemsPanel, SharedDiagnostics, shared_diagnostics};
 use crate::project_tree::ProjectTree;
 use crate::run::RunPanel;
@@ -130,6 +131,7 @@ enum Cmd {
     TrustProject,
     About,
     ShowAgents,
+    ShowNotifications,
     Quit,
 }
 
@@ -163,6 +165,7 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
+    MenuEntry { label: "Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
     MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
@@ -276,6 +279,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
     MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
+    MenuEntry { label: "Show Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -297,6 +301,7 @@ enum BottomTab {
     Http,
     Notebook,
     Agents,
+    Notifications,
 }
 
 impl BottomTab {
@@ -311,6 +316,7 @@ impl BottomTab {
             BottomTab::Http => "HTTP Client",
             BottomTab::Notebook => "Notebook",
             BottomTab::Agents => "Agents",
+            BottomTab::Notifications => "Notifications",
         }
     }
 
@@ -325,6 +331,7 @@ impl BottomTab {
             BottomTab::Http => 6,
             BottomTab::Notebook => 7,
             BottomTab::Agents => 8,
+            BottomTab::Notifications => 9,
         }
     }
 }
@@ -386,6 +393,7 @@ pub struct Workbench {
     http: Entity<HttpPanel>,
     notebook: Entity<NotebookPanel>,
     agents: Entity<AgentPanel>,
+    notifications: Entity<NotificationLog>,
     diff: Entity<DiffPanel>,
     search: Entity<SearchPanel>,
     vcs: Entity<VcsPanel>,
@@ -507,6 +515,7 @@ impl Workbench {
         let http = cx.new(|cx| HttpPanel::new(host.clone(), window, cx));
         let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
+        let notifications = cx.new(|_| NotificationLog::new());
         let diff = cx.new(|cx| DiffPanel::new(cx));
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
         let initial_soft_wrap = initial_settings.editor.soft_wrap;
@@ -545,6 +554,7 @@ impl Workbench {
             http,
             notebook,
             agents,
+            notifications,
             diff,
             search,
             vcs,
@@ -629,11 +639,33 @@ impl Workbench {
 
     fn on_event(&mut self, event: IdeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            IdeEvent::Notify { title, body, .. } => {
-                self.status = match body {
+            IdeEvent::Notify { level, title, body } => {
+                self.status = match body.as_deref() {
                     Some(body) if !body.is_empty() => format!("{title} — {body}").into(),
-                    _ => title.into(),
+                    _ => title.clone().into(),
                 };
+                // The Notifications tool window lists backend events under the
+                // `system` group, as the Tauri shell's NotificationService did;
+                // `log: false` keeps them out of the history. Project settings
+                // override the global ones when a project is open.
+                let settings = self
+                    .project
+                    .as_ref()
+                    .map(|project| project.settings.effective())
+                    .unwrap_or_else(|| self.host.global_settings.effective());
+                let logged = settings
+                    .notifications
+                    .groups
+                    .get("system")
+                    .map(|group| group.log)
+                    .unwrap_or(true);
+                if logged {
+                    let read = self.notifications_visible();
+                    self.notifications.update(cx, |log, cx| {
+                        log.push(level, title, body, read);
+                        cx.notify();
+                    });
+                }
                 cx.notify();
             }
             IdeEvent::ProjectTrustChanged { .. } => {
@@ -723,6 +755,29 @@ impl Workbench {
 
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = status.into();
+        cx.notify();
+    }
+
+    /// Whether the Notifications tool window is on screen: docked in the bottom
+    /// area (with or without a project) or detached into the floating panel.
+    fn notifications_visible(&self) -> bool {
+        self.bottom == BottomTab::Notifications && (self.float_panel.is_some() || self.show_bottom)
+    }
+
+    /// The notification history (the Notifications tool window's state).
+    pub fn notifications(&self) -> &Entity<NotificationLog> {
+        &self.notifications
+    }
+
+    /// Shows the Notifications tool window and marks the history read, as the
+    /// Tauri shell did when its list became visible.
+    fn show_notifications(&mut self, cx: &mut Context<Self>) {
+        self.show_bottom = true;
+        self.bottom = BottomTab::Notifications;
+        self.notifications.update(cx, |log, cx| {
+            log.mark_all_read();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -987,6 +1042,7 @@ impl Workbench {
                 self.agents.update(cx, |agents, cx| agents.ensure(window, cx));
                 cx.notify();
             }
+            Cmd::ShowNotifications => self.show_notifications(cx),
             Cmd::Quit => cx.quit(),
         }
     }
@@ -1583,23 +1639,48 @@ impl Workbench {
 
     fn render_bottom(&mut self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
         let height = self.layout.heights[self.bottom.index()];
-        let tab = |label: &'static str, selected: bool, target: BottomTab, cx: &mut Context<Self>| {
+        let tab = |label: &'static str, selected: bool, target: BottomTab, badge: usize, cx: &mut Context<Self>| {
             let click = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
                 this.bottom = target;
+                if target == BottomTab::Notifications {
+                    this.notifications.update(cx, |log, cx| {
+                        log.mark_all_read();
+                        cx.notify();
+                    });
+                }
                 cx.notify();
             });
             div()
                 .id(ElementId::Name(format!("bottom-tab-{label}").into()))
+                .test_support()
                 .h_full()
                 .px_3()
                 .flex()
                 .items_center()
+                .gap_1()
                 .cursor_pointer()
                 .text_size(px(11.5))
                 .text_color(if selected { theme.foreground } else { theme.fg_muted() })
                 .when(selected, |this| this.border_b_2().border_color(theme.accent))
                 .on_click(click)
                 .child(label)
+                .when(badge > 0, |this| {
+                    this.child(
+                        div()
+                            .id(ElementId::Name(format!("bottom-tab-badge-{label}").into()))
+                            .h(px(14.))
+                            .min_w(px(14.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .text_size(px(9.))
+                            .text_color(theme.background)
+                            .child(badge.to_string()),
+                    )
+                })
         };
         div()
             .h(px(height))
@@ -1618,15 +1699,22 @@ impl Workbench {
                     .bg(theme.tab_bar)
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(tab("Problems", self.bottom == BottomTab::Problems, BottomTab::Problems, cx))
-                    .child(tab("Terminal", self.bottom == BottomTab::Terminal, BottomTab::Terminal, cx))
-                    .child(tab("Diff", self.bottom == BottomTab::Diff, BottomTab::Diff, cx))
-                    .child(tab("Run", self.bottom == BottomTab::Run, BottomTab::Run, cx))
-                    .child(tab("Debug", self.bottom == BottomTab::Debug, BottomTab::Debug, cx))
-                    .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, cx))
-                    .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, cx))
-                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, cx))
-                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, cx))
+                    .child(tab("Problems", self.bottom == BottomTab::Problems, BottomTab::Problems, 0, cx))
+                    .child(tab("Terminal", self.bottom == BottomTab::Terminal, BottomTab::Terminal, 0, cx))
+                    .child(tab("Diff", self.bottom == BottomTab::Diff, BottomTab::Diff, 0, cx))
+                    .child(tab("Run", self.bottom == BottomTab::Run, BottomTab::Run, 0, cx))
+                    .child(tab("Debug", self.bottom == BottomTab::Debug, BottomTab::Debug, 0, cx))
+                    .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, 0, cx))
+                    .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, 0, cx))
+                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, 0, cx))
+                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, 0, cx))
+                    .child(tab(
+                        "Notifications",
+                        self.bottom == BottomTab::Notifications,
+                        BottomTab::Notifications,
+                        self.notifications.read(cx).unread(),
+                        cx,
+                    ))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1664,6 +1752,7 @@ impl Workbench {
             BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
             BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
             BottomTab::Agents => div().flex_1().min_h_0().child(self.agents.clone()),
+            BottomTab::Notifications => div().flex_1().min_h_0().child(self.notifications.clone()),
         }
         .into_any_element()
     }
@@ -1720,6 +1809,29 @@ impl Workbench {
                 .child(div().text_color(theme.fg_secondary()).child(info.language))
                 .child(div().text_color(theme.fg_muted()).child(info.name));
         }
+        let unread = self.notifications.read(cx).unread();
+        let unread_hover = theme.list_hover;
+        bar = bar.when(unread > 0, |this| {
+            this.child(
+                div()
+                    .id("status-notifications")
+                    .test_support()
+                    .h(px(18.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(unread_hover))
+                    .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                        this.show_notifications(cx);
+                    }))
+                    .text_color(theme.warning)
+                    .child(Icon::new(IconName::CircleAlert).xsmall())
+                    .child(format!("{unread}")),
+            )
+        });
         bar.child(div().text_color(theme.fg_muted()).child("GPUI")).into_any_element()
     }
 
@@ -3364,6 +3476,9 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &ShowHttp, window, cx| this.run(Cmd::ShowHttp, window, cx)))
             .on_action(cx.listener(|this, _: &ShowNotebook, window, cx| this.run(Cmd::ShowNotebook, window, cx)))
             .on_action(cx.listener(|this, _: &ShowAgents, window, cx| this.run(Cmd::ShowAgents, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowNotifications, window, cx| this.run(Cmd::ShowNotifications, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &RunHttpAtCaret, window, cx| this.run(Cmd::RunHttpAtCaret, window, cx)))
             .on_action(cx.listener(|this, _: &StopDebug, window, cx| this.run(Cmd::StopDebug, window, cx)))
             .on_action(cx.listener(|this, _: &ResumeDebug, window, cx| this.run(Cmd::ResumeDebug, window, cx)))
@@ -3416,7 +3531,38 @@ impl Render for Workbench {
                     .w_full()
                     .flex()
                     .child(stripe)
-                    .when_some(welcome, |this, welcome| this.child(welcome))
+                    .when_some(welcome, |this, welcome| {
+                        // Without a project only the Notifications tool window can
+                        // be open; it docks under the welcome screen so backend
+                        // messages stay reachable before any folder is opened.
+                        let show_notifications_drawer = show_bottom
+                            && self.bottom == BottomTab::Notifications
+                            && self.float_panel.is_none();
+                        this.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .child(welcome)
+                                .when(show_notifications_drawer, |this| {
+                                    let height = self.layout.heights[BottomTab::Notifications.index()];
+                                    this.child(
+                                        div()
+                                            .h(px(height))
+                                            .flex_shrink_0()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .bg(theme.background)
+                                            .border_t_1()
+                                            .border_color(theme.border)
+                                            .child(self.notifications.clone()),
+                                    )
+                                }),
+                        )
+                    })
                     .when(has_project, |this| {
                         this.child(
                             div()

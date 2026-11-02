@@ -31,3 +31,11 @@ lsp-types.workspace = true
 url.workspace = true
 vt100.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# UI integration tests: headless windows, native input dispatch, snapshots.
+gpui-kit = { workspace = true, features = ["test-support"] }
+# Workbench entry tests: a real `Host` (runtime + language registry) and temp dirs.
+tokio.workspace = true
+ide-language.workspace = true
+tempfile.workspace = true

@@ -309,6 +309,28 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - Backend events (`IdeEvent`) flow from `ide-core::EventSink` through a channel
   onto the GPUI thread; notifications update the status bar. Indexing progress
   is logged today and becomes a status item in Phase 1.
+- **Notifications tool window**: `IdeEvent::Notify` history (newest first,
+  200 entries) with level icons/colors, relative age, per-entry close and
+  Clear All, in a variable-height scrollable list (full bodies stay readable);
+  unread count on the bottom tab and in the status bar (click opens the panel).
+  Entries honor `notifications.groups.system.log` from the effective settings
+  (project overrides included), as the Tauri shell's NotificationService did.
+  The panel opens from the View menu, the command palette, the bottom tab and
+  the status bar; without a project it docks under the welcome screen, so
+  backend messages stay reachable before any folder is opened. Opening or
+  viewing the panel marks the history read; notifications arriving while it is
+  visible (docked or floating) are read on arrival. Balloon pop-ups (timeouts,
+  hover pause, sound, per-group display settings) are not ported yet.
+- **Notifications verification**: `cargo +nightly-2026-10-24 test --locked
+  -p ide-ui` covers the panel through `gpui_kit::test` in
+  `crates/ide-ui/tests/notifications_ui.rs` — entry close/Clear All, a
+  30-entry multi-line list scrolling inside a 480×320 window (bounds,
+  non-overlapping variable-height rows, scroll-then-close), the 200-entry
+  cap, and the workbench entry path with a real `Host`: hidden panel →
+  unread without auto-open, status-bar badge click → panel + read,
+  visible-panel arrival → read, and project `system.log = false` keeping
+  events out of the history. The app binary also boots and opens a project
+  on this machine; balloon behavior is untested (not ported).
 
 ## Ecosystem choices
 
@@ -410,7 +432,7 @@ Status of the Tauri shell's features in the native app.
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop | P1 (gutter dots, hit counts) |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
-| Problems / notifications panels | yes | Problems with real diagnostics (notifications: status bar) | P1 |
+| Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) | P2 (balloons) |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
