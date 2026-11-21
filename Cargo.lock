@@ -6707,6 +6707,7 @@ dependencies = [
  "ide-vfs",
  "ide-workspace",
  "lsp-types",
+ "regex-lite",
  "rfd",
  "serde_json",
  "tempfile",

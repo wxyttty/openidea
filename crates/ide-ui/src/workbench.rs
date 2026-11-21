@@ -12,11 +12,11 @@ use crate::breakpoints::Breakpoints;
 use crate::db::DbPanel;
 use crate::debug::{DebugAction, DebugPanel};
 use crate::diff::DiffPanel;
-use crate::editor::{EditorArea, TabInfo};
+use crate::editor::{EditorArea, FindOptions, TabInfo};
 use crate::http::HttpPanel;
 use crate::layout::Layout;
 use crate::notebook::NotebookPanel;
-use crate::notifications::NotificationLog;
+use crate::notifications::{BalloonDisplay, NotificationLog, NotificationPrefs};
 use crate::problems::{ProblemsPanel, SharedDiagnostics, shared_diagnostics};
 use crate::project_tree::ProjectTree;
 use crate::run::RunPanel;
@@ -240,7 +240,49 @@ fn parse_goto(text: &str) -> Option<(u32, u32)> {
 fn float_bounds(width: f32, height: f32) -> FloatPanel {
     let w = 720_f32.min((width - 40.).max(200.));
     let h = 480_f32.min((height - 80.).max(160.));
-    FloatPanel { x: ((width - w) / 2.).max(10.), y: 80., w, h }
+    FloatPanel { x: ((width - w) / 2.).max(10.), y: 80., w, h, edge: None }
+}
+
+/// How close to a window edge a dragged card must be to snap there.
+const SNAP_DISTANCE: f32 = 28.;
+
+/// The edge a dragged card at (`x`, `y`) snaps to, if any. Bottom wins over the
+/// sides near the bottom corners, so the wide dock is reachable there.
+fn snap_edge(x: f32, y: f32, width: f32, height: f32) -> Option<DockEdge> {
+    if y >= height - SNAP_DISTANCE {
+        Some(DockEdge::Bottom)
+    } else if x <= SNAP_DISTANCE {
+        Some(DockEdge::Left)
+    } else if x + SNAP_DISTANCE >= width {
+        Some(DockEdge::Right)
+    } else {
+        None
+    }
+}
+
+/// Geometry of a card docked to `edge` in a window of `width` × `height`.
+/// A docked card spans its edge at about a third of the window, leaving the
+/// editor usable.
+fn docked_bounds(edge: DockEdge, width: f32, height: f32) -> FloatPanel {
+    const MIN: f32 = 240.;
+    const MAX: f32 = 560.;
+    match edge {
+        DockEdge::Left => {
+            let w = (width * 0.32).clamp(MIN, MAX).min(width - 80.);
+            FloatPanel { x: 0., y: 0., w, h: height, edge: Some(edge) }
+        }
+        DockEdge::Right => {
+            let w = (width * 0.32).clamp(MIN, MAX).min(width - 80.);
+            FloatPanel { x: width - w, y: 0., w, h: height, edge: Some(edge) }
+        }
+        DockEdge::Bottom => {
+            // A short window keeps a usable strip instead of clamping to an
+            // empty range (min > max panics in `f32::clamp`).
+            let max = (height - 120.).max(80.);
+            let h = (height * 0.34).clamp(80_f32.min(max), max);
+            FloatPanel { x: 0., y: height - h, w: width, h, edge: Some(edge) }
+        }
+    }
 }
 
 fn menu_entries(kind: MenuKind) -> &'static [MenuEntry] {
@@ -342,12 +384,74 @@ enum ResizeTarget {
     Bottom,
 }
 
+/// A small on/off chip in the Find bar (`Aa` for case, `.*` for regex).
+fn option_toggle(
+    id: &'static str,
+    label: &'static str,
+    title: &'static str,
+    active: bool,
+    theme: &gpui_kit::component::Theme,
+    hover: Hsla,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(ElementId::Name(id.into()))
+        .test_support()
+        .h(px(20.))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .cursor_pointer()
+        .when(active, |this| this.bg(theme.accent.opacity(0.22)))
+        .hover(move |this| this.bg(hover))
+        .on_click(click)
+        .text_size(px(10.))
+        .text_color(if active { theme.foreground } else { theme.fg_muted() })
+        .child(label)
+        .into_any_element()
+}
+
+/// Where a floating tool window is parked when it reaches a window edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockEdge {
+    Left,
+    Right,
+    Bottom,
+}
+
+impl DockEdge {
+    fn label(self) -> &'static str {
+        match self {
+            DockEdge::Left => "left",
+            DockEdge::Right => "right",
+            DockEdge::Bottom => "bottom",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FloatPanel {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    /// Set once the card has snapped to a window edge; dragging it away floats
+    /// it again.
+    edge: Option<DockEdge>,
+}
+
+/// The drag of a floating card: where the pointer went down and where the card
+/// was, plus the edge the release would snap to.
+#[derive(Clone, Copy)]
+struct FloatDrag {
+    start_x: f32,
+    start_y: f32,
+    panel_x: f32,
+    panel_y: f32,
+    /// Preview only: the card keeps floating until the pointer is released.
+    preview: Option<DockEdge>,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +533,7 @@ pub struct Workbench {
     find_highlight_dirty: bool,
     find_index: usize,
     find_searched: bool,
+    find_options: FindOptions,
     settings_open: bool,
     settings_section: SettingsSection,
     editor_font_size: f32,
@@ -437,12 +542,13 @@ pub struct Workbench {
     terminal_viewport: Rc<Cell<(f32, f32)>>,
     resize_drag: Option<ResizeDrag>,
     float_panel: Option<FloatPanel>,
-    float_drag: Option<(f32, f32, f32, f32)>,
+    float_drag: Option<FloatDrag>,
     plugins: Option<Arc<PluginHost>>,
     plugins_open: bool,
     plugins_list: Vec<PluginInfo>,
     plugins_notice: Option<SharedString>,
     plugin_task: Option<Task<()>>,
+    balloon_clock: Option<Task<()>>,
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
     goto_input: Entity<InputState>,
@@ -590,6 +696,7 @@ impl Workbench {
             find_highlight_dirty: false,
             find_index: 0,
             find_searched: false,
+            find_options: FindOptions::default(),
             settings_open: false,
             settings_section: SettingsSection::Editor,
             editor_font_size,
@@ -604,6 +711,7 @@ impl Workbench {
             plugins_list: Vec::new(),
             plugins_notice: None,
             plugin_task: None,
+            balloon_clock: None,
             condition_input,
             log_input,
             goto_input,
@@ -653,19 +761,28 @@ impl Workbench {
                     .as_ref()
                     .map(|project| project.settings.effective())
                     .unwrap_or_else(|| self.host.global_settings.effective());
-                let logged = settings
-                    .notifications
-                    .groups
-                    .get("system")
-                    .map(|group| group.log)
-                    .unwrap_or(true);
-                if logged {
-                    let read = self.notifications_visible();
-                    self.notifications.update(cx, |log, cx| {
-                        log.push(level, title, body, read);
-                        cx.notify();
-                    });
-                }
+                let group = settings.notifications.groups.get("system");
+                let prefs = NotificationPrefs {
+                    balloons: settings.notifications.balloons,
+                    display: match group.map(|group| group.display.as_str()) {
+                        Some("none") => BalloonDisplay::None,
+                        Some("sticky") => BalloonDisplay::Sticky,
+                        _ => BalloonDisplay::Balloon,
+                    },
+                    log: group.map(|group| group.log).unwrap_or(true),
+                };
+                // Balloons are hidden while the Notifications tool window is on
+                // screen (IDEA shows either the stack or the list).
+                let read = self.notifications_visible();
+                self.notifications.update(cx, |log, cx| {
+                    log.set_prefs(prefs);
+                    log.push(level, title, body);
+                    if read {
+                        log.mark_all_read();
+                    }
+                    cx.notify();
+                });
+                self.ensure_balloon_clock(window, cx);
                 cx.notify();
             }
             IdeEvent::ProjectTrustChanged { .. } => {
@@ -769,6 +886,59 @@ impl Workbench {
         &self.notifications
     }
 
+    /// The Find in File options the bar's `Aa` / `.*` chips toggle.
+    pub fn find_options(&self) -> FindOptions {
+        self.find_options
+    }
+
+    /// Whether the Find in File bar is open.
+    pub fn find_is_open(&self) -> bool {
+        self.find_open
+    }
+
+    /// Starts the balloon clock when there is something to fade. One foreground
+    /// task per window; it stops itself once no balloon can fade.
+    fn ensure_balloon_clock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.balloon_clock.is_some() {
+            return;
+        }
+        let should_tick = self.notifications.read(cx).should_tick();
+        if !should_tick {
+            return;
+        }
+        self.notifications.update(cx, |log, _| log.mark_ticking(true));
+        let task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(crate::notifications::TICK).await;
+                let keep = this.update_in(cx, |this, window, cx| {
+                    let active = window.is_window_active();
+                    let mut more = false;
+                    this.notifications.update(cx, |log, cx| {
+                        log.tick(crate::notifications::TICK, active);
+                        // The list is visible: balloons stay hidden.
+                        if this.notifications_visible() {
+                            log.mark_all_read();
+                        }
+                        more = log.should_tick();
+                        if !more {
+                            log.mark_ticking(false);
+                        }
+                        cx.notify();
+                    });
+                    more
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+            this.update(cx, |this, _| {
+                this.balloon_clock = None;
+            })
+            .ok();
+        });
+        self.balloon_clock = Some(task);
+    }
+
     /// Shows the Notifications tool window and marks the history read, as the
     /// Tauri shell did when its list became visible.
     fn show_notifications(&mut self, cx: &mut Context<Self>) {
@@ -869,7 +1039,7 @@ impl Workbench {
                 }
                 self.float_bottom(window, cx);
             }
-            Cmd::DockBottom => self.dock_bottom(cx),
+            Cmd::DockBottom => self.dock_bottom(window, cx),
             Cmd::ZoomIn => self.change_editor_font_size(1., cx),
             Cmd::ZoomOut => self.change_editor_font_size(-1., cx),
             Cmd::ZoomReset => {
@@ -1076,7 +1246,7 @@ impl Workbench {
         if query.is_empty() {
             return;
         }
-        let matches = self.editor.read(cx).find_matches(&query);
+        let matches = self.editor.read(cx).find_matches(&query, self.find_options);
         if matches.is_empty() {
             self.status = format!("No matches for \"{query}\"").into();
             self.find_searched = false;
@@ -1161,11 +1331,24 @@ impl Workbench {
         cx.notify();
     }
 
-    fn dock_bottom(&mut self, cx: &mut Context<Self>) {
-        if self.float_panel.take().is_some() {
-            self.float_drag = None;
-            self.status = "Tool window docked".into();
-            cx.notify();
+    /// Undocks the tool window: a card parked on an edge floats free again;
+    /// a floating card returns to the bottom tool area.
+    fn dock_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.bounds();
+        match self.float_panel {
+            Some(panel) if panel.edge.is_some() => {
+                self.float_panel = Some(float_bounds(bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                self.float_drag = None;
+                self.status = format!("{} floated", self.bottom.label()).into();
+                cx.notify();
+            }
+            Some(_) => {
+                self.float_panel = None;
+                self.float_drag = None;
+                self.status = "Tool window docked".into();
+                cx.notify();
+            }
+            None => {}
         }
     }
 
@@ -2086,7 +2269,8 @@ impl Render for Workbench {
         if self.find_highlight_dirty {
             self.find_highlight_dirty = false;
             let query = if self.find_open { self.find_input.read(cx).value().trim().to_owned() } else { String::new() };
-            self.editor.update(cx, |editor, cx| editor.highlight_find(&query, cx));
+            let options = self.find_options;
+            self.editor.update(cx, |editor, cx| editor.highlight_find(&query, options, cx));
         }
         let theme = cx.theme().clone();
         let menu_bar = self.render_menu_bar(&theme, cx);
@@ -2118,10 +2302,16 @@ impl Render for Workbench {
         let mut overlays = Vec::new();
         if let Some(bounds) = self.float_panel {
             let float_hover = theme.list_hover;
-            let dock = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.dock_bottom(cx));
+            let dock = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| this.dock_bottom(window, cx));
             let drag = cx.listener(|this: &mut Self, event: &MouseDownEvent, _window, cx| {
                 if let Some(panel) = this.float_panel {
-                    this.float_drag = Some((event.position.x.as_f32(), event.position.y.as_f32(), panel.x, panel.y));
+                    this.float_drag = Some(FloatDrag {
+                        start_x: event.position.x.as_f32(),
+                        start_y: event.position.y.as_f32(),
+                        panel_x: panel.x,
+                        panel_y: panel.y,
+                        preview: None,
+                    });
                 }
                 cx.notify();
             });
@@ -2135,10 +2325,19 @@ impl Render for Workbench {
                     .flex()
                     .flex_col()
                     .bg(theme.background)
-                    .border_1()
-                    .border_color(theme.border_strong())
-                    .rounded(px(6.))
-                    .shadow_xl()
+                    // A docked card squares off against its edge; a floating
+                    // one keeps the card look.
+                    .when(bounds.edge.is_none(), |this| {
+                        this.border_1()
+                            .border_color(theme.border_strong())
+                            .rounded(px(6.))
+                            .shadow_xl()
+                    })
+                    .when_some(bounds.edge, |this, edge| {
+                        this.border_color(theme.border_strong()).when(edge == DockEdge::Left, |this| this.border_r_1())
+                            .when(edge == DockEdge::Right, |this| this.border_l_1())
+                            .when(edge == DockEdge::Bottom, |this| this.border_t_1())
+                    })
                     .occlude()
                     .child(
                         div()
@@ -2171,8 +2370,16 @@ impl Render for Workbench {
                                     .on_click(dock)
                                     .text_size(px(9.5))
                                     .text_color(theme.fg_secondary())
-                                    .child("Dock"),
-                            ),
+                                    .child(if bounds.edge.is_some() { "Undock" } else { "Dock" }),
+                            )
+                            .when_some(bounds.edge, |this, edge| {
+                                this.child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.fg_muted())
+                                        .child(format!("{} edge", edge.label())),
+                                )
+                            }),
                     )
                     .child(div().flex_1().min_h_0().child(self.render_bottom_tab()))
                     .into_any_element(),
@@ -3064,7 +3271,8 @@ impl Render for Workbench {
         if self.find_open {
             let find_hover = theme.list_hover;
             let query = self.find_input.read(cx).value().trim().to_owned();
-            let count = if query.is_empty() { 0 } else { self.editor.read(cx).find_matches(&query).len() };
+            let options = self.find_options;
+            let count = if query.is_empty() { 0 } else { self.editor.read(cx).find_matches(&query, options).len() };
             let label = if count == 0 {
                 "0".to_owned()
             } else if self.find_searched {
@@ -3085,7 +3293,7 @@ impl Render for Workbench {
                     .absolute()
                     .top(px(36.))
                     .right(px(18.))
-                    .w(px(380.))
+                    .w(px(470.))
                     .p_2()
                     .flex()
                     .items_center()
@@ -3097,6 +3305,34 @@ impl Render for Workbench {
                     .shadow_lg()
                     .occlude()
                     .child(div().flex_1().min_w_0().child(Input::new(&self.find_input)))
+                    .child(option_toggle(
+                        "find-case",
+                        "Aa",
+                        "Match case",
+                        options.case_sensitive,
+                        &theme,
+                        find_hover,
+                        cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                            this.find_options.case_sensitive = !this.find_options.case_sensitive;
+                            this.find_highlight_dirty = true;
+                            this.find_searched = false;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(option_toggle(
+                        "find-regex",
+                        ".*",
+                        "Regex",
+                        options.regex,
+                        &theme,
+                        find_hover,
+                        cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                            this.find_options.regex = !this.find_options.regex;
+                            this.find_highlight_dirty = true;
+                            this.find_searched = false;
+                            cx.notify();
+                        }),
+                    ))
                     .child(div().text_size(px(10.)).text_color(theme.fg_muted()).child(label))
                     .child(
                         div()
@@ -3139,6 +3375,46 @@ impl Render for Workbench {
                     )
                     .into_any_element(),
             );
+        }
+        // Dock preview: while a card is dragged near an edge, shade the strip
+        // it would snap into.
+        if let Some(preview) = self.float_drag.and_then(|drag| drag.preview) {
+            let bounds = window.bounds();
+            let (x, y, w, h) = match preview {
+                DockEdge::Left => (0., 0., 220., bounds.size.height.as_f32()),
+                DockEdge::Right => (bounds.size.width.as_f32() - 220., 0., 220., bounds.size.height.as_f32()),
+                DockEdge::Bottom => (0., bounds.size.height.as_f32() - 220., bounds.size.width.as_f32(), 220.),
+            };
+            overlays.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(theme.accent.opacity(0.18))
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.5))
+                    .into_any_element(),
+            );
+        }
+        // Balloons: bottom-right stack, hidden while the Notifications tool
+        // window is on screen (IDEA shows either the stack or the list).
+        if !self.notifications_visible() {
+            let balloons = self.notifications.update(cx, |log, cx| log.render_balloons(&theme, cx));
+            if !balloons.is_empty() {
+                overlays.push(
+                    div()
+                        .absolute()
+                        .bottom(px(34.))
+                        .right(px(16.) )
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(balloons)
+                        .into_any_element(),
+                );
+            }
         }
         if self.plugins_open {
             let backdrop = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
@@ -3641,12 +3917,42 @@ impl Render for Workbench {
             )
             .child(status_bar)
             .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, _window, cx| {
-                if let Some((start_x, start_y, panel_x, panel_y)) = this.float_drag {
+                if let Some(mut drag) = this.float_drag {
+                    let width = _window.bounds().size.width.as_f32();
+                    let height = _window.bounds().size.height.as_f32();
+                    let cursor_x = event.position.x.as_f32();
+                    let cursor_y = event.position.y.as_f32();
                     if let Some(panel) = this.float_panel.as_mut() {
-                        let dx = event.position.x.as_f32() - start_x;
-                        let dy = event.position.y.as_f32() - start_y;
-                        panel.x = (panel_x + dx).clamp(-200., 2000.);
-                        panel.y = (panel_y + dy).clamp(-50., 2000.);
+                        // A drag away from a dock pulls the card free again; the
+                        // pointer keeps its offset inside the card.
+                        if panel.edge.is_some() {
+                            let w = 720_f32.min((width - 40.).max(200.));
+                            let h = 480_f32.min((height - 80.).max(160.));
+                            *panel = FloatPanel {
+                                x: (cursor_x - w / 2.).clamp(-200., width),
+                                y: (cursor_y - 20.).clamp(-50., height),
+                                w,
+                                h,
+                                edge: None,
+                            };
+                            drag = FloatDrag {
+                                start_x: cursor_x,
+                                start_y: cursor_y,
+                                panel_x: panel.x,
+                                panel_y: panel.y,
+                                preview: None,
+                            };
+                            this.float_drag = Some(drag);
+                            cx.notify();
+                            return;
+                        }
+                        let dx = cursor_x - drag.start_x;
+                        let dy = cursor_y - drag.start_y;
+                        panel.x = (drag.panel_x + dx).clamp(-200., 2000.);
+                        panel.y = (drag.panel_y + dy).clamp(-50., 2000.);
+                        // Preview only: the card keeps floating until release.
+                        drag.preview = snap_edge(panel.x, panel.y, width, height);
+                        this.float_drag = Some(drag);
                         cx.notify();
                     }
                     return;
@@ -3667,8 +3973,24 @@ impl Render for Workbench {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this: &mut Self, _: &MouseUpEvent, _window, cx| {
-                    this.float_drag = None;
+                cx.listener(|this: &mut Self, _: &MouseUpEvent, window, cx| {
+                    let preview = this.float_drag.take().and_then(|drag| drag.preview);
+                    // Release near an edge: the card docks there; anywhere else
+                    // it stays floating with its preview cleared.
+                    if let Some(panel) = this.float_panel.as_mut() {
+                        let width = window.bounds().size.width.as_f32();
+                        let height = window.bounds().size.height.as_f32();
+                        match preview.or_else(|| snap_edge(panel.x, panel.y, width, height)) {
+                            Some(edge) => {
+                                *panel = docked_bounds(edge, width, height);
+                                this.status = format!("{} docked to the {} edge", this.bottom.label(), edge.label()).into();
+                            }
+                            None => {
+                                panel.edge = None;
+                            }
+                        }
+                        cx.notify();
+                    }
                     if this.resize_drag.take().is_some() {
                         this.layout.save(&this.config_dir);
                         this.status = format!(
@@ -3687,15 +4009,52 @@ impl Render for Workbench {
 
 #[cfg(test)]
 mod float_tests {
-    use super::float_bounds;
+    use super::{DockEdge, docked_bounds, float_bounds, snap_edge};
 
     #[test]
     fn float_bounds_center_and_clamp() {
         let panel = float_bounds(1600., 1000.);
         assert_eq!((panel.x, panel.y, panel.w, panel.h), (440., 80., 720., 480.));
+        assert_eq!(panel.edge, None);
 
         let small = float_bounds(600., 300.);
         assert!(small.w <= 560. && small.h <= 220.);
         assert!(small.x >= 10.);
+    }
+
+    #[test]
+    fn snap_edge_picks_the_nearest_edge() {
+        // Nothing near an edge.
+        assert_eq!(snap_edge(600., 400., 1200., 800.), None);
+        // Within the snap distance of each edge.
+        assert_eq!(snap_edge(10., 300., 1200., 800.), Some(DockEdge::Left));
+        assert_eq!(snap_edge(1195., 300., 1200., 800.), Some(DockEdge::Right));
+        assert_eq!(snap_edge(600., 790., 1200., 800.), Some(DockEdge::Bottom));
+        // The bottom wins at the bottom corners: the wide dock is reachable.
+        assert_eq!(snap_edge(5., 795., 1200., 800.), Some(DockEdge::Bottom));
+    }
+
+    #[test]
+    fn docked_bounds_span_the_edge() {
+        let left = docked_bounds(DockEdge::Left, 1200., 800.);
+        assert_eq!((left.x, left.y, left.h, left.edge), (0., 0., 800., Some(DockEdge::Left)));
+        assert!(left.w >= 240. && left.w <= 560. && left.w < 1200.);
+
+        let right = docked_bounds(DockEdge::Right, 1200., 800.);
+        assert_eq!(right.x + right.w, 1200.);
+        assert_eq!(right.edge, Some(DockEdge::Right));
+
+        let bottom = docked_bounds(DockEdge::Bottom, 1200., 800.);
+        assert_eq!((bottom.x, bottom.w, bottom.y + bottom.h), (0., 1200., 800.));
+        assert!(bottom.h >= 180. && bottom.h < 800.);
+        assert_eq!(bottom.edge, Some(DockEdge::Bottom));
+    }
+
+    #[test]
+    fn docked_bounds_stay_inside_a_small_window() {
+        let left = docked_bounds(DockEdge::Left, 300., 400.);
+        assert!(left.w <= 220. && left.x == 0.);
+        let bottom = docked_bounds(DockEdge::Bottom, 300., 200.);
+        assert!(bottom.h <= 80. && bottom.h > 0.);
     }
 }

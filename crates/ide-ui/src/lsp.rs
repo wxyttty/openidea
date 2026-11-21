@@ -7,17 +7,15 @@
 //! and gutter, see [`crate::problems`]).
 
 use anyhow::Result;
-use gpui_kit::base::input::{
-    CompletionProvider, DefinitionProvider, HoverProvider, Rope, RopeExt as _, ShowDocumentHandler,
-};
+use gpui_kit::base::input::{CompletionProvider, DefinitionProvider, HoverProvider, Rope, RopeExt as _, ShowDocumentHandler};
 use gpui_kit::*;
 use ide_core::{CancellationToken, DocId, Pos};
 use ide_host::Project;
 use ide_lsp::types::{CompletionKind, GotoKind, Markup};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionList, CompletionResponse, Documentation,
-    Hover, HoverContents, InsertTextFormat, LocationLink, MarkupContent, MarkupKind, Position, Range,
-    ShowDocumentParams, TextEdit, Uri,
+    Hover, HoverContents, InlineCompletionContext, InlineCompletionResponse, InsertTextFormat, LocationLink,
+    MarkupContent, MarkupKind, Position, Range, ShowDocumentParams, TextEdit, Uri,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -82,6 +80,32 @@ impl CompletionProvider for IdeLspProvider {
     /// matching IDEA's default autopopup.
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
         new_text.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '$' | '#'))
+    }
+
+    /// Inline suggestions (LSP 3.18 `textDocument/inlineCompletion`): the grey
+    /// text the editor shows ahead of the caret when a server advertises
+    /// `inlineCompletionProvider`.
+    fn inline_completion(
+        &self,
+        text: &Rope,
+        offset: usize,
+        trigger: InlineCompletionContext,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<InlineCompletionResponse>> {
+        let lsp = self.project.lsp.clone();
+        let doc = self.doc;
+        let pos = position_of(text, offset);
+        // `automatic` is a trigger-kind bit; anything but `Invoked` is typed.
+        let automatic = matches!(trigger.trigger_kind, lsp_types::InlineCompletionTriggerKind::Automatic);
+        cx.spawn(async move |_cx| {
+            let cancel = CancellationToken::new();
+            let items = lsp.inline_completion(doc, pos, automatic, cancel).await.unwrap_or_default();
+            tracing::debug!(items = items.len(), ?pos, "lsp inline completion");
+            Ok(InlineCompletionResponse::Array(
+                items.into_iter().map(inline_completion_item).collect(),
+            ))
+        })
     }
 
     fn completions(
@@ -220,5 +244,63 @@ fn completion_kind(kind: CompletionKind) -> CompletionItemKind {
         CompletionKind::Event => CompletionItemKind::EVENT,
         CompletionKind::Operator => CompletionItemKind::OPERATOR,
         CompletionKind::TypeParameter => CompletionItemKind::TYPE_PARAMETER,
+    }
+}
+
+/// One `ide-lsp` inline suggestion as the editor's `lsp_types` item. The
+/// server's command is dropped: accepting a suggestion types its text, and
+/// running arbitrary server commands from the editor is not wired yet.
+fn inline_completion_item(item: ide_lsp::types::InlineCompletionItem) -> lsp_types::InlineCompletionItem {
+    lsp_types::InlineCompletionItem {
+        insert_text: item.insert_text,
+        filter_text: item.filter_text,
+        range: item.range.map(range_to_lsp),
+        command: None,
+        insert_text_format: None,
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::inline_completion_item;
+    use ide_core::text::Range;
+    use ide_lsp::types::InlineCompletionItem;
+
+    fn range(line: u32, start: u32, end: u32) -> Range {
+        Range {
+            start: ide_core::Pos { line, col: start },
+            end: ide_core::Pos { line, col: end },
+        }
+    }
+
+    #[test]
+    fn keeps_text_filter_and_range() {
+        let mapped = inline_completion_item(InlineCompletionItem {
+            insert_text: "println!(\"hi\")".into(),
+            range: Some(range(3, 4, 9)),
+            filter_text: Some("print".into()),
+            command: None,
+            server: ide_core::ServerId(1),
+        });
+        assert_eq!(mapped.insert_text, "println!(\"hi\")");
+        assert_eq!(mapped.filter_text.as_deref(), Some("print"));
+        let lsp_range = mapped.range.expect("range is kept");
+        assert_eq!((lsp_range.start.line, lsp_range.start.character), (3, 4));
+        assert_eq!((lsp_range.end.line, lsp_range.end.character), (3, 9));
+        assert!(mapped.command.is_none());
+        assert!(mapped.insert_text_format.is_none());
+    }
+
+    #[test]
+    fn insertion_at_the_caret_has_no_range() {
+        let mapped = inline_completion_item(InlineCompletionItem {
+            insert_text: "x".into(),
+            range: None,
+            filter_text: None,
+            command: None,
+            server: ide_core::ServerId(2),
+        });
+        assert!(mapped.range.is_none());
+        assert!(mapped.filter_text.is_none());
     }
 }

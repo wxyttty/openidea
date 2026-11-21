@@ -31,6 +31,8 @@ lsp-types.workspace = true
 url.workspace = true
 vt100.workspace = true
 serde_json.workspace = true
+# Find in File: regex mode (small, dependency-free).
+regex-lite = "0.1"
 
 [dev-dependencies]
 # UI integration tests: headless windows, native input dispatch, snapshots.

@@ -185,9 +185,12 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   records the decision and enables servers/hooks without a restart.
   Diagnostics land in the editor gutter, the tab counts, the status bar and
   the **Problems** tool window (click jumps to file/line).
-- LSP providers for the editor element: completion, hover and go-to-definition
-  call `ide-lsp` directly (`IdeLspProvider`), and `showDocument` opens the
-  target file at the definition.
+- LSP providers for the editor element: completion, hover, go-to-definition and
+  inline completion (LSP 3.18 `textDocument/inlineCompletion`, triggered after
+  the editor's 300 ms debounce, shown as grey text and accepted with Tab) call
+  `ide-lsp` directly (`IdeLspProvider`), and `showDocument` opens the target file
+  at the definition. Server commands attached to an inline suggestion are
+  dropped (accepting types the text only).
 - **Project opening**: CLI path (dir/file), `Ctrl+O` folder picker, drag-drop,
   and **File › Open Recent Project…** — a modal over `recent.json` showing the
   active project highlighted plus git branch, with a Browse… fallback; picking
@@ -197,10 +200,12 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - **Go to Line** (`Ctrl+G`, Navigate menu): modal input accepting `line` or
   `line:column` (1-based), jumps the active editor caret and focuses it.
 - **Find in File** (`Ctrl+F`, Navigate menu): floating bar over the editor with
-  live match count, case-insensitive search over the active tab, every match
-  highlighted with a warning fill (RangeDecoration), Enter/next, prev and close
-  (Esc or ×, which also clears the highlights); jumps focus the editor so typing
-  continues at the match.
+  live match count, `Aa` (match case) and `.*` (regular expression, `regex-lite`
+  syntax with dot-all so patterns can span lines) chips, every match highlighted
+  with a warning fill (RangeDecoration), Enter/next, prev and close (Esc or ×,
+  which also clears the highlights); jumps focus the editor so typing continues
+  at the match. An unfinished pattern matches nothing instead of panicking;
+  empty regex matches are skipped; matches cap at 2000.
 - **Zoom**: View › Zoom In / Zoom Out / Reset Zoom change the editor font size
   in 1 px steps and persist it to `settings.toml` (`editor.fontSize`).
 - **Find in Path** (`Ctrl+Shift+F`): streams `ide-search` results from a worker
@@ -288,10 +293,15 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   Remove, Install from folder…, persisted in the plugin host's `state.json`
   (an existing plugin manager is reused; plugin events such as insert-text
   are not routed to the native UI yet).
-- **Floating tool window (Dock pilot)**: View › Float Tool Window (or the
+- **Floating / edge-docked tool window**: View › Float Tool Window (or the
   Float chip in the bottom tab strip) detaches the current bottom tab into a
-  floating card over the editor; its title bar drags it, and Dock restores the
-  bottom panel. Edge docking and per-pane floating are still pending.
+  floating card over the editor. Dragging its title bar shades the left, right
+  or bottom strip it would snap into (28 px from the edge; the bottom wins at
+  the corners), and releasing there docks the card against that edge at about a
+  third of the window, squared off and spanning it; dragging a docked card away
+  floats it again. **Undock** on a docked card, **Dock** on a floating one, and
+  View › Dock Tool Window all restore the bottom panel. Per-pane floating and
+  drag-to-split remain pending.
 - **Resizable workbench**: drag the 4 px splitter right of the project panel or
   above the bottom tool window; left width and each bottom tab's height are
   stored in `<config>/ui.json` under `layout` and restored on launch. The
@@ -319,8 +329,15 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   the status bar; without a project it docks under the welcome screen, so
   backend messages stay reachable before any folder is opened. Opening or
   viewing the panel marks the history read; notifications arriving while it is
-  visible (docked or floating) are read on arrival. Balloon pop-ups (timeouts,
-  hover pause, sound, per-group display settings) are not ported yet.
+  visible (docked or floating) are read on arrival.
+- **Notification balloons**: info/warning balloons stack bottom-right (at most
+  three, newest lowest) and fade after 10 s; errors and `sticky` groups keep a
+  5-minute clock and stay until dismissed when not logged. The clock pauses
+  while the pointer is over the balloon or the window is inactive (no public
+  activation observer: the tick task re-reads `Window::is_window_active()`),
+  closing a balloon keeps its history entry, `display = none` suppresses
+  balloons while still logging, and balloons hide while the Notifications tool
+  window is visible. Sound and "Don't Show Again" are not ported.
 - **Notifications verification**: `cargo +nightly-2026-10-24 test --locked
   -p ide-ui` covers the panel through `gpui_kit::test` in
   `crates/ide-ui/tests/notifications_ui.rs` — entry close/Clear All, a
@@ -328,8 +345,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   non-overlapping variable-height rows, scroll-then-close), the 200-entry
   cap, and the workbench entry path with a real `Host`: hidden panel →
   unread without auto-open, status-bar badge click → panel + read,
-  visible-panel arrival → read, and project `system.log = false` keeping
-  events out of the history. The app binary also boots and opens a project
+  visible-panel arrival → read, `log = false` keeping events out of the
+  history, plus balloon semantics (10 s fade, 5-minute sticky clock, hover and
+  inactive-window pause, three-balloon cap, `display = none`, and a rendered
+  window: hover pause then close). The app binary also boots and opens a project
   on this machine; balloon behavior is untested (not ported).
 
 ## Ecosystem choices
@@ -418,21 +437,21 @@ Status of the Tauri shell's features in the native app.
 | Syntax highlighting | CodeMirror/Lezer | syntect | tree-sitter in P1 |
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
-| Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc | P2 (regex) |
+| Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc, `Aa` case and `.*` regex toggles | — |
 | Replace in files | yes | Replace All over the search results, Documents-backed | P2 (preview, per-match replace) |
 | Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
 | Menu bar | native `menu.rs` (1.6k lines) | 6 menus, core actions | P2 (full menu set) |
 | Command palette | yes | yes (13 commands) | grows with actions |
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
-| LSP: diagnostics, completion, hover, goto | yes | diagnostics + providers (component popup UI) | P1 polish |
+| LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
 | Code insight: inspections, refactors, structure | yes | no | P2 |
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop | P1 (gutter dots, hit counts) |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
-| Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) | P2 (balloons) |
+| Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings) | P2 (sound, Don't Show Again) |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
@@ -441,7 +460,7 @@ Status of the Tauri shell's features in the native app.
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
-| Dockable/floating tool windows, drag-to-split | yes | floating bottom tool window (drag + dock) pilot, edge docking pending | P2/P3 |
+| Dockable/floating tool windows, drag-to-split | yes | floating card with left/right/bottom edge docking and undock; drag-to-split pending | P2/P3 |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder | P2 (commands, insert-text events, marketplace) |
 | Multi-window / window groups | yes | no | P3 |
 | Updater, single instance, window-state | yes | no | P4 |
@@ -501,11 +520,13 @@ to the native binary. Until then both apps build from the same workspace.
 - **API churn.** GPUI is pre-1.0 and `gpui-kit` pins `gpui-pre` exactly. Treat
   `gpui-kit` as the public API (the Kit's own guidance), and upgrade it as a
   unit with visual checks.
-- **Editor capability gap.** `gpui-component`'s editor is explicitly aimed at
-  simple code editing (≈50k lines), not at CodeMirror parity: no multi-cursor,
-  no block indent, limited IME coverage, no LSP UI yet. Phase 1 closes the LSP
-  part; multi-cursor and large-file handling may need upstream work or a
-  purpose-built editor element.
+- **Editor capability gap.** `gpui-component`'s editor is aimed at simple code
+  editing (≈50k lines), not at CodeMirror parity: limited IME coverage and no
+  purpose-built large-file handling. Multi-cursor *is* implemented by
+  `gpui-base` (Alt+click, `AddCursorAbove`/`AddCursorBelow`) but ships without
+  keystrokes — the workbench binds IDEA's `Ctrl+Alt+Up`/`Ctrl+Alt+Down` for the
+  editor's `Input` key context (`crates/ide-ui/tests/cursor_bindings_ui.rs`).
+  Block indent and multi-cursor column behaviour still need upstream work.
 - **Key dispatch.** Bindings are scoped by key context (`"Workspace"`). The
   editor owns many Ctrl bindings; always check new shortcuts against
   `gpui-base`'s input map. `secondary-` must go through `KeyBinding::load` (not

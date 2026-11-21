@@ -106,4 +106,23 @@ pub fn install(cx: &mut App) {
     bind("secondary-f", Box::new(FindInEditor));
     bind("escape", Box::new(CloseFind));
     cx.bind_keys(bindings);
+
+    // Editor-local bindings. `gpui-base` implements multi-cursor (Alt+click,
+    // AddCursorAbove/Below) but ships no keystrokes for them; IDEA's are
+    // Ctrl+Alt+Up/Down. The editor's key context is `Input mode=editor`, and a
+    // binding there wins over the workspace's, so plain typing stays intact.
+    let editor = Some(Rc::new(
+        KeyBindingContextPredicate::parse("Input").expect("valid editor context"),
+    ));
+    let mut editor_bindings = Vec::new();
+    for (keystroke, action) in [
+        ("ctrl-alt-up", Box::new(gpui_kit::base::input::AddCursorAbove) as Box<dyn Action>),
+        ("ctrl-alt-down", Box::new(gpui_kit::base::input::AddCursorBelow) as Box<dyn Action>),
+    ] {
+        match KeyBinding::load(keystroke, action, editor.clone(), false, None, cx) {
+            Ok(binding) => editor_bindings.push(binding),
+            Err(err) => tracing::warn!("invalid editor keybinding {keystroke}: {err}"),
+        }
+    }
+    cx.bind_keys(editor_bindings);
 }

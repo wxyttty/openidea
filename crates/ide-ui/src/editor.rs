@@ -75,6 +75,89 @@ pub struct TabInfo {
     pub read_only: bool,
 }
 
+/// Find in File options: the toggles the search bar offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindOptions {
+    pub case_sensitive: bool,
+    /// Treat `query` as a regular expression (`regex-lite` syntax).
+    pub regex: bool,
+}
+
+/// Byte ranges of `query` in `text` under `options`, capped at 2000 matches.
+///
+/// An invalid regular expression yields no matches: the bar reports that while
+/// the user types an unfinished pattern instead of dropping the highlight.
+pub fn find_ranges(text: &str, query: &str, options: FindOptions) -> Vec<std::ops::Range<usize>> {
+    const CAP: usize = 2000;
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return out;
+    }
+    if options.regex {
+        let pattern = if options.case_sensitive {
+            format!("(?s){query}")
+        } else {
+            format!("(?is){query}")
+        };
+        let Ok(regex) = regex_lite::Regex::new(&pattern) else {
+            return out;
+        };
+        for found in regex.find_iter(text) {
+            // Empty matches (e.g. `^` with no flag) would add nothing visible
+            // and can repeat forever; skip them.
+            if found.start() == found.end() {
+                continue;
+            }
+            out.push(found.start()..found.end());
+            if out.len() >= CAP {
+                break;
+            }
+        }
+        return out;
+    }
+    if options.case_sensitive {
+        for (at, found) in text.match_indices(query) {
+            out.push(at..at + found.len());
+            if out.len() >= CAP {
+                break;
+            }
+        }
+        return out;
+    }
+    // Case-insensitive plain text. Lowercasing can change byte lengths
+    // (`İ` → `i̇`), which would offset every match; fall back to the exact
+    // scan then.
+    let lower = text.to_lowercase();
+    let needle = query.to_lowercase();
+    if lower.len() != text.len() || needle.is_empty() {
+        for (at, found) in text.match_indices(query) {
+            out.push(at..at + found.len());
+            if out.len() >= CAP {
+                break;
+            }
+        }
+        return out;
+    }
+    let mut start = 0;
+    while let Some(offset) = lower[start..].find(&needle) {
+        let at = start + offset;
+        out.push(at..at + needle.len());
+        if out.len() >= CAP {
+            break;
+        }
+        start = at + needle.len();
+    }
+    out
+}
+
+/// 0-based (line, column) of a byte offset; the column counts UTF-16 units.
+fn position(text: &str, offset: usize) -> (u32, u32) {
+    let line = text[..offset].matches('\n').count() as u32;
+    let line_start = text[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let col = text[line_start..offset].encode_utf16().count() as u32;
+    (line, col)
+}
+
 pub struct EditorArea {
     project: Option<Arc<Project>>,
     tabs: Vec<Tab>,
@@ -402,9 +485,9 @@ impl EditorArea {
         });
     }
 
-    /// Case-insensitive occurrences of `query` in the active tab as 0-based
-    /// (line, column); capped at 2000 so a one-letter query stays cheap.
-    pub fn find_matches(&self, query: &str) -> Vec<(u32, u32)> {
+    /// Occurrences of `query` in the active tab as 0-based (line, column) under
+    /// `options`; capped at 2000 so a one-letter query stays cheap.
+    pub fn find_matches(&self, query: &str, options: FindOptions) -> Vec<(u32, u32)> {
         if query.is_empty() {
             return Vec::new();
         }
@@ -412,60 +495,17 @@ impl EditorArea {
             return Vec::new();
         };
         let text = &tab.text;
-        let mut out = Vec::new();
-        fn position(text: &str, offset: usize) -> (u32, u32) {
-            let line = text[..offset].matches('\n').count() as u32;
-            let line_start = text[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
-            let col = text[line_start..offset].encode_utf16().count() as u32;
-            (line, col)
-        }
-        let lower = text.to_lowercase();
-        let needle = query.to_lowercase();
-        if lower.len() == text.len() && !needle.is_empty() {
-            let mut start = 0;
-            while let Some(offset) = lower[start..].find(&needle) {
-                let at = start + offset;
-                out.push(position(text, at));
-                if out.len() >= 2000 {
-                    break;
-                }
-                start = at + needle.len();
-            }
-        } else {
-            for (at, _) in text.match_indices(query) {
-                out.push(position(text, at));
-                if out.len() >= 2000 {
-                    break;
-                }
-            }
-        }
-        out
+        find_ranges(text, query, options).into_iter().map(|range| position(text, range.start)).collect()
     }
 
     /// Highlight every case-insensitive occurrence of `query` in the active
     /// tab (empty clears them).
-    pub fn highlight_find(&mut self, query: &str, cx: &mut Context<Self>) {
+    pub fn highlight_find(&mut self, query: &str, options: FindOptions, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
         let ranges = {
             let state = self.tabs[index].state.read(cx);
             let text = state.text().to_string();
-            let mut ranges = Vec::new();
-            if !query.is_empty() {
-                let lower = text.to_lowercase();
-                let needle = query.to_lowercase();
-                if lower.len() == text.len() && !needle.is_empty() {
-                    let mut start = 0;
-                    while let Some(offset) = lower[start..].find(&needle) {
-                        let at = start + offset;
-                        ranges.push(at..at + needle.len());
-                        if ranges.len() >= 2000 {
-                            break;
-                        }
-                        start = at + needle.len();
-                    }
-                }
-            }
-            ranges
+            if query.is_empty() { Vec::new() } else { find_ranges(&text, query, options) }
         };
         let mut tint = cx.theme().warning;
         tint.a = 0.26;
@@ -812,4 +852,66 @@ pub fn language_for(path: &Path) -> &'static str {
         _ => "plaintext",
     };
     language_for_id(id)
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::{FindOptions, find_ranges};
+
+    fn plain(case_sensitive: bool) -> FindOptions {
+        FindOptions { case_sensitive, regex: false }
+    }
+
+    fn regex(case_sensitive: bool) -> FindOptions {
+        FindOptions { case_sensitive, regex: true }
+    }
+
+    #[test]
+    fn plain_case_insensitive_by_default() {
+        let ranges = find_ranges("Alpha alpha ALPHA", "alpha", plain(false));
+        assert_eq!(ranges, vec![0..5, 6..11, 12..17]);
+    }
+
+    #[test]
+    fn plain_respects_case_sensitivity() {
+        let ranges = find_ranges("Alpha alpha ALPHA", "alpha", plain(true));
+        assert_eq!(ranges, vec![6..11]);
+    }
+
+    #[test]
+    fn regex_matches_word_starts() {
+        // `foo` starts with `f`, which `[b-z]` covers, so all three match.
+        let ranges = find_ranges("foo bar baz", r"\b[b-z]\w+", regex(false));
+        assert_eq!(ranges, vec![0..3, 4..7, 8..11]);
+        // `regex-lite` has no lookaround: anchoring on `bar` matches just it.
+        let tail = find_ranges("foo bar baz", r"bar|baz", regex(false));
+        assert_eq!(tail, vec![4..7, 8..11]);
+    }
+
+    #[test]
+    fn regex_is_case_insensitive_unless_asked() {
+        assert_eq!(find_ranges("Foo FOO", "foo", regex(false)), vec![0..3, 4..7]);
+        assert_eq!(find_ranges("Foo FOO", "foo", regex(true)), Vec::<std::ops::Range<usize>>::new());
+    }
+
+    #[test]
+    fn invalid_regex_yields_no_matches() {
+        // An unfinished pattern while typing must not panic.
+        assert_eq!(find_ranges("anything", "(", regex(false)), Vec::<std::ops::Range<usize>>::new());
+    }
+
+    #[test]
+    fn empty_regex_matches_are_skipped() {
+        // `x*` can match empty at every position; those add no highlight.
+        let ranges = find_ranges("aXbXc", "X*", regex(false));
+        assert_eq!(ranges, vec![1..2, 3..4]);
+    }
+
+    #[test]
+    fn queries_with_empty_text_and_caps() {
+        assert_eq!(find_ranges("", "a", plain(false)), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(find_ranges("aaa", "", plain(false)), Vec::<std::ops::Range<usize>>::new());
+        let many = "a".repeat(2500);
+        assert_eq!(find_ranges(&many, "a", plain(false)).len(), 2000);
+    }
 }
