@@ -14,7 +14,9 @@ use gpui_kit::base::input::{
     Diagnostic, DiagnosticSet, DiagnosticSeverity, Position, RangeDecoration, RangeDecorationCollection,
     RangeDecorationStyle, RopeExt,
 };
-use gpui_kit::component::input::{Editor, EditorState, InputContent, InputEvent};
+use gpui_kit::component::input::{
+    Editor, EditorState, GutterDecoration, GutterDecorationCollection, InputContent, InputEvent,
+};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -44,6 +46,8 @@ struct Tab {
     _change: Option<Subscription>,
     /// Breakpoint line highlights, adjusted automatically across edits.
     breakpoint_decorations: Option<RangeDecorationCollection>,
+    /// Breakpoint marks in the gutter strip beside the line numbers.
+    breakpoint_gutter: Option<GutterDecorationCollection>,
     /// Find-in-file match highlights.
     find_decorations: Option<RangeDecorationCollection>,
 }
@@ -288,6 +292,7 @@ impl EditorArea {
             read_only: info.read_only,
             _change: None,
             breakpoint_decorations: None,
+            breakpoint_gutter: None,
             find_decorations: None,
         });
         self.active = Some(self.tabs.len() - 1);
@@ -355,8 +360,8 @@ impl EditorArea {
                 .collect()
         };
         let decorations = ranges
-            .into_iter()
-            .map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(tint))
+            .iter()
+            .map(|range| RangeDecoration::new(range.clone()).with_style(RangeDecorationStyle::Fill).with_color(tint))
             .collect::<Vec<_>>();
         match self.tabs[index].breakpoint_decorations.clone() {
             Some(collection) => collection.set(decorations, cx),
@@ -364,6 +369,20 @@ impl EditorArea {
                 let collection =
                     state.update(cx, |state, cx| state.create_range_decorations_collection(decorations, cx));
                 self.tabs[index].breakpoint_decorations = Some(collection);
+            }
+        }
+        // The gutter mark: a solid bar beside the line number, IDEA's breakpoint
+        // slot. Ranges are the same line spans as the fill above.
+        let mut mark = cx.theme().danger;
+        mark.a = 0.9;
+        let gutter: Vec<GutterDecoration> =
+            ranges.iter().map(|range| GutterDecoration::new(range.clone()).with_color(mark)).collect();
+        match self.tabs[index].breakpoint_gutter.clone() {
+            Some(collection) => collection.set(gutter, cx),
+            None => {
+                let collection =
+                    state.update(cx, |state, cx| state.create_gutter_decorations_collection(gutter, cx));
+                self.tabs[index].breakpoint_gutter = Some(collection);
             }
         }
     }
@@ -510,8 +529,8 @@ impl EditorArea {
         let mut tint = cx.theme().warning;
         tint.a = 0.26;
         let decorations = ranges
-            .into_iter()
-            .map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(tint))
+            .iter()
+            .map(|range| RangeDecoration::new(range.clone()).with_style(RangeDecorationStyle::Fill).with_color(tint))
             .collect::<Vec<_>>();
         match self.tabs[index].find_decorations.clone() {
             Some(collection) => collection.set(decorations, cx),

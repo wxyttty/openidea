@@ -409,6 +409,7 @@ fn option_toggle(
         .on_click(click)
         .text_size(px(10.))
         .text_color(if active { theme.foreground } else { theme.fg_muted() })
+        .aria_label(title)
         .child(label)
         .into_any_element()
 }

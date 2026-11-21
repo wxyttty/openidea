@@ -249,8 +249,10 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   Watches evaluate the expression against the selected frame on Enter and
   refresh on every stop; the console has an **Evaluate** input that prints the
   result of an expression for the current frame (`debugger.evaluate`).
-  Not ported yet: breakpoint dots in the editor gutter, conditions/logpoints,
-  a REPL/evaluate window, and the Cargo/Gradle/Java launch builders.
+  Breakpoint **gutter marks** are drawn through `GutterDecorationCollection`
+  (a solid bar beside the line number, following edits like the line fill).
+  Not ported yet: hit counts, a REPL/evaluate window, and the Cargo/Gradle/Java
+  launch builders.
 - **Appearance**: all seven built-in palettes (Islands Dark/Light, High
   Contrast, Solarized Dark/Light, One Dark/Light) ported from `tokens.css`,
   with an Appearance dialog and the choice persisted to
@@ -355,11 +357,16 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 
 Checked against crates.io at the time of writing:
 
-- **`gpui` is published as `gpui-pre` 0.3.10.** `gpui-kit` 0.8.1 pins it and
+- **`gpui` is published as `gpui-pre` 0.3.12.** `gpui-kit` 0.10.0 pins it and
   re-exports it, so the app depends on `gpui-kit` alone (`use gpui_kit::*`).
-- **`gpui-kit` 0.8.1** = GPUI + `gpui-base` (behavior: docking, tabs, trees,
-  input engine, theme tokens) + `gpui-component` 0.8.1 (60+ styled widgets:
-  menu, palette, editor, tree, dock, status bar…) + Lucide assets.
+- **`gpui-kit` 0.10.0** = GPUI + `gpui-base` 0.10 (behavior: docking, tabs,
+  trees, input engine, theme tokens) + `gpui-component` 0.10 (60+ styled
+  widgets: menu, palette, editor, tree, dock, status bar…) + Lucide assets.
+  Upgraded from 0.8.1 on the latest nightly (1.102): the editor gained
+  `GutterDecoration`/`GutterDecorationCollection`, which is what the breakpoint
+  gutter marks needed. The 0.10 breaking changes (`TextareaMode::Extras`,
+  `EditorState::text_gutter_margin` → `text_origin_offset`) do not affect this
+  app; `ide-ui` and `openidea-gpui` compile unchanged.
 - **`gpui-ce` 0.3.0** is a *separate community fork* of GPUI with its own type
   identity (`gpui_ce_*`). It cannot be mixed with `gpui-kit`/`gpui-component`:
   `App`, `Window`, `Element` and `Action` would be different types. We use the
@@ -388,6 +395,13 @@ bump `ast-grep-core` to 0.40.2+, run `ide-language`/`ide-syntax`/
 `ide-analysis` tests, then enable `gpui-kit`'s `tree-sitter` and
 `tree-sitter-languages` features and call `set_highlighter` with the same
 language names the editor already passes.
+
+Re-checked on `gpui-component` 0.10: C#, Swift, GraphQL, Proto and CMake still
+carry an **empty highlights query** (`(tree_sitter_x::LANGUAGE, "", "", "")`),
+so switching the editor from syntect to tree-sitter would lose highlighting for
+five languages the current syntect backend already covers. That regression is
+the blocker, not the dependency; the workspace tree-sitter bump alone does not
+fix it.
 
 ## Architecture
 
@@ -449,7 +463,7 @@ Status of the Tauri shell's features in the native app.
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
-| Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop | P1 (gutter dots, hit counts) |
+| Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop, gutter breakpoint marks | — |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
 | Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings) | P2 (sound, Don't Show Again) |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |

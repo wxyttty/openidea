@@ -70,7 +70,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # native UI (Tauri replacement)
-gpui-kit = { version = "0.8.1", default-features = false, features = ["component", "assets", "syntect"] }
+gpui-kit = { version = "0.10.0", default-features = false, features = ["component", "assets", "syntect"] }
 rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland", "tokio"] }
 
 # text & fs
