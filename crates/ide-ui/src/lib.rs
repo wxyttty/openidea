@@ -24,6 +24,7 @@ pub mod agents;
 pub mod breakpoints;
 pub mod db;
 pub mod debug;
+pub mod dock;
 pub mod diff;
 pub mod editor;
 pub mod events;

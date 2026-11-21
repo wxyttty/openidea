@@ -12,6 +12,7 @@ use crate::breakpoints::Breakpoints;
 use crate::db::DbPanel;
 use crate::debug::{DebugAction, DebugPanel};
 use crate::diff::DiffPanel;
+use crate::dock::ToolPanel;
 use crate::editor::{EditorArea, FindOptions, TabInfo};
 use crate::http::HttpPanel;
 use crate::layout::Layout;
@@ -29,8 +30,9 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dock::{DockArea, DockLayout, DockPlacement, DockSkin};
 use gpui_kit::component::input::{Input, InputContent, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, dock::PanelStyle};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_core::IdeEvent;
@@ -499,6 +501,12 @@ pub struct Workbench {
     notebook: Entity<NotebookPanel>,
     agents: Entity<AgentPanel>,
     notifications: Entity<NotificationLog>,
+    /// The bottom tool area: a dock, so panels move between groups and the
+    /// layout persists.
+    dock: Option<Entity<DockArea>>,
+    dock_skin: Option<std::rc::Rc<DockSkin>>,
+    /// Panel id of each `BottomTab` in the dock, in `BottomTab::index` order.
+    dock_panels: Vec<(BottomTab, gpui_kit::base::dock::PanelId)>,
     diff: Entity<DiffPanel>,
     search: Entity<SearchPanel>,
     vcs: Entity<VcsPanel>,
@@ -624,6 +632,50 @@ impl Workbench {
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let notifications = cx.new(|_| NotificationLog::new());
         let diff = cx.new(|cx| DiffPanel::new(cx));
+
+        // The bottom tool area as a dock: panels become tabs of a bottom dock,
+        // drag between groups, and the layout persists through `DockArea`.
+        let (dock_entity, dock_skin) = DockSkin::dock_area("workbench-bottom", Some(1), window, cx);
+        let problems_panel = cx.new(|cx| ToolPanel::new("problems", "Problems", IconName::CircleAlert, problems.clone(), cx));
+        let terminal_panel = cx.new(|cx| ToolPanel::new("terminal", "Terminal", IconName::SquareTerminal, terminal.clone(), cx));
+        let diff_panel = cx.new(|cx| ToolPanel::new("diff", "Diff", IconName::GitCompare, diff.clone(), cx));
+        let run_panel = cx.new(|cx| ToolPanel::new("run", "Run", IconName::Play, run.clone(), cx));
+        let debug_panel = cx.new(|cx| ToolPanel::new("debug", "Debug", IconName::Bug, debug.clone(), cx));
+        let db_panel = cx.new(|cx| ToolPanel::new("database", "Database", IconName::Database, db.clone(), cx));
+        let http_panel = cx.new(|cx| ToolPanel::new("http", "HTTP Client", IconName::Cloud, http.clone(), cx));
+        let notebook_panel = cx.new(|cx| ToolPanel::new("notebook", "Notebook", IconName::BookOpen, notebook.clone(), cx));
+        let agents_panel = cx.new(|cx| ToolPanel::new("agents", "Agents", IconName::Bot, agents.clone(), cx));
+        let notifications_panel =
+            cx.new(|cx| ToolPanel::new("notifications", "Notifications", IconName::Info, notifications.clone(), cx));
+        let dock_panels = vec![
+            (BottomTab::Problems, problems_panel.entity_id()),
+            (BottomTab::Terminal, terminal_panel.entity_id()),
+            (BottomTab::Diff, diff_panel.entity_id()),
+            (BottomTab::Run, run_panel.entity_id()),
+            (BottomTab::Debug, debug_panel.entity_id()),
+            (BottomTab::Db, db_panel.entity_id()),
+            (BottomTab::Http, http_panel.entity_id()),
+            (BottomTab::Notebook, notebook_panel.entity_id()),
+            (BottomTab::Agents, agents_panel.entity_id()),
+            (BottomTab::Notifications, notifications_panel.entity_id()),
+        ]
+        .into_iter()
+        .map(|(tab, id)| (tab, gpui_kit::base::dock::PanelId::from(id)))
+        .collect::<Vec<_>>();
+        let bottom_layout = DockLayout::tabs()
+            .panel(problems_panel)
+            .panel(terminal_panel)
+            .panel(diff_panel)
+            .panel(run_panel)
+            .panel(debug_panel)
+            .panel(db_panel)
+            .panel(http_panel)
+            .panel(notebook_panel)
+            .panel(agents_panel)
+            .panel(notifications_panel);
+        dock_entity.update(cx, |dock, cx| {
+            dock.set_dock(DockPlacement::Bottom, bottom_layout, window, cx);
+        });
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
         let initial_soft_wrap = initial_settings.editor.soft_wrap;
         editor.update(cx, |editor, cx| editor.set_soft_wrap_default(initial_soft_wrap, window, cx));
@@ -662,6 +714,9 @@ impl Workbench {
             notebook,
             agents,
             notifications,
+            dock: Some(dock_entity),
+            dock_skin: Some(dock_skin),
+            dock_panels,
             diff,
             search,
             vcs,
@@ -882,9 +937,28 @@ impl Workbench {
         self.bottom == BottomTab::Notifications && (self.float_panel.is_some() || self.show_bottom)
     }
 
+    /// Points the dock at the panel for `tab`, so `self.bottom` stays the one
+    /// source of truth for "which tool window is showing".
+    fn sync_dock_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dock) = self.dock.clone() else { return };
+        let Some((_, panel)) = self.dock_panels.iter().find(|(tab, _)| *tab == self.bottom) else { return };
+        let panel = *panel;
+        dock.update(cx, |dock, cx| dock.select_panel(panel, window, cx));
+    }
+
     /// The notification history (the Notifications tool window's state).
     pub fn notifications(&self) -> &Entity<NotificationLog> {
         &self.notifications
+    }
+
+    /// The bottom tool dock (all tool windows as dock panels).
+    pub fn dock(&self) -> Option<&Entity<DockArea>> {
+        self.dock.as_ref()
+    }
+
+    /// Whether the Problems tool window is the one selected.
+    pub fn bottom_is_problems(&self) -> bool {
+        self.bottom == BottomTab::Problems && self.show_bottom
     }
 
     /// The Find in File options the bar's `Aa` / `.*` chips toggle.
@@ -1000,6 +1074,7 @@ impl Workbench {
     }
 
     fn run(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_before = self.bottom;
         match cmd {
             Cmd::OpenProject => self.pick_project(window, cx),
             Cmd::RecentProjects => {
@@ -1215,6 +1290,11 @@ impl Workbench {
             }
             Cmd::ShowNotifications => self.show_notifications(cx),
             Cmd::Quit => cx.quit(),
+        }
+        // Most commands pick a tool window by assigning `bottom`; point the dock
+        // at it so the two stay in step.
+        if self.bottom != tab_before {
+            self.sync_dock_selection(window, cx);
         }
     }
 
@@ -1823,48 +1903,12 @@ impl Workbench {
 
     fn render_bottom(&mut self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
         let height = self.layout.heights[self.bottom.index()];
-        let tab = |label: &'static str, selected: bool, target: BottomTab, badge: usize, cx: &mut Context<Self>| {
-            let click = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
-                this.bottom = target;
-                if target == BottomTab::Notifications {
-                    this.notifications.update(cx, |log, cx| {
-                        log.mark_all_read();
-                        cx.notify();
-                    });
-                }
-                cx.notify();
-            });
-            div()
-                .id(ElementId::Name(format!("bottom-tab-{label}").into()))
-                .test_support()
-                .h_full()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_1()
-                .cursor_pointer()
-                .text_size(px(11.5))
-                .text_color(if selected { theme.foreground } else { theme.fg_muted() })
-                .when(selected, |this| this.border_b_2().border_color(theme.accent))
-                .on_click(click)
-                .child(label)
-                .when(badge > 0, |this| {
-                    this.child(
-                        div()
-                            .id(ElementId::Name(format!("bottom-tab-badge-{label}").into()))
-                            .h(px(14.))
-                            .min_w(px(14.))
-                            .px_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(theme.accent)
-                            .text_size(px(9.))
-                            .text_color(theme.background)
-                            .child(badge.to_string()),
-                    )
-                })
+        let float_hover = theme.list_hover;
+        // The dock draws its own tab bar; the workbench keeps the height, the
+        // splitter and the Float control around it.
+        let body: AnyElement = match self.dock.clone() {
+            Some(dock) => div().size_full().min_h_0().child(dock).into_any_element(),
+            None => self.render_bottom_tab(),
         };
         div()
             .h(px(height))
@@ -1876,29 +1920,22 @@ impl Workbench {
             .border_color(theme.border)
             .child(
                 div()
-                    .h(px(28.))
+                    .h(px(26.))
                     .w_full()
                     .flex()
                     .items_center()
+                    .px_2()
+                    .gap_2()
                     .bg(theme.tab_bar)
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(tab("Problems", self.bottom == BottomTab::Problems, BottomTab::Problems, 0, cx))
-                    .child(tab("Terminal", self.bottom == BottomTab::Terminal, BottomTab::Terminal, 0, cx))
-                    .child(tab("Diff", self.bottom == BottomTab::Diff, BottomTab::Diff, 0, cx))
-                    .child(tab("Run", self.bottom == BottomTab::Run, BottomTab::Run, 0, cx))
-                    .child(tab("Debug", self.bottom == BottomTab::Debug, BottomTab::Debug, 0, cx))
-                    .child(tab("Database", self.bottom == BottomTab::Db, BottomTab::Db, 0, cx))
-                    .child(tab("HTTP", self.bottom == BottomTab::Http, BottomTab::Http, 0, cx))
-                    .child(tab("Notebook", self.bottom == BottomTab::Notebook, BottomTab::Notebook, 0, cx))
-                    .child(tab("Agents", self.bottom == BottomTab::Agents, BottomTab::Agents, 0, cx))
-                    .child(tab(
-                        "Notifications",
-                        self.bottom == BottomTab::Notifications,
-                        BottomTab::Notifications,
-                        self.notifications.read(cx).unread(),
-                        cx,
-                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.fg_secondary())
+                            .child(self.bottom.label()),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1909,19 +1946,17 @@ impl Workbench {
                             .items_center()
                             .gap_1()
                             .cursor_pointer()
-                            .hover(move |this| this.bg(theme.list_hover))
-                            .on_click(
-                                cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
-                                    this.float_bottom(window, cx)
-                                }),
-                            )
+                            .hover(move |this| this.bg(float_hover))
+                            .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                                this.float_bottom(window, cx)
+                            }))
                             .text_size(px(10.))
                             .text_color(theme.fg_secondary())
                             .child(Icon::new(IconName::Maximize2).xsmall())
                             .child("Float"),
                     ),
             )
-            .child(self.render_bottom_tab())
+            .child(body)
             .into_any_element()
     }
 

@@ -295,6 +295,13 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   Remove, Install from folder…, persisted in the plugin host's `state.json`
   (an existing plugin manager is reused; plugin events such as insert-text
   are not routed to the native UI yet).
+- **Bottom tool dock**: every tool window (Problems, Terminal, Diff, Run,
+  Debug, Database, HTTP, Notebook, Agents, Notifications) is a `DockArea` panel
+  in a bottom dock, so they share one tab bar, can be dragged between groups and
+  zoomed. The workbench keeps `bottom` as the "which tool window" state and
+  points the dock at it (`select_panel`) whenever a command changes it;
+  `ToolPanel` (`crates/ide-ui/src/dock.rs`) adapts the pre-existing panel
+  entities without touching their code.
 - **Floating / edge-docked tool window**: View › Float Tool Window (or the
   Float chip in the bottom tab strip) detaches the current bottom tab into a
   floating card over the editor. Dragging its title bar shades the left, right
@@ -474,7 +481,7 @@ Status of the Tauri shell's features in the native app.
 | Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
-| Dockable/floating tool windows, drag-to-split | yes | floating card with left/right/bottom edge docking and undock; drag-to-split pending | P2/P3 |
+| Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder | P2 (commands, insert-text events, marketplace) |
 | Multi-window / window groups | yes | no | P3 |
 | Updater, single instance, window-state | yes | no | P4 |
