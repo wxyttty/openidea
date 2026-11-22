@@ -57,6 +57,7 @@ gpui_kit::actions!(
         FindInEditor,
         CloseFind,
         Intentions,
+        Rename,
     ]
 );
 
@@ -107,6 +108,7 @@ pub fn install(cx: &mut App) {
     bind("secondary-f", Box::new(FindInEditor));
     bind("escape", Box::new(CloseFind));
     bind("alt-enter", Box::new(Intentions));
+    bind("alt-shift-f6", Box::new(Rename));
     cx.bind_keys(bindings);
 
     // Editor-local bindings. `gpui-base` implements multi-cursor (Alt+click,

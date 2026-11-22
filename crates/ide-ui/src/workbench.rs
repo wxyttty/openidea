@@ -16,6 +16,7 @@ use crate::dock::ToolPanel;
 use crate::editor::{EditorArea, FindOptions, TabInfo};
 use crate::http::HttpPanel;
 use crate::intentions::IntentionSection;
+use crate::rename::{RenameDialog, RenameDone, dialog_origin};
 use crate::layout::Layout;
 use crate::notebook::NotebookPanel;
 use crate::notifications::{BalloonDisplay, NotificationLog, NotificationPrefs};
@@ -136,6 +137,7 @@ enum Cmd {
     ShowAgents,
     ShowNotifications,
     Intentions,
+    Rename,
     Quit,
 }
 
@@ -327,6 +329,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Show Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
     MenuEntry { label: "Show Context Actions", shortcut: Some("Alt+Enter"), cmd: Cmd::Intentions },
+    MenuEntry { label: "Rename Symbol", shortcut: Some("Shift+F6"), cmd: Cmd::Rename },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -507,6 +510,8 @@ pub struct Workbench {
     /// The bottom tool area: a dock, so panels move between groups and the
     /// layout persists.
     intentions: Entity<IntentionSection>,
+    rename: Entity<RenameDialog>,
+    rename_open: bool,
     dock: Option<Entity<DockArea>>,
     dock_skin: Option<std::rc::Rc<DockSkin>>,
     /// Panel id of each `BottomTab` in the dock, in `BottomTab::index` order.
@@ -635,6 +640,12 @@ impl Workbench {
         let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let notifications = cx.new(|_| NotificationLog::new());
+        let rename = cx.new(|cx| RenameDialog::new(window, cx));
+        let rename_done = cx.subscribe(&rename, |this: &mut Self, _dialog, _: &RenameDone, cx| {
+            this.rename_open = false;
+            this.set_status("Rename applied", cx);
+        });
+        let _rename_done = rename_done;
         let intentions = {
             let editor = editor.clone();
             let host = host.clone();
@@ -724,6 +735,8 @@ impl Workbench {
             agents,
             notifications,
             intentions,
+            rename,
+            rename_open: false,
             dock: Some(dock_entity),
             dock_skin: Some(dock_skin),
             dock_panels,
@@ -971,6 +984,24 @@ impl Workbench {
         let host = self.host.clone();
         let pos = ide_core::Pos { line, col };
         self.intentions.update(cx, |section, cx| section.request(host, doc, pos, range, cx));
+        cx.notify();
+    }
+
+    /// `Shift+F6`: rename the symbol under the caret.
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((doc, line, col, range)) = self.editor.read(cx).active_position(cx) else {
+            self.set_status("Open a file first", cx);
+            return;
+        };
+        let text = self.editor.read(cx).active_text().unwrap_or_default();
+        let Some(name) = symbol_at(&text, range) else {
+            self.set_status("Put the caret on a symbol to rename", cx);
+            return;
+        };
+        self.rename_open = true;
+        let host = self.host.clone();
+        let pos = ide_core::Pos { line, col };
+        self.rename.update(cx, |dialog, cx| dialog.begin(host, doc, pos, name, window, cx));
         cx.notify();
     }
 
@@ -1324,6 +1355,7 @@ impl Workbench {
             }
             Cmd::ShowNotifications => self.show_notifications(cx),
             Cmd::Intentions => self.show_intentions(window, cx),
+            Cmd::Rename => self.start_rename(window, cx),
             Cmd::Quit => cx.quit(),
         }
         // Most commands pick a tool window by assigning `bottom`; point the dock
@@ -1700,6 +1732,15 @@ impl Workbench {
     /// Keys that the intentions popup owns while it is open: Up/Down walk the
     /// list, Enter applies the selected action, Esc closes it.
     fn intentions_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.rename_open {
+            if event.keystroke.key == "escape" {
+                self.rename_open = false;
+                self.rename.update(cx, |dialog, cx| dialog.close(cx));
+                self.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
+                cx.stop_propagation();
+            }
+            return true;
+        }
         if !self.intentions.read(cx).open {
             return false;
         }
@@ -3464,6 +3505,33 @@ impl Render for Workbench {
                     .into_any_element(),
             );
         }
+        // Rename: a centred dialog over a dimmed workbench.
+        if self.rename_open {
+            let origin = dialog_origin(window.bounds().size);
+            let dismiss = cx.listener(|this: &mut Self, _: &MouseDownEvent, _window, cx| {
+                this.rename_open = false;
+                this.rename.update(cx, |dialog, cx| dialog.close(cx));
+                cx.notify();
+            });
+            overlays.push(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(hsla(0., 0., 0., 0.25))
+                    .on_mouse_down(MouseButton::Left, dismiss)
+                    .into_any_element(),
+            );
+            overlays.push(
+                div()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .child(self.rename.clone())
+                    .into_any_element(),
+            );
+        }
         // Context actions: a popup near the caret, above the editor.
         if self.intentions.read(cx).open {
             // Under the editor's title area, near the caret's line: the editor
@@ -3877,6 +3945,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.run(Cmd::GoToLine, window, cx)))
             .on_action(cx.listener(|this, _: &FindInEditor, window, cx| this.run(Cmd::FindInEditor, window, cx)))
             .on_action(cx.listener(|this, _: &Intentions, window, cx| this.run(Cmd::Intentions, window, cx)))
+            .on_action(cx.listener(|this, _: &Rename, window, cx| this.run(Cmd::Rename, window, cx)))
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
                 if this.find_open {
                     this.find_open = false;
@@ -4115,6 +4184,60 @@ impl Render for Workbench {
                 }),
             )
             .children(overlays)
+    }
+}
+
+/// The identifier under a selection/caret: `active_position`'s byte range when
+/// something is selected, otherwise the word the caret sits in.
+fn symbol_at(text: &str, range: std::ops::Range<usize>) -> Option<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    if range.start < range.end {
+        return text.get(range.clone()).filter(|word| word.chars().all(is_ident)).map(str::to_owned);
+    }
+    let caret = range.start.min(text.len());
+    let bytes = text.as_bytes();
+    let mut start = caret;
+    while start > 0 && is_ident(bytes[start - 1] as char) {
+        start -= 1;
+    }
+    let mut end = caret;
+    while end < bytes.len() && is_ident(bytes[end] as char) {
+        end += 1;
+    }
+    (end > start).then(|| text[start..end].to_owned())
+}
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::symbol_at;
+
+    #[test]
+    fn finds_the_word_under_a_caret() {
+        let text = "fn alpha() { beta(); }";
+        // Caret inside "alpha".
+        assert_eq!(symbol_at(text, 6..6).as_deref(), Some("alpha"));
+        // Caret at the very start of a word.
+        assert_eq!(symbol_at(text, 3..3).as_deref(), Some("alpha"));
+        // Caret just past the last letter of a word.
+        assert_eq!(symbol_at(text, 7..7).as_deref(), Some("alpha"));
+        // Offset 0 is inside the leading "fn".
+        assert_eq!(symbol_at(text, 0..0).as_deref(), Some("fn"));
+        // At a word boundary the preceding word wins (IDEA behaves the same).
+        assert_eq!(symbol_at(text, 2..2).as_deref(), Some("fn"));
+        // Right after a word the word still wins.
+        assert_eq!(symbol_at(text, 8..8).as_deref(), Some("alpha"));
+        // Inside punctuation or a gap between words nothing is a symbol.
+        assert_eq!(symbol_at(text, 19..19), None);
+        // A caret inside "beta" picks it up.
+        assert_eq!(symbol_at(text, 15..15).as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn a_selection_is_used_when_it_is_an_identifier() {
+        let text = "let value = other;";
+        assert_eq!(symbol_at(text, 4..9).as_deref(), Some("value"));
+        // A selection spanning punctuation is not a symbol.
+        assert_eq!(symbol_at(text, 3..10), None);
     }
 }
 

@@ -320,6 +320,13 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   `terminal.fontSize` to `<config>/settings.toml` through `SettingsStore`),
   the current theme with a shortcut to the Appearance dialog, and read-only
   tab size / indent / shell values from the effective settings.
+- **Rename** (`Shift+F6`, Navigate menu): `textDocument/prepareRename` gates the
+  dialog, which opens prefilled with the symbol under the caret (the selected
+  text, else the word the caret is in), computes `textDocument/rename` for the
+  typed name, lists the files the edit touches with per-file edit counts, flags
+  an incomplete result, and applies on the second Enter through the shared
+  `Documents` (open editors repaint from `DocPatched`). A server that answers
+  nothing leaves the dialog with a notice.
 - **Context actions** (`Alt+Enter`, Navigate menu): asks every language server for
   `textDocument/codeAction` at the caret and lists quick fixes, refactorings and
   source actions in a popup under the caret (`crates/ide-ui/src/intentions.rs`).
@@ -468,7 +475,7 @@ Status of the Tauri shell's features in the native app.
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
-| Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions (quick fixes, refactorings, source actions) from every server's `textDocument/codeAction`, with kind sections, preferred preselection, disabled reasons and a filter; rename/locate-duplicates/structural-search backends stay unwired | P2 (rename UI, duplicates UI, structure view) |
+| Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions (quick fixes, refactorings, source actions: kind sections, preferred preselection, disabled reasons, filter) and `Shift+F6` rename (prepareRename check, impact summary, apply through `Documents`); Locate Duplicates and Search Structurally have backends but no UI | P2 (duplicates UI, structural search, structure view) |
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
