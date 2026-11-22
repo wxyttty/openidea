@@ -186,6 +186,9 @@ enum Cmd {
     ShowDeploy,
     ShowRemoteHost,
     CheckUpdates,
+    GoToDeclaration,
+    GoToImplementation,
+    GoToTypeDefinition,
     NewWindow,
     Quit,
 }
@@ -233,10 +236,10 @@ const VIEW_MENU: &[MenuEntry] = &[
 const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Go to File…", shortcut: Some("Ctrl+P"), cmd: Cmd::QuickOpen },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
+    MenuEntry { label: "Go to Declaration or Usages", shortcut: Some("Ctrl+B"), cmd: Cmd::GoToDeclaration },
+    MenuEntry { label: "Go to Implementation(s)", shortcut: Some("Ctrl+Alt+B"), cmd: Cmd::GoToImplementation },
+    MenuEntry { label: "Go to Type Declaration", shortcut: Some("Ctrl+Shift+B"), cmd: Cmd::GoToTypeDefinition },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
-    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
-    MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
-    MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
     MenuEntry { label: "Command Palette…", shortcut: Some("Ctrl+Shift+P"), cmd: Cmd::CommandPalette },
     MenuEntry { label: "Next Tab", shortcut: Some("Ctrl+Tab"), cmd: Cmd::NextTab },
@@ -272,8 +275,6 @@ const RUN_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Stop", shortcut: Some("Shift+F5"), cmd: Cmd::StopRun },
     MenuEntry { label: "Show Run Tool Window", shortcut: Some("Alt+4"), cmd: Cmd::ShowRun },
     MenuEntry { label: "Edit Configurations…", shortcut: None, cmd: Cmd::EditRunConfigurations },
-    MenuEntry { label: "Show Database Tool Window", shortcut: Some("Alt+3"), cmd: Cmd::ShowDb },
-    MenuEntry { label: "Show HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Run HTTP Request at Caret", shortcut: Some("Ctrl+Alt+R"), cmd: Cmd::RunHttpAtCaret },
 ];
 
@@ -288,9 +289,6 @@ const DEBUG_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Toggle Breakpoint", shortcut: Some("Ctrl+F8"), cmd: Cmd::ToggleBreakpoint },
     MenuEntry { label: "View Breakpoints…", shortcut: Some("Ctrl+Shift+F8"), cmd: Cmd::ViewBreakpoints },
     MenuEntry { label: "Show Debug Tool Window", shortcut: Some("Alt+5"), cmd: Cmd::ShowDebug },
-    MenuEntry { label: "Show Database Tool Window", shortcut: Some("Alt+3"), cmd: Cmd::ShowDb },
-    MenuEntry { label: "Show HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
-    MenuEntry { label: "Run HTTP Request at Caret", shortcut: Some("Ctrl+Alt+R"), cmd: Cmd::RunHttpAtCaret },
 ];
 
 const HELP_MENU: &[MenuEntry] = &[
@@ -1300,6 +1298,48 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Go to Declaration / Implementation / Type Declaration: asks the language
+    /// servers at the caret and opens the first answer (a file and position).
+    fn goto_symbol(&mut self, kind: ide_lsp::types::GotoKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((doc, line, col, _range)) = self.editor.read(cx).active_position(cx) else {
+            self.status = "Open a file first".into();
+            cx.notify();
+            return;
+        };
+        let host = self.host.clone();
+        let editor = self.editor.clone();
+        let pos = ide_core::Pos { line, col };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result = ide_host::ops::lsp::lsp_goto(&host, "main", doc, pos, kind)
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    match result {
+                        Ok(locations) if !locations.is_empty() => {
+                            let location = &locations[0];
+                            let path = location.path.0.clone();
+                            let line = location.range.start.line;
+                            let col = location.range.start.col;
+                            editor.update(cx, |editor, cx| editor.open_file_at(path, line, col, window, cx));
+                            this.status =
+                                format!("{} location(s)", locations.len()).into();
+                        }
+                        Ok(_) => this.status = "No navigation target here".into(),
+                        Err(err) => this.status = format!("Navigation failed: {err}").into(),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Checks the configured release feed and reports the result in the status
     /// bar (plus a notification when a newer build exists).
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
@@ -2009,6 +2049,9 @@ impl Workbench {
                 cx.notify();
             }
             Cmd::CheckUpdates => self.check_for_updates(cx),
+            Cmd::GoToDeclaration => self.goto_symbol(ide_lsp::types::GotoKind::Definition, window, cx),
+            Cmd::GoToImplementation => self.goto_symbol(ide_lsp::types::GotoKind::Implementation, window, cx),
+            Cmd::GoToTypeDefinition => self.goto_symbol(ide_lsp::types::GotoKind::TypeDefinition, window, cx),
             Cmd::NewWindow => self.open_new_window(window, cx),
             Cmd::Quit => cx.quit(),
         }

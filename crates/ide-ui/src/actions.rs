@@ -68,6 +68,9 @@ gpui_kit::actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        GoToDeclaration,
+        GoToImplementation,
+        GoToTypeDefinition,
         Undo,
         Redo,
         Cut,
@@ -131,6 +134,9 @@ pub fn install(cx: &mut App) {
     bind("escape", Box::new(CloseFind));
     bind("alt-enter", Box::new(Intentions));
     bind("alt-shift-f6", Box::new(Rename));
+    bind("secondary-b", Box::new(GoToDeclaration));
+    bind("secondary-alt-b", Box::new(GoToImplementation));
+    bind("secondary-shift-b", Box::new(GoToTypeDefinition));
     bind("secondary-equal", Box::new(ZoomIn));
     bind("secondary-minus", Box::new(ZoomOut));
     bind("secondary-0", Box::new(ZoomReset));

@@ -510,7 +510,7 @@ Status of the Tauri shell's features in the native app.
 | Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc, `Aa` case and `.*` regex toggles | — |
 | Replace in files | yes | Replace All over the search results, Documents-backed; per-match Replace on each result row with a replacement preview | — |
 | Editor zoom | yes | View menu + Ctrl+= / Ctrl+- / Ctrl+0, persisted `editor.fontSize` | — |
-| Menu bar | native `menu.rs` (1.6k lines) | 9 menus (File, Edit, View, Navigate, Refactor, Git, Run, Debug, Help) with the actions the native workbench implements | P2 (remaining native-only entries) |
+| Menu bar | native `menu.rs` (1.6k lines) | 9 menus (File, Edit, View, Navigate, Refactor, Git, Run, Debug, Help) with the actions the native workbench implements, including Ctrl+B / Ctrl+Alt+B / Ctrl+Shift+B navigation to declaration, implementation and type declaration; unrelated entries that had drifted into Navigate/Run/Debug were removed | — |
 | Command palette | yes | yes (13 commands) | grows with actions |
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
