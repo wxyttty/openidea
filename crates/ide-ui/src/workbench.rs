@@ -678,6 +678,8 @@ pub struct Workbench {
     plugins_open: bool,
     plugins_list: Vec<PluginInfo>,
     plugins_notice: Option<SharedString>,
+    /// Installable plugin packages found in the catalog folders.
+    plugin_catalog: Vec<ide_plugin::CatalogPlugin>,
     plugin_task: Option<Task<()>>,
     /// The task draining the plugin event stream.
     plugin_event_task: Option<Task<()>>,
@@ -967,6 +969,7 @@ impl Workbench {
             plugins_open: false,
             plugins_list: Vec::new(),
             plugins_notice: None,
+            plugin_catalog: Vec::new(),
             plugin_task: None,
             plugin_event_task: None,
             plugin_events: plugin_rx,
@@ -1956,12 +1959,20 @@ impl Workbench {
                 plugins.sync_project(root);
             }
             let snapshot = plugins.list(root.as_deref());
-            let _ = tx.unbounded_send(snapshot);
+            // The catalog folders: the data-dir catalog plus any folders the
+            // settings name (a team's internal plugin directory).
+            let mut dirs = vec![plugins.plugins_dir().to_path_buf()];
+            if let Some(path) = std::env::var_os("OPENIDEA_PLUGIN_CATALOG") {
+                dirs.push(std::path::PathBuf::from(path));
+            }
+            let catalog = ide_plugin::scan_catalog(&dirs);
+            let _ = tx.unbounded_send((snapshot, catalog));
         });
         self.plugin_task = Some(cx.spawn(async move |this, cx| {
-            while let Some(snapshot) = rx.next().await {
+            while let Some((snapshot, catalog)) = rx.next().await {
                 let _ = this.update(cx, |this, cx| {
                     this.plugins_list = snapshot.plugins;
+                    this.plugin_catalog = catalog;
                     this.plugins_notice = None;
                     cx.notify();
                 });
@@ -4530,6 +4541,99 @@ impl Render for Workbench {
                 }
             });
             let mut list = div().id("plugins-list").flex_1().min_h_0().flex().flex_col().gap_1().overflow_y_scroll();
+            // Installable packages from the catalog folders: a marketplace row
+            // per package with its metadata and an Install button.
+            if !self.plugin_catalog.is_empty() {
+                list = list.child(
+                    div()
+                        .pt_1()
+                        .text_size(px(9.5))
+                        .text_color(theme.fg_muted())
+                        .child("AVAILABLE FROM THE CATALOG"),
+                );
+                for (index, package) in self.plugin_catalog.iter().enumerate() {
+                    let id = package.id.clone();
+                    let path = package.path.0.clone();
+                    let installed = self.plugins_list.iter().any(|plugin| plugin.id == package.id);
+                    let problem = package.problem.clone();
+                    let plugins = self.plugins.clone();
+                    let hover = plugin_hover;
+                    let install = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                        let Some(plugins) = plugins.clone() else { return };
+                        let path = path.clone();
+                        this.plugin_action(
+                            move || plugins.install_from_dir(&path).map(|_| ()).map_err(|err| err.to_string()),
+                            cx,
+                        );
+                    });
+                    list = list.child(
+                        div()
+                            .id(ElementId::Name(format!("catalog-plugin-{index}").into()))
+                            .w_full()
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(theme.foreground)
+                                            .child(format!("{} {}", package.name, package.version)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(theme.fg_muted())
+                                            .child(package.description.clone()),
+                                    )
+                                    .when_some(problem.clone(), |this, problem| {
+                                        this.child(div().text_size(px(9.5)).text_color(theme.warning).child(problem))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.))
+                                    .text_color(theme.fg_muted())
+                                    .child(format!(
+                                        "{} cmd · {} lang · {} theme",
+                                        package.commands.len(),
+                                        package.language_count,
+                                        package.theme_count
+                                    )),
+                            )
+                            .when(!installed && problem.is_none(), |this| {
+                                this.child(
+                                    div()
+                                        .id(ElementId::Name(format!("catalog-install-{id}").into()))
+                                        .h(px(20.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .bg(theme.primary)
+                                        .hover(move |this| this.bg(hover))
+                                        .on_click(install)
+                                        .text_size(px(9.5))
+                                        .text_color(theme.primary_foreground)
+                                        .child("Install"),
+                                )
+                            })
+                            .when(installed, |this| {
+                                this.child(div().text_size(px(9.5)).text_color(theme.success).child("installed"))
+                            }),
+                    );
+                }
+            }
             if self.plugins_list.is_empty() {
                 list = list
                     .child(div().py_6().text_size(px(11.5)).text_color(theme.fg_muted()).child("No plugins installed"));
