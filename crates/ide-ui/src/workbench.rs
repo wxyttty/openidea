@@ -836,6 +836,19 @@ impl Workbench {
             .panel(notifications_panel);
         dock_entity.update(cx, |dock, cx| {
             dock.set_dock(DockPlacement::Bottom, bottom_layout, window, cx);
+            // Restore a dock arrangement the user split and saved last time
+            // (`ui.json` › layout › dock). A state from an incompatible version
+            // fails to load and the default tab layout stays.
+            if let Some(saved) = layout.dock.clone() {
+                match serde_json::from_value::<gpui_kit::base::dock::DockAreaState>(saved) {
+                    Ok(state) => {
+                        if let Err(err) = dock.load(state, window, cx) {
+                            tracing::warn!("saved dock layout was ignored: {err}");
+                        }
+                    }
+                    Err(err) => tracing::warn!("saved dock layout is unreadable: {err}"),
+                }
+            }
         });
         editor.update(cx, |editor, cx| editor.set_font_size(editor_font_size, cx));
         let initial_soft_wrap = initial_settings.editor.soft_wrap;
@@ -5003,6 +5016,11 @@ impl Render for Workbench {
                         cx.notify();
                     }
                     if this.resize_drag.take().is_some() {
+                        // Capture the dock's pane tree too, so a split
+                        // arrangement survives the restart.
+                        if let Some(dock) = this.dock.clone() {
+                            this.layout.dock = serde_json::to_value(dock.read(cx).dump(cx)).ok();
+                        }
                         this.layout.save(&this.config_dir);
                         this.status = format!(
                             "Layout saved · left {}px · bottom {}px",
