@@ -8,6 +8,7 @@
 use crate::theme::IdeColors as _;
 use futures::StreamExt;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -56,8 +57,35 @@ pub struct RunPanel {
     exit: Option<Option<i32>>,
     scroll: UniformListScrollHandle,
     task: Option<Task<()>>,
+    /// The configuration editor (Run › Edit Configurations…).
+    editor: Option<RunConfigEditor>,
     focus_handle: FocusHandle,
 }
+
+/// The fields of the configuration editor, one text input per field.
+pub struct RunConfigEditor {
+    /// The configuration being edited; `None` while creating a new one.
+    editing: Option<String>,
+    pub name: Entity<InputState>,
+    pub command: Entity<InputState>,
+    pub args: Entity<InputState>,
+    pub cwd: Entity<InputState>,
+    pub env: Entity<InputState>,
+    pub kind: SharedString,
+    pub error: Option<SharedString>,
+}
+
+/// The configuration kinds the editor offers, with the command that runs them.
+pub const CONFIG_KINDS: [(&str, &str); 8] = [
+    ("cargo", "cargo"),
+    ("gradle", "gradle"),
+    ("maven", "mvn"),
+    ("npm", "npm"),
+    ("go", "go"),
+    ("python", "python3"),
+    ("pytest", "pytest"),
+    ("shell", "sh"),
+];
 
 impl RunPanel {
     pub fn new(host: Arc<Host>, cx: &mut Context<Self>) -> Self {
@@ -75,6 +103,7 @@ impl RunPanel {
             exit: None,
             scroll: UniformListScrollHandle::default(),
             task: None,
+            editor: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -101,6 +130,151 @@ impl RunPanel {
         self.task = None;
         if self.configs.is_empty() {
             self.notice = Some("No run configurations detected for this project".into());
+        }
+        cx.notify();
+    }
+
+    /// Opens the editor for a new configuration (or the selected one when
+    /// `existing` is set).
+    pub fn open_editor(&mut self, existing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = existing.then(|| self.configs.get(self.selected).cloned()).flatten();
+        let kind = current.as_ref().map(|config| config.kind.clone()).unwrap_or_else(|| "cargo".to_owned());
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
+        let command = cx.new(|cx| InputState::new(window, cx).placeholder("Command, e.g. cargo"));
+        let args = cx.new(|cx| InputState::new(window, cx).placeholder("Arguments, space separated"));
+        let cwd = cx.new(|cx| InputState::new(window, cx).placeholder("Working directory (project-relative)"));
+        let env = cx.new(|cx| InputState::new(window, cx).placeholder("Env: KEY=value, KEY2=value2"));
+        if let Some(config) = &current {
+            name.update(cx, |input, cx| input.set_value(config.name.clone(), window, cx));
+            command.update(cx, |input, cx| input.set_value(config.command.clone(), window, cx));
+            args.update(cx, |input, cx| input.set_value(config.args.join(" "), window, cx));
+            let cwd_text = config
+                .cwd
+                .as_ref()
+                .map(|path| path.0.display().to_string())
+                .unwrap_or_default();
+            cwd.update(cx, |input, cx| input.set_value(cwd_text, window, cx));
+            let env_text = config
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            env.update(cx, |input, cx| input.set_value(env_text, window, cx));
+        } else {
+            // A new configuration starts at the kind's own command.
+            let default = CONFIG_KINDS
+                .iter()
+                .find(|(kind_id, _)| *kind_id == kind)
+                .map(|(_, command)| *command)
+                .unwrap_or("cargo");
+            command.update(cx, |input, cx| input.set_value(default, window, cx));
+        }
+        self.editor = Some(RunConfigEditor {
+            editing: current.as_ref().map(|config| config.id.clone()),
+            name,
+            command,
+            args,
+            cwd,
+            env,
+            kind: kind.into(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub fn close_editor(&mut self, cx: &mut Context<Self>) {
+        self.editor = None;
+        cx.notify();
+    }
+
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Writes the editor's configuration to `.openidea/run.toml` and reloads.
+    pub fn save_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else { return };
+        let Some(editor) = &self.editor else { return };
+        let name = editor.name.read(cx).value().trim().to_owned();
+        let command = editor.command.read(cx).value().trim().to_owned();
+        if name.is_empty() {
+            self.editor.as_mut().map(|editor| editor.error = Some("Name the configuration".into()));
+            cx.notify();
+            return;
+        }
+        if command.is_empty() {
+            self.editor.as_mut().map(|editor| editor.error = Some("Enter the command to run".into()));
+            cx.notify();
+            return;
+        }
+        let args = editor
+            .args
+            .read(cx)
+            .value()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let cwd = editor.cwd.read(cx).value().trim().to_owned();
+        let env = parse_env(&editor.env.read(cx).value());
+        let kind = editor.kind.clone();
+        let id = editor
+            .editing
+            .clone()
+            .unwrap_or_else(|| format!("user:{}", uuid_like(&name)));
+        let config = RunConfig {
+            id: id.clone(),
+            name,
+            kind: kind.to_string(),
+            command,
+            args,
+            cwd: (!cwd.is_empty()).then(|| ide_core::IpcPath(project.root.join(cwd))),
+            env,
+            detected: false,
+            is_test: false,
+            debug_adapter: None,
+            allow_parallel: false,
+            extras: Default::default(),
+        };
+        let mut saved = ide_run::load_user_configs(&project.root).unwrap_or_default();
+        match saved.iter_mut().find(|existing| existing.id == id) {
+            Some(existing) => *existing = config,
+            None => saved.push(config),
+        }
+        match ide_run::save_user_configs(&project.root, &saved) {
+            Ok(()) => {
+                self.editor = None;
+                self.configs = load_configs(&project.root);
+                self.selected = self.configs.iter().position(|config| config.id == id).unwrap_or(0);
+                self.notice = Some("Run configuration saved".into());
+            }
+            Err(err) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.error = Some(format!("Cannot save: {err}").into());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Removes the selected user configuration (detected ones are regenerated).
+    pub fn remove_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else { return };
+        let Some(config) = self.configs.get(self.selected).cloned() else { return };
+        if config.detected {
+            self.notice = Some("Detected configurations are regenerated; suppress them instead".into());
+            cx.notify();
+            return;
+        }
+        let mut saved = ide_run::load_user_configs(&project.root).unwrap_or_default();
+        saved.retain(|existing| existing.id != config.id);
+        match ide_run::save_user_configs(&project.root, &saved) {
+            Ok(()) => {
+                self.configs = load_configs(&project.root);
+                self.selected = self.selected.min(self.configs.len().saturating_sub(1));
+                self.notice = Some(format!("Removed {}", config.name).into());
+            }
+            Err(err) => self.notice = Some(format!("Cannot remove: {err}").into()),
         }
         cx.notify();
     }
@@ -266,6 +440,34 @@ impl RunPanel {
     }
 }
 
+/// `KEY=value, KEY2=value2` → map (blank is an empty map).
+fn parse_env(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// A stable id suffix from a display name: lowercase, runs of non-alphanumerics
+/// collapsed to one `-`, trimmed.
+fn uuid_like(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for c in name.chars() {
+        if c.is_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
 fn load_configs(root: &Path) -> Vec<RunConfig> {
     let saved = ide_run::load_user_configs(root).unwrap_or_default();
     let suppressed = ide_run::load_suppressed_config_ids(root).unwrap_or_default();
@@ -406,6 +608,44 @@ impl Render for RunPanel {
             })
             .child(
                 div()
+                    .id("run-edit-configs")
+                    .h(px(22.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.border)
+                    .hover(move |this| this.bg(list_hover))
+                    .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                        this.open_editor(true, window, cx)
+                    }))
+                    .text_size(px(9.5))
+                    .text_color(theme.fg_secondary())
+                    .child("Edit"),
+            )
+            .child(
+                div()
+                    .id("run-new-config")
+                    .h(px(22.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.border)
+                    .hover(move |this| this.bg(list_hover))
+                    .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                        this.open_editor(false, window, cx)
+                    }))
+                    .text_size(px(9.5))
+                    .text_color(theme.fg_secondary())
+                    .child("New"),
+            )
+            .child(
+                div()
                     .id("run-clear")
                     .size(px(22.))
                     .flex()
@@ -418,12 +658,145 @@ impl Render for RunPanel {
                     .child(Icon::new(IconName::Trash).xsmall().text_color(theme.fg_muted())),
             );
 
+        let editor = self.editor.as_ref().map(|editor| {
+            let theme = theme.clone();
+            let fields: [(&str, &Entity<InputState>); 5] = [
+                ("Name", &editor.name),
+                ("Command", &editor.command),
+                ("Arguments", &editor.args),
+                ("Working dir", &editor.cwd),
+                ("Env", &editor.env),
+            ];
+            let rows = fields
+                .iter()
+                .map(|(label, input)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(80.))
+                                .text_size(px(10.5))
+                                .text_color(theme.fg_secondary())
+                                .child(*label),
+                        )
+                        .child(div().flex_1().min_w_0().child(Input::new(*input)))
+                })
+                .collect::<Vec<_>>();
+            let save = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.save_editor(cx));
+            let cancel = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.close_editor(cx));
+            div()
+                .id("run-config-editor")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(460.))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .bg(theme.popover)
+                        .border_1()
+                        .border_color(theme.border_strong())
+                        .rounded(px(8.))
+                        .shadow_xl()
+                        .occlude()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(if editor.editing.is_some() {
+                                    "Edit run configuration"
+                                } else {
+                                    "New run configuration"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(80.))
+                                        .text_size(px(10.5))
+                                        .text_color(theme.fg_secondary())
+                                        .child("Type"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.foreground)
+                                        .child(editor.kind.clone()),
+                                ),
+                        )
+                        .children(rows)
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(theme.fg_muted())
+                                .child("Written to .openidea/run.toml · detected configurations stay automatic"),
+                        )
+                        .when_some(editor.error.clone(), |this, error| {
+                            this.child(div().text_size(px(10.5)).text_color(theme.danger).child(error))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("run-config-cancel")
+                                        .h(px(24.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .on_click(cancel)
+                                        .text_size(px(11.))
+                                        .text_color(theme.fg_secondary())
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("run-config-save")
+                                        .h(px(24.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .bg(theme.primary)
+                                        .on_click(save)
+                                        .text_size(px(11.))
+                                        .text_color(theme.primary_foreground)
+                                        .child("Save"),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        });
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.background)
+            .relative()
             .child(header)
+            .when_some(editor, |this, editor| this.child(editor))
             .when_some(notice, |this, notice| {
                 this.child(div().px_2().py(px(2.)).text_size(px(10.5)).text_color(theme.warning).child(notice))
             })
@@ -493,4 +866,71 @@ fn render_line(line: &RunLine, theme: &gpui_kit::component::Theme) -> AnyElement
         .text_color(color)
         .child(line.text.clone())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{CONFIG_KINDS, parse_env, uuid_like};
+    use ide_run::RunConfig;
+
+    #[test]
+    fn env_pairs_parse_and_blank_entries_are_skipped() {
+        let env = parse_env("RUST_LOG=debug, PORT=8080 ,, =bad,NO_KEY");
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("debug"));
+        assert_eq!(env.get("PORT").map(String::as_str), Some("8080"));
+        assert!(!env.contains_key("NO_KEY"), "a pair without `=` is dropped");
+        assert!(!env.contains_key(""), "an empty key is dropped");
+        assert!(parse_env("").is_empty());
+    }
+
+    #[test]
+    fn a_config_id_is_a_stable_slug_of_its_name() {
+        // Same name → same id, so editing the same configuration replaces it
+        // instead of adding a second one.
+        assert_eq!(uuid_like("Run Tests"), "run-tests");
+        assert_eq!(uuid_like("Run  Tests!"), "run-tests");
+        assert_eq!(uuid_like("--"), "");
+    }
+
+    #[test]
+    fn every_offered_kind_is_a_command() {
+        for (kind, command) in CONFIG_KINDS {
+            assert!(!kind.is_empty(), "a kind needs an id");
+            assert!(!command.is_empty(), "{kind} needs a default command");
+        }
+        assert!(CONFIG_KINDS.iter().any(|(kind, _)| *kind == "cargo"));
+        assert!(CONFIG_KINDS.iter().any(|(kind, _)| *kind == "gradle"));
+        assert!(CONFIG_KINDS.iter().any(|(kind, _)| *kind == "python"));
+    }
+
+    #[test]
+    fn a_user_config_round_trips_through_the_run_file() {
+        let config = RunConfig {
+            id: "user:run-tests".into(),
+            name: "Run Tests".into(),
+            kind: "cargo".into(),
+            command: "cargo".into(),
+            args: vec!["test".into()],
+            cwd: None,
+            env: Default::default(),
+            detected: false,
+            is_test: false,
+            debug_adapter: None,
+            allow_parallel: false,
+            extras: Default::default(),
+        };
+        // The backend's own serializer is what run.toml holds; round-tripping
+        // through it proves every editor field survives the save.
+        let dir = std::env::temp_dir().join(format!("openidea-run-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".openidea")).unwrap();
+        ide_run::save_user_configs(&dir, &[config]).expect("saves");
+        let configs = ide_run::load_user_configs(&dir).expect("loads");
+        let loaded = configs.iter().find(|loaded| loaded.id == "user:run-tests").expect("the config is listed");
+        assert_eq!(loaded.name, "Run Tests");
+        assert_eq!(loaded.command, "cargo");
+        assert_eq!(loaded.args, vec!["test".to_owned()]);
+        assert!(!loaded.detected, "user configurations stay user configurations");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -142,6 +142,7 @@ enum Cmd {
     Run,
     StopRun,
     ShowRun,
+    EditRunConfigurations,
     Debug,
     ShowDebug,
     ShowDb,
@@ -248,6 +249,7 @@ const RUN_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Run", shortcut: Some("F5"), cmd: Cmd::Run },
     MenuEntry { label: "Stop", shortcut: Some("Shift+F5"), cmd: Cmd::StopRun },
     MenuEntry { label: "Show Run Tool Window", shortcut: Some("Alt+4"), cmd: Cmd::ShowRun },
+    MenuEntry { label: "Edit Configurations…", shortcut: None, cmd: Cmd::EditRunConfigurations },
     MenuEntry { label: "Show Database Tool Window", shortcut: Some("Alt+3"), cmd: Cmd::ShowDb },
     MenuEntry { label: "Show HTTP Client", shortcut: Some("Alt+7"), cmd: Cmd::ShowHttp },
     MenuEntry { label: "Run HTTP Request at Caret", shortcut: Some("Ctrl+Alt+R"), cmd: Cmd::RunHttpAtCaret },
@@ -1416,6 +1418,12 @@ impl Workbench {
             }
             Cmd::StopRun => {
                 self.run.update(cx, |run, cx| run.stop(cx));
+            }
+            Cmd::EditRunConfigurations => {
+                self.show_bottom = true;
+                self.bottom = BottomTab::Run;
+                self.run.update(cx, |run, cx| run.open_editor(true, window, cx));
+                cx.notify();
             }
             Cmd::ShowRun => {
                 self.show_bottom = true;
