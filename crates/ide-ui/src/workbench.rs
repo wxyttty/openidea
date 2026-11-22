@@ -59,6 +59,9 @@ pub struct WorkbenchConfig {
     /// A file given on the command line; opened after its project.
     pub initial_file: Option<PathBuf>,
     pub theme: theme::ThemeChoice,
+    /// Paths a later launch forwarded (single instance); the workbench opens
+    /// them in this window as they arrive.
+    pub launches: Option<std::sync::mpsc::Receiver<Vec<String>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -626,6 +629,9 @@ pub struct Workbench {
     find_searched: bool,
     find_options: FindOptions,
     settings_open: bool,
+    /// The last window geometry written to `ui.json`, so a frame that did not
+    /// move or resize the window does not touch the disk.
+    window_state: crate::layout::WindowState,
     /// The shortcut dialog (Settings › Keymap).
     keymap_dialog: Entity<crate::keymap::KeymapDialog>,
     keymap_accepted: Option<Subscription>,
@@ -827,6 +833,7 @@ impl Workbench {
             let loader = plugin_host.clone();
             let _ = std::thread::Builder::new().name("plugin-load".into()).spawn(move || loader.load_all());
         }
+        let window_state = crate::layout::WindowState::load(&config.config_dir);
         let mut this = Self {
             host,
             config_dir: config.config_dir,
@@ -891,6 +898,7 @@ impl Workbench {
             find_searched: false,
             find_options: FindOptions::default(),
             settings_open: false,
+            window_state,
             keymap_dialog: cx.new(|cx| crate::keymap::KeymapDialog::new(window, cx)),
             keymap_accepted: None,
             settings_section: SettingsSection::Editor,
@@ -936,6 +944,35 @@ impl Workbench {
         }
         if let Some(file) = config.initial_file.clone() {
             this.editor.update(cx, |editor, cx| editor.open_file(file, window, cx));
+        }
+        // A second launch forwards its arguments here; open them in this window.
+        if let Some(launches) = config.launches {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+            std::thread::Builder::new()
+                .name("openidea-launch-bridge".into())
+                .spawn(move || {
+                    while let Ok(paths) = launches.recv() {
+                        if tx.unbounded_send(paths).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn launch bridge");
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(arguments) = rx.next().await {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            for argument in arguments {
+                                this.open_launch(PathBuf::from(argument), window, cx);
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
         let handle = this.focus_handle.clone();
         window.focus(&handle, cx);
@@ -1132,6 +1169,25 @@ impl Workbench {
     /// The notification history (the Notifications tool window's state).
     pub fn notifications(&self) -> &Entity<NotificationLog> {
         &self.notifications
+    }
+
+    /// Opens what a launch argument names: a directory opens as the project, a
+    /// file opens (its project first). A second instance forwards its arguments
+    /// here, and the first launch uses the same rules.
+    pub fn open_launch(&mut self, argument: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if argument.is_dir() {
+            self.open_project(argument, window, cx);
+            return;
+        }
+        if let Some(parent) = argument.parent() {
+            let needs_project =
+                self.project.as_ref().is_none_or(|project| project.root != parent);
+            if needs_project {
+                self.open_project(parent.to_path_buf(), window, cx);
+            }
+        }
+        self.editor.update(cx, |editor, cx| editor.open_file(argument, window, cx));
+        cx.notify();
     }
 
     /// The bottom tool dock (all tool windows as dock panels).
@@ -2813,6 +2869,24 @@ impl Focusable for Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Persist the window geometry as the user resizes or moves it. Only a
+        // change touches the disk, so an idle frame is free.
+        let bounds = window.bounds();
+        let next = crate::layout::WindowState {
+            x: bounds.origin.x.as_f32(),
+            y: bounds.origin.y.as_f32(),
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+            maximized: self.window_state.maximized,
+        };
+        let changed = (next.x - self.window_state.x).abs() > 1.
+            || (next.y - self.window_state.y).abs() > 1.
+            || (next.width - self.window_state.width).abs() > 1.
+            || (next.height - self.window_state.height).abs() > 1.;
+        if changed {
+            self.window_state = next;
+            self.window_state.save(&self.config_dir);
+        }
         if self.goto_submit {
             self.goto_submit = false;
             let text = self.goto_input.read(cx).value().trim().to_owned();

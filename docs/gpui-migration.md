@@ -533,7 +533,7 @@ Status of the Tauri shell's features in the native app.
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder; commands listed in the command palette and run through `PluginHost::run_command`; `insertText`/`replaceSelection` reach the editor at the caret; plugin notifications land in the Notifications log | P2 (marketplace) |
 | Multi-window / window groups | yes | no | P3 |
-| Updater, single instance, window-state | yes | no | P4 |
+| Updater, single instance, window-state | yes | single instance (a second launch forwards its project/file to the running window over a socket and exits) and window state (geometry restored from `ui.json`, saved on move/resize); updater still pending | P3 (updater) |
 | Playwright e2e | yes | no | P2 (`gpui_kit::test`) |
 
 Rough size of what remains: the TypeScript UI is ~267k lines across 400 `.tsx`

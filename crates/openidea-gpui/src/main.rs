@@ -5,6 +5,8 @@
 //! crates (`ide-host`, `ide-tools`, `ide-sdk`, …) and opens a GPUI window with
 //! the workbench from `ide-ui`. No IPC, no webview, no TypeScript bridge.
 
+mod single_instance;
+
 use gpui_kit::*;
 use ide_host::{Host, HostConfig, SinkFactory};
 use ide_language::{LanguageRegistry, Syntax};
@@ -26,6 +28,17 @@ fn main() {
         eprintln!("cannot create {config_dir:?} / {data_dir:?}: {err}");
         std::process::exit(1);
     }
+    // One instance per user: a second launch hands its arguments (a project or
+    // file) to the running window and exits, like the Tauri single-instance
+    // plugin did.
+    let mut instance_lock = match single_instance::acquire(&data_dir.join("openidea.sock")) {
+        Ok(lock) => lock,
+        Err(single_instance::Claim::Handed(arguments)) => {
+            tracing::info!("another instance received {arguments:?}");
+            return;
+        }
+        Err(single_instance::Claim::Owned(lock)) => lock,
+    };
 
     // Tools, JDKs and language servers keep the layout the Tauri build used.
     ide_tools::extend_process_path(&data_dir);
@@ -95,9 +108,19 @@ fn main() {
     };
 
     let theme = ide_ui::theme::load_choice(&config_dir).unwrap_or(ide_ui::theme::ThemeChoice::IslandsDark);
-    let config = WorkbenchConfig { config_dir, data_dir, initial_project, initial_file, theme };
+    let launches = std::sync::Arc::new(std::sync::Mutex::new(instance_lock.take_incoming()));
+    let config = WorkbenchConfig {
+        config_dir,
+        data_dir,
+        initial_project,
+        initial_file,
+        theme,
+        launches: launches.lock().ok().and_then(|mut slot| slot.take()),
+    };
     let receiver = stream.receiver;
 
+    // The lock must outlive the window: dropping it removes the socket.
+    let _instance_lock = instance_lock;
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     application.run(move |cx| {
         gpui_kit::init(cx);
@@ -106,13 +129,23 @@ fn main() {
         theme::install_choice(cx, config.theme);
         ide_ui::actions::install(cx);
 
-        let bounds = Bounds::centered(None, size(px(1360.), px(880.)), cx);
+        // Restore the window's last geometry (`ui.json` › window), as the Tauri
+        // shell did; a fresh install centres at the default size.
+        let state = ide_ui::layout::WindowState::load(&config.config_dir);
+        let bounds = match (state.x.is_finite(), state.y.is_finite()) {
+            (true, true) => Bounds {
+                origin: point(px(state.x), px(state.y)),
+                size: size(px(state.width), px(state.height)),
+            },
+            _ => Bounds::centered(None, size(px(state.width), px(state.height)), cx),
+        };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             focus: true,
             show: true,
             ..Default::default()
         };
+
         let result = gpui_kit::open_window(options, cx, {
             let host = host.clone();
             let config = WorkbenchConfig {
@@ -121,6 +154,9 @@ fn main() {
                 initial_project: config.initial_project.clone(),
                 initial_file: config.initial_file.clone(),
                 theme: config.theme,
+                // The forwarded-argument receiver is moved into the workbench
+                // (a `Receiver` cannot be cloned).
+                launches: launches.lock().ok().and_then(|mut slot| slot.take()),
             };
             move |window, cx| cx.new(|cx| Workbench::new(host, config, receiver, window, cx))
         });

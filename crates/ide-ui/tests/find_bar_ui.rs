@@ -65,6 +65,7 @@ fn open_workbench(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workbench
                             initial_project: None,
                             initial_file: None,
                             theme: ThemeChoice::IslandsDark,
+                            launches: None,
                         },
                         receiver,
                         window,

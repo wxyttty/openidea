@@ -71,6 +71,7 @@ fn open(cx: &mut TestAppContext) -> Fixture {
                             initial_project: None,
                             initial_file: None,
                             theme: ThemeChoice::IslandsDark,
+                            launches: None,
                         },
                         receiver,
                         window,

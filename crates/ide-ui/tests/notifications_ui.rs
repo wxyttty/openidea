@@ -241,6 +241,7 @@ fn open_workbench(cx: &mut TestAppContext, settings_toml: Option<&str>) -> Workb
                             initial_project: None,
                             initial_file: None,
                             theme: ThemeChoice::IslandsDark,
+                            launches: None,
                         },
                         receiver,
                         window,
