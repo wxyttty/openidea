@@ -58,6 +58,7 @@ gpui_kit::actions!(
         CloseFind,
         Intentions,
         Rename,
+        ShowDuplicates,
     ]
 );
 

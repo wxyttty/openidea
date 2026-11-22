@@ -336,8 +336,15 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   entry, and typing filters the list (Up/Down walk it, Enter applies, Esc
   closes). Applying goes through `ide-host`'s `lsp_apply_code_action`, so the
   edit lands in the shared document and the editor repaints through
-  `DocPatched`. Rename, Locate Duplicates and Search Structurally have backends
-  (`ide-lsp`, `ide-analysis`) but no UI yet.
+  `DocPatched`. Rename has its own dialog; Locate Duplicates has its own tool
+  window; Search Structurally still has only a backend.
+- **Locate Duplicates** (View menu, `duplicates` tool window): scans the project
+  with `ide-analysis`'s token-based clone detection on the host runtime. The
+  header sets the minimum fragment length (`+20`/`-20`) and toggles identifier
+  and literal anonymisation (so copies survive renamed variables and changed
+  constants), Run reports groups / files / tokens / elapsed, and each group lists
+  its occurrences — click one to jump to the fragment. Unsaved buffers are read
+  first, so a just-edited fragment is found as it is on screen.
 - Command palette (`Ctrl+Shift+P`): filtered list, keyboard navigation,
   executes workbench commands; focus returns to the previous view on close.
 - Menu bar (File / View / Navigate / Help) with working actions, a native

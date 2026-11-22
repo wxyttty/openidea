@@ -98,7 +98,10 @@ fn bottom_dock_holds_every_tool_window(cx: &mut TestAppContext) {
         let tree = dock.layout(DockPlacement::Bottom).expect("bottom layout");
         // One tab group with all ten tool windows, as built in `Workbench::new`.
         let tabs = tree.panels().count();
-        assert_eq!(tabs, 10, "problems, terminal, diff, run, debug, db, http, notebook, agents, notifications");
+        assert_eq!(
+            tabs, 11,
+            "problems, terminal, diff, run, debug, db, http, notebook, agents, duplicates, notifications"
+        );
     });
 
     // Opening a tool window selects its panel in the dock.

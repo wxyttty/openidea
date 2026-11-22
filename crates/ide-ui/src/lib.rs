@@ -26,6 +26,7 @@ pub mod db;
 pub mod debug;
 pub mod dock;
 pub mod diff;
+pub mod duplicates;
 pub mod editor;
 pub mod events;
 pub mod highlights;

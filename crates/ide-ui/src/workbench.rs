@@ -12,6 +12,7 @@ use crate::breakpoints::Breakpoints;
 use crate::db::DbPanel;
 use crate::debug::{DebugAction, DebugPanel};
 use crate::diff::DiffPanel;
+use crate::duplicates::DuplicatesPanel;
 use crate::dock::ToolPanel;
 use crate::editor::{EditorArea, FindOptions, TabInfo};
 use crate::http::HttpPanel;
@@ -138,6 +139,7 @@ enum Cmd {
     ShowNotifications,
     Intentions,
     Rename,
+    ShowDuplicates,
     Quit,
 }
 
@@ -330,6 +332,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Show Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
     MenuEntry { label: "Show Context Actions", shortcut: Some("Alt+Enter"), cmd: Cmd::Intentions },
     MenuEntry { label: "Rename Symbol", shortcut: Some("Shift+F6"), cmd: Cmd::Rename },
+    MenuEntry { label: "Locate Duplicates…", shortcut: None, cmd: Cmd::ShowDuplicates },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -351,6 +354,7 @@ enum BottomTab {
     Http,
     Notebook,
     Agents,
+    Duplicates,
     Notifications,
 }
 
@@ -366,6 +370,7 @@ impl BottomTab {
             BottomTab::Http => "HTTP Client",
             BottomTab::Notebook => "Notebook",
             BottomTab::Agents => "Agents",
+            BottomTab::Duplicates => "Duplicates",
             BottomTab::Notifications => "Notifications",
         }
     }
@@ -381,7 +386,8 @@ impl BottomTab {
             BottomTab::Http => 6,
             BottomTab::Notebook => 7,
             BottomTab::Agents => 8,
-            BottomTab::Notifications => 9,
+            BottomTab::Duplicates => 9,
+            BottomTab::Notifications => 10,
         }
     }
 }
@@ -507,6 +513,7 @@ pub struct Workbench {
     notebook: Entity<NotebookPanel>,
     agents: Entity<AgentPanel>,
     notifications: Entity<NotificationLog>,
+    duplicates: Entity<DuplicatesPanel>,
     /// The bottom tool area: a dock, so panels move between groups and the
     /// layout persists.
     intentions: Entity<IntentionSection>,
@@ -640,6 +647,7 @@ impl Workbench {
         let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let notifications = cx.new(|_| NotificationLog::new());
+        let duplicates = cx.new(|cx| DuplicatesPanel::new(host.clone(), editor.clone(), cx));
         let rename = cx.new(|cx| RenameDialog::new(window, cx));
         let rename_done = cx.subscribe(&rename, |this: &mut Self, _dialog, _: &RenameDone, cx| {
             this.rename_open = false;
@@ -667,6 +675,8 @@ impl Workbench {
         let agents_panel = cx.new(|cx| ToolPanel::new("agents", "Agents", IconName::Bot, agents.clone(), cx));
         let notifications_panel =
             cx.new(|cx| ToolPanel::new("notifications", "Notifications", IconName::Info, notifications.clone(), cx));
+        let duplicates_panel =
+            cx.new(|cx| ToolPanel::new("duplicates", "Duplicates", IconName::Copy, duplicates.clone(), cx));
         let dock_panels = vec![
             (BottomTab::Problems, problems_panel.entity_id()),
             (BottomTab::Terminal, terminal_panel.entity_id()),
@@ -677,6 +687,7 @@ impl Workbench {
             (BottomTab::Http, http_panel.entity_id()),
             (BottomTab::Notebook, notebook_panel.entity_id()),
             (BottomTab::Agents, agents_panel.entity_id()),
+            (BottomTab::Duplicates, duplicates_panel.entity_id()),
             (BottomTab::Notifications, notifications_panel.entity_id()),
         ]
         .into_iter()
@@ -692,6 +703,7 @@ impl Workbench {
             .panel(http_panel)
             .panel(notebook_panel)
             .panel(agents_panel)
+            .panel(duplicates_panel)
             .panel(notifications_panel);
         dock_entity.update(cx, |dock, cx| {
             dock.set_dock(DockPlacement::Bottom, bottom_layout, window, cx);
@@ -734,6 +746,7 @@ impl Workbench {
             notebook,
             agents,
             notifications,
+            duplicates,
             intentions,
             rename,
             rename_open: false,
@@ -1356,6 +1369,12 @@ impl Workbench {
             Cmd::ShowNotifications => self.show_notifications(cx),
             Cmd::Intentions => self.show_intentions(window, cx),
             Cmd::Rename => self.start_rename(window, cx),
+            Cmd::ShowDuplicates => {
+                self.show_bottom = true;
+                self.bottom = BottomTab::Duplicates;
+                self.duplicates.update(cx, |panel, cx| panel.run(cx));
+                cx.notify();
+            }
             Cmd::Quit => cx.quit(),
         }
         // Most commands pick a tool window by assigning `bottom`; point the dock
@@ -2064,6 +2083,7 @@ impl Workbench {
             BottomTab::Http => div().flex_1().min_h_0().child(self.http.clone()),
             BottomTab::Notebook => div().flex_1().min_h_0().child(self.notebook.clone()),
             BottomTab::Agents => div().flex_1().min_h_0().child(self.agents.clone()),
+            BottomTab::Duplicates => div().flex_1().min_h_0().child(self.duplicates.clone()),
             BottomTab::Notifications => div().flex_1().min_h_0().child(self.notifications.clone()),
         }
         .into_any_element()
@@ -3946,6 +3966,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &FindInEditor, window, cx| this.run(Cmd::FindInEditor, window, cx)))
             .on_action(cx.listener(|this, _: &Intentions, window, cx| this.run(Cmd::Intentions, window, cx)))
             .on_action(cx.listener(|this, _: &Rename, window, cx| this.run(Cmd::Rename, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowDuplicates, window, cx| this.run(Cmd::ShowDuplicates, window, cx)))
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
                 if this.find_open {
                     this.find_open = false;

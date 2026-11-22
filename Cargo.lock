@@ -6817,6 +6817,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "ide-agent",
+ "ide-analysis",
  "ide-core",
  "ide-dap",
  "ide-db",
