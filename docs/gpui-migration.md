@@ -512,7 +512,7 @@ Status of the Tauri shell's features in the native app.
 | Editor zoom | yes | View menu + Ctrl+= / Ctrl+- / Ctrl+0, persisted `editor.fontSize` | — |
 | Menu bar | native `menu.rs` (1.6k lines) | 9 menus (File, Edit, View, Navigate, Refactor, Git, Run, Debug, Help) with the actions the native workbench implements, including Ctrl+B / Ctrl+Alt+B / Ctrl+Shift+B navigation to declaration, implementation and type declaration; unrelated entries that had drifted into Navigate/Run/Debug were removed | — |
 | Command palette | yes | yes (13 commands) | grows with actions |
-| Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
+| Status bar | yes | language/encoding/line ending/dirty/messages, unread notifications, branch, status messages | — |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers; the completion and hover popups are `gpui-base`'s own (theme-aware, keyboard-navigable) | — |
 | Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions, `Shift+F6` rename, Locate Duplicates, Search Structurally (patterns, replacement, Replace All), Structure view (symbol tree of the open buffer) | — |
@@ -520,13 +520,12 @@ Status of the Tauri shell's features in the native app.
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, stage by hunk, commit | — |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop, gutter breakpoint marks | — |
-| Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
+| Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size, interactive keys and paste | — |
 | Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings, optional alert sound, "Don't show again" suppresses a title for the session) | — |
-| Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
+| Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | — |
 | Notebook | yes | viewer, cell editing/save (cells, outputs, nbformat), kernel execution: Run Cell / Run All with streamed outputs, Interrupt, Restart, Clear Output, per-notebook Python selection; Alt+8 | — |
 | Agents | yes | providers/tasks/conversation, create local task (local checkout or worktree), prompt, cancel, permission prompts with per-option answers, per-task settings cycled from the provider's advertised options, ACP Registry list/install/update; Alt+9 | — |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save, gutter run marks per request line, streaming body shown live while a response arrives | — |
-| Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | SSH tool window (configurations, connect/test/disconnect with live session state); Deployment tool window (server picker, upload file / upload project / download file / compare with per-file sync status, reports as cancellable background tasks); Remote Host tool window (browse a deployment server's files, open a remote file's cached copy) | — |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, Keymap editor, theme, paths, plus **All settings (JSON)** — every effective setting as an editable tree, saveable section by section so no field is unreachable | — |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
