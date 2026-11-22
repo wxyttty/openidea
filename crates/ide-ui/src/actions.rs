@@ -60,6 +60,7 @@ gpui_kit::actions!(
         Rename,
         ShowDuplicates,
         ShowStructural,
+        ShowStructure,
     ]
 );
 

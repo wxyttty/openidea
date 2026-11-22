@@ -27,6 +27,7 @@ ide-terminal.workspace = true
 ide-lsp.workspace = true
 ide-notebook.workspace = true
 ide-analysis.workspace = true
+ide-language.workspace = true
 ide-plugin.workspace = true
 lsp-types.workspace = true
 url.workspace = true
