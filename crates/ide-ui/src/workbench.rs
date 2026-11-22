@@ -84,6 +84,12 @@ enum MenuKind {
 /// Counter for the window names of additional windows (`window-1`, …).
 static NEXT_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// Every open window's mailbox: `open_in_new_window` hands a file to the most
+/// recent window instead of moving editor entities between them (a file is just
+/// a path, and each window owns its editor state).
+static WINDOW_INBOXES: std::sync::Mutex<Vec<std::sync::mpsc::Sender<std::path::PathBuf>>> =
+    std::sync::Mutex::new(Vec::new());
+
 const MENU_KINDS: [MenuKind; 9] = [
     MenuKind::File,
     MenuKind::Edit,
@@ -661,6 +667,9 @@ pub struct Workbench {
     window_state: crate::layout::WindowState,
     /// The "All settings (JSON)" editor.
     settings_json: Entity<crate::editor_input::JsonEditor>,
+    /// A tab waiting to move to another window (handled in `render`, which has
+    /// the window).
+    pending_window_move: Option<std::path::PathBuf>,
     /// Titles the user suppressed with "Don't Show Again".
     suppressed: crate::notifications::Suppressed,
     /// The shortcut dialog (Settings › Keymap).
@@ -861,6 +870,14 @@ impl Workbench {
         let initial_soft_wrap = initial_settings.editor.soft_wrap;
         editor.update(cx, |editor, cx| editor.set_soft_wrap_default(initial_soft_wrap, window, cx));
         terminal.update(cx, |terminal, cx| terminal.set_font_size(terminal_font_size, cx));
+        cx.subscribe(&editor, |this: &mut Self, _editor, event: &crate::editor::OpenInNewWindow, cx| {
+            // Deferred: this subscription cannot borrow the window (it is also
+            // borrowed by the workbench's construction), so the path waits for
+            // the next frame and `open_in_new_window` runs there.
+            this.pending_window_move = Some(event.0.clone());
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&vcs, |this: &mut Self, _vcs, event: &crate::vcs::OpenDiffRequest, cx| {
             this.show_bottom = true;
             this.bottom = BottomTab::Diff;
@@ -951,6 +968,7 @@ impl Workbench {
             find_options: FindOptions::default(),
             settings_open: false,
             suppressed: Default::default(),
+            pending_window_move: None,
             settings_json: cx.new(|cx| crate::editor_input::JsonEditor::new(window, cx)),
             window_name: "main".to_owned(),
             bridge: config.bridge.clone(),
@@ -996,6 +1014,7 @@ impl Workbench {
         })
         .detach();
 
+        this.subscribe_window_inbox(window, cx);
         if let Some(path) = config.initial_project.clone() {
             this.open_project(path, window, cx);
         }
@@ -1319,6 +1338,61 @@ impl Workbench {
         .detach();
         let _ = host;
         cx.notify();
+    }
+
+    /// Opens `path` in another window, or in a new one when this is the only
+    /// window: the window-group behaviour of dragging a tab out, without moving
+    /// editor entities across windows.
+    pub fn open_in_new_window(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = {
+            let inboxes = WINDOW_INBOXES.lock().ok();
+            inboxes.as_ref().and_then(|inboxes| inboxes.last().cloned())
+        };
+        if let Some(target) = target
+            && target.send(path.clone()).is_ok()
+        {
+            return;
+        }
+        self.open_new_window(window, cx);
+        // The new window registers its inbox during construction; hand it the
+        // file now that it exists.
+        let target = {
+            let inboxes = WINDOW_INBOXES.lock().ok();
+            inboxes.as_ref().and_then(|inboxes| inboxes.last().cloned())
+        };
+        if let Some(target) = target {
+            let _ = target.send(path);
+        }
+    }
+
+    /// Registers this window's inbox and drains it alongside the launch paths.
+    fn subscribe_window_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Ok(mut inboxes) = WINDOW_INBOXES.lock() {
+            inboxes.push(tx);
+        }
+        let (async_tx, mut async_rx) = futures::channel::mpsc::unbounded::<std::path::PathBuf>();
+        std::thread::Builder::new()
+            .name("openidea-window-inbox".into())
+            .spawn(move || {
+                while let Ok(path) = rx.recv() {
+                    if async_tx.unbounded_send(path).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn window inbox");
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(path) = async_rx.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| this.open_launch(path, window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Opens a second window over the same backend: its own project slot, its
@@ -3188,6 +3262,9 @@ impl Render for Workbench {
         if changed {
             self.window_state = next;
             self.window_state.save(&self.config_dir);
+        }
+        if let Some(path) = self.pending_window_move.take() {
+            self.open_in_new_window(path, window, cx);
         }
         if self.goto_submit {
             self.goto_submit = false;

@@ -164,6 +164,12 @@ fn position(text: &str, offset: usize) -> (u32, u32) {
     (line, col)
 }
 
+/// Emitted when a tab asks to move to another window (Cmd/Ctrl-click on the tab);
+/// the workbench owns window creation, not the editor.
+pub struct OpenInNewWindow(pub PathBuf);
+
+impl EventEmitter<OpenInNewWindow> for EditorArea {}
+
 pub struct EditorArea {
     project: Option<Arc<Project>>,
     tabs: Vec<Tab>,
@@ -746,6 +752,12 @@ impl EditorArea {
                 this.active = Some(index);
                 this.close_active(window, cx);
             });
+            let path = tab.path.clone();
+            let move_out = cx.listener(move |_: &mut Self, event: &MouseDownEvent, _window, cx| {
+                if event.modifiers.secondary(cx) {
+                    cx.emit(OpenInNewWindow(path.clone()));
+                }
+            });
             let (errors, warnings) = tab.errors(cx);
             strip = strip.child(
                 div()
@@ -761,6 +773,7 @@ impl EditorArea {
                     .when(active, |this| this.bg(theme.tab_active))
                     .hover(move |this| this.bg(theme.tab_active))
                     .on_click(select)
+                    .on_mouse_down(MouseButton::Left, move_out)
                     .child(Icon::new(IconName::FileCode).xsmall().text_color(if active {
                         theme.primary
                     } else {
