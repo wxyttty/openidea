@@ -62,6 +62,9 @@ pub struct WorkbenchConfig {
     /// Paths a later launch forwarded (single instance); the workbench opens
     /// them in this window as they arrive.
     pub launches: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// The shared backend event bridge; a window opened later subscribes through
+    /// it so both windows see the events of their own project.
+    pub bridge: crate::events::EventBridge,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,9 @@ enum MenuKind {
     Debug,
     Help,
 }
+
+/// Counter for the window names of additional windows (`window-1`, …).
+static NEXT_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 const MENU_KINDS: [MenuKind; 9] = [
     MenuKind::File,
@@ -171,6 +177,7 @@ enum Cmd {
     ShowStructure,
     ShowSsh,
     ShowDeploy,
+    NewWindow,
     Quit,
 }
 
@@ -183,6 +190,7 @@ struct MenuEntry {
 const FILE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Open Project…", shortcut: Some("Ctrl+O"), cmd: Cmd::OpenProject },
     MenuEntry { label: "Open Recent Project…", shortcut: None, cmd: Cmd::RecentProjects },
+    MenuEntry { label: "New Window", shortcut: None, cmd: Cmd::NewWindow },
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Refresh Project", shortcut: None, cmd: Cmd::RefreshProject },
     MenuEntry { label: "Save", shortcut: Some("Ctrl+S"), cmd: Cmd::Save },
@@ -359,6 +367,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Go to File…", shortcut: Some("Ctrl+P"), cmd: Cmd::QuickOpen },
     MenuEntry { label: "Open Project…", shortcut: Some("Ctrl+O"), cmd: Cmd::OpenProject },
     MenuEntry { label: "Open Recent Project…", shortcut: None, cmd: Cmd::RecentProjects },
+    MenuEntry { label: "New Window", shortcut: None, cmd: Cmd::NewWindow },
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
@@ -631,6 +640,10 @@ pub struct Workbench {
     settings_open: bool,
     /// The last window geometry written to `ui.json`, so a frame that did not
     /// move or resize the window does not touch the disk.
+    /// The backend's project slot for this window (`main` for the first).
+    window_name: String,
+    /// The shared event bridge, so a new window can subscribe.
+    bridge: crate::events::EventBridge,
     window_state: crate::layout::WindowState,
     /// The shortcut dialog (Settings › Keymap).
     keymap_dialog: Entity<crate::keymap::KeymapDialog>,
@@ -898,6 +911,8 @@ impl Workbench {
             find_searched: false,
             find_options: FindOptions::default(),
             settings_open: false,
+            window_name: "main".to_owned(),
+            bridge: config.bridge.clone(),
             window_state,
             keymap_dialog: cx.new(|cx| crate::keymap::KeymapDialog::new(window, cx)),
             keymap_accepted: None,
@@ -1171,6 +1186,81 @@ impl Workbench {
         &self.notifications
     }
 
+    /// Opens a second window over the same backend: its own project slot, its
+    /// own editor state and its own event subscription, like a second IDEA
+    /// window. The window keeps the geometry and theme of this one.
+    fn open_new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let host = self.host.clone();
+        let bridge = self.bridge.clone();
+        // `WorkbenchConfig` holds a receiver (single instance) so it cannot be
+        // cloned; the fields are cheap to rebuild.
+        let (config_dir, data_dir, theme) = (self.config_dir.clone(), self.data_dir.clone(), self.theme);
+        let bridge = self.bridge.clone();
+        let window_name = format!("window-{}", NEXT_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let bounds = window.bounds();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            focus: true,
+            show: true,
+            ..Default::default()
+        };
+        match gpui_kit::open_window(options, cx, {
+            let host = host.clone();
+            let window_name = window_name.clone();
+            let config_dir = config_dir.clone();
+            let data_dir = data_dir.clone();
+            let bridge = bridge.clone();
+            move |window, cx| {
+                let receiver = bridge.subscribe();
+                let config = WorkbenchConfig {
+                    config_dir: config_dir.clone(),
+                    data_dir: data_dir.clone(),
+                    initial_project: None,
+                    initial_file: None,
+                    theme,
+                    launches: None,
+                    bridge: bridge.clone(),
+                };
+                cx.new(|cx| {
+                    let mut workbench = Workbench::new(host.clone(), config, receiver, window, cx);
+                    // The backend keys projects by window name; give this one
+                    // its own slot so opening a project here leaves the first
+                    // window's project alone.
+                    workbench.window_name = window_name.clone();
+                    workbench
+                })
+            }
+        }) {
+            Ok(_) => {}
+            Err(err) => {
+                self.status = format!("Cannot open a window: {err}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Creates an empty project folder and opens it: a folder picker gives the
+    /// parent, the name is typed in the palette-style dialog.
+    fn new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = rfd::FileDialog::new().set_title("Choose the parent folder").pick_folder() else {
+            return;
+        };
+        // A sensible default name that is not already taken.
+        let mut name = "untitled".to_owned();
+        let mut attempt = 2;
+        while parent.join(&name).exists() {
+            name = format!("untitled{attempt}");
+            attempt += 1;
+        }
+        let path = parent.join(&name);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            self.status = format!("Cannot create {}: {err}", path.display()).into();
+            cx.notify();
+            return;
+        }
+        self.open_project(path, window, cx);
+    }
+
     /// Opens what a launch argument names: a directory opens as the project, a
     /// file opens (its project first). A second instance forwards its arguments
     /// here, and the first launch uses the same rules.
@@ -1279,7 +1369,7 @@ impl Workbench {
     }
 
     fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        match self.host.open_project("main", &path) {
+        match self.host.open_project(&self.window_name, &path) {
             Ok(project) => {
                 let name = project
                     .root
@@ -1634,6 +1724,7 @@ impl Workbench {
                 self.deploy.update(cx, |panel, cx| panel.reload(cx));
                 cx.notify();
             }
+            Cmd::NewWindow => self.open_new_window(window, cx),
             Cmd::Quit => cx.quit(),
         }
         // Most commands pick a tool window by assigning `bottom`; point the dock
@@ -1756,7 +1847,7 @@ impl Workbench {
         });
         let workspace_root = self.project.as_ref().map(|project| project.root.clone());
         let invocation =
-            ide_plugin::Invocation { client: Some("main".to_owned()), workspace_root, buffer_text };
+            ide_plugin::Invocation { client: Some(self.window_name.clone()), workspace_root, buffer_text };
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<Result<Option<String>, String>>();
         let status_command = command_id.clone();
         std::thread::Builder::new()
@@ -2627,7 +2718,32 @@ impl Workbench {
                     .text_color(theme.fg_secondary())
                     .child("The IDE you know, rebuilt in Rust — now on GPUI."),
             )
-            .child(Button::new("welcome-open-project").label("Open Project…").primary().on_click(open_click));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Button::new("welcome-open-project").label("Open Project…").primary().on_click(open_click))
+                    .child(
+                        div()
+                            .id("welcome-new-project")
+                            .h(px(28.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border_strong())
+                            .hover(move |this| this.bg(theme.list_hover))
+                            .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                                this.new_project(window, cx)
+                            }))
+                            .text_size(px(12.))
+                            .text_color(theme.foreground)
+                            .child("New Project…"),
+                    ),
+            );
         if !recent.is_empty() {
             column =
                 column.child(div().mt_2().text_size(px(11.)).text_color(theme.fg_muted()).child("RECENT PROJECTS"));
@@ -2636,6 +2752,14 @@ impl Workbench {
                 let click = cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
                     this.open_project(path.clone(), window, cx);
                 });
+                let remove_path = entry.path.0.clone();
+                let remove = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                    let _ = this.recent.remove(&remove_path);
+                    cx.notify();
+                });
+                let hover = theme.list_hover;
+                let remove_hover = theme.danger.opacity(0.2);
+                let fg_muted = theme.fg_muted();
                 column = column.child(
                     div()
                         .id(ElementId::Name(format!("recent-{}", entry.name).into()))
@@ -2646,11 +2770,11 @@ impl Workbench {
                         .items_center()
                         .gap_3()
                         .rounded(px(5.))
+                        .hover(move |this| this.bg(hover))
                         .cursor_pointer()
-                        .hover(move |this| this.bg(theme.list_hover))
                         .on_click(click)
                         .child(Icon::new(IconName::Folder).small().text_color(theme.fg_muted()))
-                        .child(div().text_size(px(12.5)).text_color(theme.foreground).child(entry.name))
+                        .child(div().text_size(px(12.5)).text_color(theme.foreground).child(entry.name.clone()))
                         .child(
                             div()
                                 .flex_1()
@@ -2659,6 +2783,23 @@ impl Workbench {
                                 .text_size(px(10.5))
                                 .text_color(theme.fg_muted())
                                 .child(entry.path.0.display().to_string()),
+                        )
+                        .when_some(entry.branch.clone(), |this, branch| {
+                            this.child(
+                                div().text_size(px(9.5)).text_color(theme.info).child(format!("⑂ {branch}")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(ElementId::Name(format!("recent-remove-{}", entry.name).into()))
+                                .size(px(18.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .hover(move |this| this.bg(remove_hover))
+                                .on_click(remove)
+                                .child(Icon::new(IconName::X).xsmall().text_color(fg_muted)),
                         ),
                 );
             }

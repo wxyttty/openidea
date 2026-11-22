@@ -23,6 +23,7 @@ fn open_workbench(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workbench
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
     let stream = ide_ui::events::stream();
+    let bridge = stream.bridge.clone();
     let sink_bridge = stream.bridge.clone();
     let sink_for: ide_host::SinkFactory =
         Box::new(move |_window| Arc::new(sink_bridge.clone()) as ide_core::SharedSink);
@@ -66,6 +67,7 @@ fn open_workbench(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workbench
                             initial_file: None,
                             theme: ThemeChoice::IslandsDark,
                             launches: None,
+                            bridge: bridge.clone(),
                         },
                         receiver,
                         window,

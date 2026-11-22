@@ -242,6 +242,7 @@ fn open_workbench(cx: &mut TestAppContext, settings_toml: Option<&str>) -> Workb
                             initial_file: None,
                             theme: ThemeChoice::IslandsDark,
                             launches: None,
+                            bridge: bridge.clone(),
                         },
                         receiver,
                         window,

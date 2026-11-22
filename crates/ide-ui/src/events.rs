@@ -11,15 +11,25 @@ use ide_core::{EventSink, IdeEvent, SharedSink};
 use std::sync::Arc;
 
 /// Cloneable sink handed to `ide-host` for every window.
-#[derive(Clone)]
+///
+/// Every window of the process shares one backend, so the bridge fans each event
+/// out to all open windows: each has its own receiver (a project opened in a
+/// second window must see its own `DocPatched`, and the first window must keep
+/// seeing its own).
+#[derive(Clone, Default)]
 pub struct EventBridge {
-    tx: UnboundedSender<IdeEvent>,
+    subscribers: Arc<std::sync::Mutex<Vec<UnboundedSender<IdeEvent>>>>,
 }
 
 impl EventSink for EventBridge {
     fn emit(&self, event: IdeEvent) {
-        // Dropping the receiver (window closed) is not an error.
-        let _ = self.tx.unbounded_send(event);
+        let mut subscribers = match self.subscribers.lock() {
+            Ok(subscribers) => subscribers,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // A closed window's receiver makes the send fail; drop that subscriber
+        // rather than keeping a dead channel forever.
+        subscribers.retain(|tx| tx.unbounded_send(event.clone()).is_ok());
     }
 }
 
@@ -27,6 +37,15 @@ impl EventBridge {
     /// A `SharedSink` for code paths that ask for one directly.
     pub fn shared(&self) -> SharedSink {
         Arc::new(self.clone())
+    }
+
+    /// A receiver for one window's event loop.
+    pub fn subscribe(&self) -> UnboundedReceiver<IdeEvent> {
+        let (tx, receiver) = unbounded();
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.push(tx);
+        }
+        receiver
     }
 }
 
@@ -37,6 +56,7 @@ pub struct EventStream {
 }
 
 pub fn stream() -> EventStream {
-    let (tx, receiver) = unbounded();
-    EventStream { bridge: EventBridge { tx }, receiver }
+    let bridge = EventBridge::default();
+    let receiver = bridge.subscribe();
+    EventStream { bridge, receiver }
 }

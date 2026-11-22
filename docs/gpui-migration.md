@@ -501,7 +501,7 @@ Status of the Tauri shell's features in the native app.
 
 | Area | Tauri (current) | GPUI (now) | Phase |
 | --- | --- | --- | --- |
-| Project open / recent / welcome | yes | open via CLI/picker/drop + Recent Projects modal; no welcome window | P3 (welcome) |
+| Project open / recent / welcome | yes | open via CLI/picker/drop, New Project (creates the folder), Recent Projects modal, and a welcome screen with recent projects (branch shown, removable) when no project is open | — |
 | Project tree (lazy, gitignore, expand) | yes | yes | — |
 | Editor load/save, encoding, line endings | yes | yes | — |
 | Syntax highlighting | CodeMirror/Lezer | tree-sitter (five grammars get queries from `ide-language`) | — |
@@ -532,7 +532,7 @@ Status of the Tauri shell's features in the native app.
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder; commands listed in the command palette and run through `PluginHost::run_command`; `insertText`/`replaceSelection` reach the editor at the caret; plugin notifications land in the Notifications log | P2 (marketplace) |
-| Multi-window / window groups | yes | no | P3 |
+| Multi-window / window groups | yes | multi-window: File › New Window opens a second workbench with its own project slot (`window-N`), editor state and event subscription; the bridge fans backend events out to every window and drops closed ones. Window groups (drag a tab between windows) not implemented | P3 (window groups) |
 | Updater, single instance, window-state | yes | single instance (a second launch forwards its project/file to the running window over a socket and exits) and window state (geometry restored from `ui.json`, saved on move/resize); updater still pending | P3 (updater) |
 | Playwright e2e | yes | no | P2 (`gpui_kit::test`) |
 

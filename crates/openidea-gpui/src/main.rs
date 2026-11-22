@@ -89,7 +89,8 @@ fn main() {
 
     let stream = events::stream();
     let bridge = stream.bridge.clone();
-    let sink_for: SinkFactory = Box::new(move |_window| Arc::new(bridge.clone()) as ide_core::SharedSink);
+    let sink_bridge = bridge.clone();
+    let sink_for: SinkFactory = Box::new(move |_window| Arc::new(sink_bridge.clone()) as ide_core::SharedSink);
     let host = Arc::new(Host::new(HostConfig {
         config_dir: config_dir.clone(),
         data_dir: data_dir.clone(),
@@ -109,6 +110,7 @@ fn main() {
 
     let theme = ide_ui::theme::load_choice(&config_dir).unwrap_or(ide_ui::theme::ThemeChoice::IslandsDark);
     let launches = std::sync::Arc::new(std::sync::Mutex::new(instance_lock.take_incoming()));
+    let bridge_for_windows = bridge.clone();
     let config = WorkbenchConfig {
         config_dir,
         data_dir,
@@ -116,6 +118,7 @@ fn main() {
         initial_file,
         theme,
         launches: launches.lock().ok().and_then(|mut slot| slot.take()),
+        bridge: bridge_for_windows,
     };
     let receiver = stream.receiver;
 
@@ -148,7 +151,8 @@ fn main() {
 
         let result = gpui_kit::open_window(options, cx, {
             let host = host.clone();
-            let config = WorkbenchConfig {
+            let bridge_for_windows = bridge.clone();
+    let config = WorkbenchConfig {
                 config_dir: config.config_dir.clone(),
                 data_dir: config.data_dir.clone(),
                 initial_project: config.initial_project.clone(),
@@ -157,6 +161,7 @@ fn main() {
                 // The forwarded-argument receiver is moved into the workbench
                 // (a `Receiver` cannot be cloned).
                 launches: launches.lock().ok().and_then(|mut slot| slot.take()),
+                bridge: config.bridge.clone(),
             };
             move |window, cx| cx.new(|cx| Workbench::new(host, config, receiver, window, cx))
         });
