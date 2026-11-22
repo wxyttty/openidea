@@ -101,6 +101,8 @@ fn main() {
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     application.run(move |cx| {
         gpui_kit::init(cx);
+        // Highlights queries for the grammars gpui-component ships without one.
+        ide_ui::highlights::install();
         theme::install_choice(cx, config.theme);
         ide_ui::actions::install(cx);
 

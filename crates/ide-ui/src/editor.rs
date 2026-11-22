@@ -224,6 +224,23 @@ impl EditorArea {
         self.notice.as_ref()
     }
 
+    /// The active tab's document, 0-based caret and selected byte range, as
+    /// code actions and rename need them; `None` without an open tab.
+    ///
+    /// With nothing selected the range is the caret itself, which is what every
+    /// LSP request takes.
+    pub fn active_position(&self, cx: &App) -> Option<(DocId, u32, u32, std::ops::Range<usize>)> {
+        let tab = self.tabs.get(self.active?)?;
+        let state = tab.state.read(cx);
+        let position = state.cursor_position();
+        Some((tab.doc, position.line, position.character, state.selected_range()))
+    }
+
+    /// The active tab's text, for a code-action request's range conversion.
+    pub fn active_text(&self) -> Option<String> {
+        Some(self.tabs.get(self.active?)?.text.clone())
+    }
+
     /// Open `path`, reusing the tab that already holds it.
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.open_file_at(path, 0, 0, window, cx);

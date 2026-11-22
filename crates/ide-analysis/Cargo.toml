@@ -14,4 +14,4 @@ tree-sitter.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 # Pinned: 0.40.2+ moves to tree-sitter 0.26, the workspace is on 0.25.
-ast-grep-core = "=0.40.1"
+ast-grep-core = "=0.40.3"

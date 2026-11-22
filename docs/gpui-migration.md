@@ -320,6 +320,17 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   `terminal.fontSize` to `<config>/settings.toml` through `SettingsStore`),
   the current theme with a shortcut to the Appearance dialog, and read-only
   tab size / indent / shell values from the effective settings.
+- **Context actions** (`Alt+Enter`, Navigate menu): asks every language server for
+  `textDocument/codeAction` at the caret and lists quick fixes, refactorings and
+  source actions in a popup under the caret (`crates/ide-ui/src/intentions.rs`).
+  The preferred action sorts first and starts selected; entries keep their LSP
+  kind as a section heading (`quickfix` → "Quick Fixes", `refactor.extract` →
+  "Refactorings"), a server's `disabled` reason shows instead of hiding the
+  entry, and typing filters the list (Up/Down walk it, Enter applies, Esc
+  closes). Applying goes through `ide-host`'s `lsp_apply_code_action`, so the
+  edit lands in the shared document and the editor repaints through
+  `DocPatched`. Rename, Locate Duplicates and Search Structurally have backends
+  (`ide-lsp`, `ide-analysis`) but no UI yet.
 - Command palette (`Ctrl+Shift+P`): filtered list, keyboard navigation,
   executes workbench commands; focus returns to the previous view on close.
 - Menu bar (File / View / Navigate / Help) with working actions, a native
@@ -381,34 +392,25 @@ Checked against crates.io at the time of writing:
   If the fork ever gains a component ecosystem that matters more, switching is
   a foundation-level swap, not a widget-level one.
 
-### Tree-sitter version conflict (important)
+### Tree-sitter highlighting (landed)
 
-The repository pins `tree-sitter = 0.25` (`ide-language`, `ide-syntax`,
-`ide-analysis`, 36 bundled grammars, `ast-grep-core = 0.40.1`).
-`gpui-component` 0.8.1's tree-sitter highlighter requires `tree-sitter 0.26`,
-and Cargo refuses two versions of a crate that declares `links = "tree-sitter"`
-in one dependency graph.
+The workspace is on `tree-sitter 0.26.13` (`ide-language`, `ide-syntax`,
+`ide-analysis`, 36 bundled grammars, `ast-grep-core = 0.40.3`), matching
+`gpui-component` 0.10's highlighter, so the editor now runs on the
+**tree-sitter** backend instead of syntect. `cc` is pinned to 1.2.67 because
+`tree-sitter-sequel` (pulled in by `tree-sitter-languages`) requires `~1.2.1`.
 
-For now the native editor uses `gpui-component`'s **syntect** highlighter
-(`syntect` feature), which has no such conflict and already highlights the 40+
-languages the app opens. The structural features that need the repo's own
-tree-sitter (outline, folding, LSP fallbacks, structural search) keep using
-`ide-syntax`/`ide-language` on 0.25.
+The 0.26 upgrade needed three small API updates in `ide-language`:
+`Node::child` takes `u32`, and `ParseOptions::progress_callback` returns
+`ControlFlow` (`Break` cancels).
 
-**Phase 1 prerequisite to get tree-sitter highlighting in the editor:** bump
-the workspace to `tree-sitter 0.26`, update the 36 grammar crates to
-`tree-sitter-language 0.1`-compatible releases that build against 0.26,
-bump `ast-grep-core` to 0.40.2+, run `ide-language`/`ide-syntax`/
-`ide-analysis` tests, then enable `gpui-kit`'s `tree-sitter` and
-`tree-sitter-languages` features and call `set_highlighter` with the same
-language names the editor already passes.
-
-Re-checked on `gpui-component` 0.10: C#, Swift, GraphQL, Proto and CMake still
-carry an **empty highlights query** (`(tree_sitter_x::LANGUAGE, "", "", "")`),
-so switching the editor from syntect to tree-sitter would lose highlighting for
-five languages the current syntect backend already covers. That regression is
-the blocker, not the dependency; the workspace tree-sitter bump alone does not
-fix it.
+Five grammars (`csharp`, `swift`, `graphql`, `proto`, `cmake`) ship an **empty
+highlights query** upstream. `crates/ide-ui/src/highlights.rs` registers the
+workbench's own queries (`crates/ide-language/queries/<lang>/highlights.scm`)
+with `LanguageRegistry::register` at start-up, so those languages keep their
+highlighting; `crates/ide-ui/tests/highlights_ui.rs` parses real source and
+requires spans, which is what catches a query that fails to compile (a broken
+query silently falls back to plain text).
 
 ## Architecture
 
@@ -455,7 +457,7 @@ Status of the Tauri shell's features in the native app.
 | Project open / recent / welcome | yes | open via CLI/picker/drop + Recent Projects modal; no welcome window | P3 (welcome) |
 | Project tree (lazy, gitignore, expand) | yes | yes | — |
 | Editor load/save, encoding, line endings | yes | yes | — |
-| Syntax highlighting | CodeMirror/Lezer | syntect | tree-sitter in P1 |
+| Syntax highlighting | CodeMirror/Lezer | tree-sitter (five grammars get queries from `ide-language`) | — |
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
 | Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc, `Aa` case and `.*` regex toggles | — |
@@ -466,7 +468,7 @@ Status of the Tauri shell's features in the native app.
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
-| Code insight: inspections, refactors, structure | yes | no | P2 |
+| Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions (quick fixes, refactorings, source actions) from every server's `textDocument/codeAction`, with kind sections, preferred preselection, disabled reasons and a filter; rename/locate-duplicates/structural-search backends stay unwired | P2 (rename UI, duplicates UI, structure view) |
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
@@ -576,8 +578,9 @@ to the native binary. Until then both apps build from the same workspace.
 
 Nothing in this change modifies `src-tauri` or `src`. The only workspace edits
 are new members (`crates/ide-ui`, `crates/openidea-gpui`), a `gpui-kit`
-dependency and `rfd`. The tree-sitter conflict is avoided by using syntect, so
-`cargo build -p openidea` and `pnpm tauri dev` keep working.
+dependency and `rfd`. The tree-sitter bump to 0.26 is shared with the backend
+crates and was verified with `cargo check -p openidea`, so `cargo build -p
+openidea` and `pnpm tauri dev` keep working.
 
 Rule for the transition: **new UI features go native**; the Tauri shell only
 receives critical bug fixes until Phase 4.

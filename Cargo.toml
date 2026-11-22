@@ -70,7 +70,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # native UI (Tauri replacement)
-gpui-kit = { version = "0.10.0", default-features = false, features = ["component", "assets", "syntect"] }
+gpui-kit = { version = "0.10.0", default-features = false, features = ["component", "assets", "tree-sitter", "tree-sitter-languages"] }
 rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland", "tokio"] }
 
 # text & fs
@@ -93,7 +93,7 @@ grep-regex = "0.1"
 grep-matcher = "0.1"
 nucleo-matcher = "0.3"
 redb = "4"
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 
 # protocols & integrations
 jupyter-zmq-client = { version = "=2.0.0", default-features = false, features = ["tokio-runtime", "ring"] }

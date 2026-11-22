@@ -67,7 +67,7 @@ impl KindTable {
 
     /// [`bracket_pair`] by kind id.
     fn bracket_close_row(&self, node: &Node) -> Option<usize> {
-        let count = node.child_count();
+        let count = node.child_count() as u32;
         if count < 2 {
             return None;
         }
@@ -190,7 +190,7 @@ pub(crate) fn is_comment(kind: &str) -> bool {
 
 /// Row of the closing token when `node` is delimited by a matching bracket pair.
 pub(crate) fn bracket_pair<'t>(node: &Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
-    let count = node.child_count();
+    let count = node.child_count() as u32;
     if count < 2 {
         return None;
     }

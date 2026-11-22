@@ -15,6 +15,7 @@ use crate::diff::DiffPanel;
 use crate::dock::ToolPanel;
 use crate::editor::{EditorArea, FindOptions, TabInfo};
 use crate::http::HttpPanel;
+use crate::intentions::IntentionSection;
 use crate::layout::Layout;
 use crate::notebook::NotebookPanel;
 use crate::notifications::{BalloonDisplay, NotificationLog, NotificationPrefs};
@@ -32,7 +33,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{DockArea, DockLayout, DockPlacement, DockSkin};
 use gpui_kit::component::input::{Input, InputContent, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, dock::PanelStyle};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_core::IdeEvent;
@@ -134,6 +135,7 @@ enum Cmd {
     About,
     ShowAgents,
     ShowNotifications,
+    Intentions,
     Quit,
 }
 
@@ -324,6 +326,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
     MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Show Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
+    MenuEntry { label: "Show Context Actions", shortcut: Some("Alt+Enter"), cmd: Cmd::Intentions },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -503,6 +506,7 @@ pub struct Workbench {
     notifications: Entity<NotificationLog>,
     /// The bottom tool area: a dock, so panels move between groups and the
     /// layout persists.
+    intentions: Entity<IntentionSection>,
     dock: Option<Entity<DockArea>>,
     dock_skin: Option<std::rc::Rc<DockSkin>>,
     /// Panel id of each `BottomTab` in the dock, in `BottomTab::index` order.
@@ -631,6 +635,11 @@ impl Workbench {
         let notebook = cx.new(|cx| NotebookPanel::new(host.clone(), cx));
         let agents = cx.new(|cx| AgentPanel::new(host.clone(), window, cx));
         let notifications = cx.new(|_| NotificationLog::new());
+        let intentions = {
+            let editor = editor.clone();
+            let host = host.clone();
+            cx.new(|cx| IntentionSection::new(window, cx, editor, host))
+        };
         let diff = cx.new(|cx| DiffPanel::new(cx));
 
         // The bottom tool area as a dock: panels become tabs of a bottom dock,
@@ -714,6 +723,7 @@ impl Workbench {
             notebook,
             agents,
             notifications,
+            intentions,
             dock: Some(dock_entity),
             dock_skin: Some(dock_skin),
             dock_panels,
@@ -946,6 +956,24 @@ impl Workbench {
         dock.update(cx, |dock, cx| dock.select_panel(panel, window, cx));
     }
 
+    /// `Alt+Enter`: asks the language servers for code actions at the caret.
+    fn show_intentions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((doc, line, col, _range)) = self.editor.read(cx).active_position(cx) else {
+            self.set_status("Open a file first", cx);
+            return;
+        };
+        let range = ide_core::Range {
+            start: ide_core::Pos { line, col },
+            end: ide_core::Pos { line, col },
+        };
+        let focus = self.intentions.read(cx).popup_focus(cx);
+        window.focus(&focus, cx);
+        let host = self.host.clone();
+        let pos = ide_core::Pos { line, col };
+        self.intentions.update(cx, |section, cx| section.request(host, doc, pos, range, cx));
+        cx.notify();
+    }
+
     /// The notification history (the Notifications tool window's state).
     pub fn notifications(&self) -> &Entity<NotificationLog> {
         &self.notifications
@@ -954,6 +982,12 @@ impl Workbench {
     /// The bottom tool dock (all tool windows as dock panels).
     pub fn dock(&self) -> Option<&Entity<DockArea>> {
         self.dock.as_ref()
+    }
+
+    /// The dock's skin: its settings (panel style, button visibility) change
+    /// through this handle.
+    pub fn dock_skin(&self) -> Option<&std::rc::Rc<DockSkin>> {
+        self.dock_skin.as_ref()
     }
 
     /// Whether the Problems tool window is the one selected.
@@ -1289,6 +1323,7 @@ impl Workbench {
                 cx.notify();
             }
             Cmd::ShowNotifications => self.show_notifications(cx),
+            Cmd::Intentions => self.show_intentions(window, cx),
             Cmd::Quit => cx.quit(),
         }
         // Most commands pick a tool window by assigning `bottom`; point the dock
@@ -1660,6 +1695,23 @@ impl Workbench {
             PaletteMode::Commands => self.filtered_palette().len(),
             PaletteMode::Files => self.quick.len(),
         }
+    }
+
+    /// Keys that the intentions popup owns while it is open: Up/Down walk the
+    /// list, Enter applies the selected action, Esc closes it.
+    fn intentions_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.intentions.read(cx).open {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        let consumed = self.intentions.update(cx, |section, cx| section.on_key(key, cx));
+        if consumed {
+            cx.stop_propagation();
+            if !self.intentions.read(cx).open {
+                self.editor.update(cx, |editor, cx| editor.focus_current(window, cx));
+            }
+        }
+        consumed
     }
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3412,7 +3464,26 @@ impl Render for Workbench {
                     .into_any_element(),
             );
         }
-        // Dock preview: while a card is dragged near an edge, shade the strip
+        // Context actions: a popup near the caret, above the editor.
+        if self.intentions.read(cx).open {
+            // Under the editor's title area, near the caret's line: the editor
+            // does not expose its caret's window-relative position, so the popup
+            // sits where a context menu reads naturally (top-left of the text).
+            let center_width = window.bounds().size.width.as_f32();
+            let origin = crate::intentions::popup_origin(
+                gpui_kit::point(px(if show_project { left_width + 60. } else { 60. }), px(120.)),
+                gpui_kit::size(px(center_width), window.bounds().size.height),
+            );
+            overlays.push(
+                div()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .child(self.intentions.clone())
+                    .into_any_element(),
+            );
+        }
+        // Dock preview: while a card is dragged near a stripe, shade the strip
         // it would snap into.
         if let Some(preview) = self.float_drag.and_then(|drag| drag.preview) {
             let bounds = window.bounds();
@@ -3805,6 +3876,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &Settings, window, cx| this.run(Cmd::Settings, window, cx)))
             .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.run(Cmd::GoToLine, window, cx)))
             .on_action(cx.listener(|this, _: &FindInEditor, window, cx| this.run(Cmd::FindInEditor, window, cx)))
+            .on_action(cx.listener(|this, _: &Intentions, window, cx| this.run(Cmd::Intentions, window, cx)))
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
                 if this.find_open {
                     this.find_open = false;
@@ -3952,6 +4024,9 @@ impl Render for Workbench {
                     }),
             )
             .child(status_bar)
+            .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, window, cx| {
+                this.intentions_key(event, window, cx);
+            }))
             .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, _window, cx| {
                 if let Some(mut drag) = this.float_drag {
                     let width = _window.bounds().size.width.as_f32();

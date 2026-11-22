@@ -329,7 +329,14 @@ fn parse_cancellable(
         }
         let bytes = text.as_bytes();
         let mut read = |i: usize, _: tree_sitter::Point| bytes.get(i..).unwrap_or_default();
-        let mut progress = |_: &tree_sitter::ParseState| cancelled();
+        // tree-sitter 0.26 wants a `ControlFlow`: `Break` cancels the parse.
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if cancelled() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        };
         let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
         let tree = parser.parse_with_options(&mut read, old, Some(options));
         if tree.is_none() {
