@@ -1,9 +1,14 @@
-//! Read-only native Notebook tool window.
+//! Native Notebook tool window: cells, editing, and kernel execution.
 //!
-//! Renders `ide-notebook`'s lossless snapshot: markdown and code cells with
-//! their sources, execution counts and the text of their outputs. Editing and
-//! kernel execution stay with the Tauri shell until the GPUI editor gains a
-//! multi-line cell widget.
+//! Renders `ide-notebook`'s lossless snapshot and drives its kernel:
+//! *Run Cell* / *Run All* send code through `ide-host`'s `notebook::execute`,
+//! which streams notebook outputs back as `NotebookOutputEvent`s while the
+//! kernel runs. *Interrupt* cancels the active request, *Restart* reloads the
+//! document with kernel restart. The interpreter is the project's Python SDK
+//! unless the header names one explicitly.
+//!
+//! Execution needs a trusted project and a Python with `ipykernel`; both
+//! failures surface in the header notice rather than a silent no-op.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +28,14 @@ struct CellEditor {
     state: Entity<EditorState>,
 }
 
+/// What the execution task sends back to the UI thread.
+enum ExecuteEvent {
+    /// One streamed notebook output; the panel re-reads the document.
+    Output(ide_host::notebook::NotebookOutputEvent),
+    /// The batch finished (`Ok` final snapshot, or the error text).
+    Done(Result<NotebookSnapshot, String>),
+}
+
 pub struct NotebookPanel {
     host: Arc<Host>,
     project: Option<Arc<ide_host::Project>>,
@@ -32,6 +45,14 @@ pub struct NotebookPanel {
     cell_editor: Option<CellEditor>,
     task: Option<Task<()>>,
     cell_task: Option<Task<()>>,
+    /// The streaming execution task.
+    exec_task: Option<Task<()>>,
+    /// Cells the kernel is running right now.
+    executing: std::collections::BTreeSet<String>,
+    /// The request of the running execution, for *Interrupt*.
+    request: Option<ide_core::RequestId>,
+    /// The interpreter the user named; `None` uses the project's Python SDK.
+    python: Option<SharedString>,
     focus_handle: FocusHandle,
 }
 
@@ -72,6 +93,10 @@ impl NotebookPanel {
             cell_editor: None,
             task: None,
             cell_task: None,
+            exec_task: None,
+            executing: std::collections::BTreeSet::new(),
+            request: None,
+            python: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -98,11 +123,14 @@ impl NotebookPanel {
         self.snapshot = None;
         self.notice = Some(format!("Loading {}…", path.display()).into());
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let root = project.root.clone();
-        std::thread::spawn(move || {
-            let notebooks = project.notebooks.clone();
-            let result = notebooks.open(&path).map_err(|err| err.to_string());
-            let _ = root;
+        // Through the host's notebook op: it blocks on the runtime's blocking
+        // pool instead of spawning a bare OS thread per open.
+        let host = self.host.clone();
+        let open_path = path.clone();
+        self.host.runtime.spawn(async move {
+            let result = ide_host::ops::notebook::open(&host, "main", open_path.to_string_lossy().into_owned())
+                .await
+                .map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -198,6 +226,213 @@ impl NotebookPanel {
         }
     }
 
+    /// The panel's notice (the last status or failure).
+    pub fn notice(&self) -> Option<&SharedString> {
+        self.notice.as_ref()
+    }
+
+    /// Whether a notebook is loaded.
+    pub fn is_open(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    /// The loaded notebook's cell ids, for tests and diagnostics.
+    pub fn cell_ids(&self) -> Vec<String> {
+        self.snapshot.as_ref().map(|snapshot| snapshot.cells.iter().map(|cell| cell.id.clone()).collect()).unwrap_or_default()
+    }
+
+    /// Drops the loaded notebook (as closing the tool window's file does).
+    pub fn close_document(&mut self, cx: &mut Context<Self>) {
+        self.path = None;
+        self.snapshot = None;
+        self.cell_editor = None;
+        self.executing.clear();
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// The cell ids the kernel is running.
+    pub fn executing(&self) -> Vec<String> {
+        self.executing.iter().cloned().collect()
+    }
+
+    /// The interpreter in use (`None` means the project's Python SDK).
+    pub fn python(&self) -> Option<SharedString> {
+        self.python.clone()
+    }
+
+    /// Names an interpreter, or clears it to go back to SDK detection.
+    pub fn set_python(&mut self, python: Option<String>, cx: &mut Context<Self>) {
+        self.python = python.filter(|path| !path.trim().is_empty()).map(Into::into);
+        cx.notify();
+    }
+
+    /// Runs `cells` (in order) and streams their outputs in.
+    ///
+    /// One execution is admitted at a time — the backend refuses a second run
+    /// while the kernel is busy — so `executing` also doubles as the guard the
+    /// buttons read to disable themselves.
+    pub fn execute_cells(&mut self, cells: Vec<String>, cx: &mut Context<Self>) {
+        if cells.is_empty() {
+            self.notice = Some("No code cells to run".into());
+            cx.notify();
+            return;
+        }
+        if !self.executing.is_empty() {
+            self.notice = Some("The kernel is busy; interrupt it first".into());
+            cx.notify();
+            return;
+        }
+        let Some(snapshot) = self.snapshot.clone() else {
+            self.notice = Some("Open a notebook first".into());
+            cx.notify();
+            return;
+        };
+        self.executing = cells.iter().cloned().collect();
+        self.notice = None;
+        let request = ide_core::RequestId::next();
+        self.request = Some(request);
+        let host = self.host.clone();
+        let python = self.python.as_ref().map(|path| path.to_string());
+        let id = snapshot.id.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExecuteEvent>();
+        self.host.runtime.spawn(async move {
+            let channel = ide_host::ops::Channel::new({
+                let tx = tx.clone();
+                move |event: ide_host::notebook::NotebookOutputEvent| {
+                    let _ = tx.unbounded_send(ExecuteEvent::Output(event));
+                }
+            });
+            let result = ide_host::ops::notebook::execute(&host, "main", id, cells, python, request, channel)
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(ExecuteEvent::Done(result));
+        });
+        self.exec_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    match event {
+                        ExecuteEvent::Output(output) => {
+                            // The event carries the version and the cells it
+                            // changed; re-reading the snapshot is an in-memory
+                            // call and keeps the document view authoritative.
+                            panel.refresh_snapshot(&output.id, cx);
+                        }
+                        ExecuteEvent::Done(result) => {
+                            panel.executing.clear();
+                            panel.request = None;
+                            match result {
+                                Ok(snapshot) => {
+                                    panel.snapshot = Some(snapshot);
+                                    panel.notice = None;
+                                }
+                                Err(err) => panel.notice = Some(err.into()),
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Runs every code cell of the notebook in order.
+    pub fn run_all(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            self.notice = Some("Open a notebook first".into());
+            cx.notify();
+            return;
+        };
+        let cells = snapshot
+            .cells
+            .iter()
+            .filter(|cell| cell.cell_type == "code" && !cell.source.trim().is_empty())
+            .map(|cell| cell.id.clone())
+            .collect::<Vec<_>>();
+        self.execute_cells(cells, cx);
+    }
+
+    /// Cancels the running execution (the kernel keeps its state).
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.request else { return };
+        self.host.cancel_request(request);
+        self.notice = Some("Interrupting…".into());
+        cx.notify();
+    }
+
+    /// Restarts the kernel: the document is reloaded with kernel restart.
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else { return };
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let id = snapshot.id.clone();
+        self.host.runtime.spawn(async move {
+            let result =
+                ide_host::ops::notebook::restart(&host, "main", id).await.map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        self.cell_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    match result {
+                        Ok(snapshot) => {
+                            panel.snapshot = Some(snapshot);
+                            panel.notice = Some("Kernel restarted".into());
+                            panel.executing.clear();
+                        }
+                        Err(err) => panel.notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Re-reads the document after a streamed output (in-memory, no I/O).
+    fn refresh_snapshot(&mut self, id: &str, cx: &mut Context<Self>) {
+        match ide_host::ops::notebook::get(&self.host, "main", id.to_owned()) {
+            Ok(snapshot) => self.snapshot = Some(snapshot),
+            Err(err) => self.notice = Some(format!("Notebook refresh failed: {err}").into()),
+        }
+        cx.notify();
+    }
+
+    /// Empties one cell's outputs (and its execution count), as IDEA's
+    /// *Clear Output* does.
+    pub fn clear_outputs(&mut self, cell: String, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else { return };
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let id = snapshot.id.clone();
+        let version = snapshot.version;
+        let save_id = id.clone();
+        self.host.runtime.spawn(async move {
+            let result = async {
+                let edit = NotebookEdit::SetOutputs { cell, outputs: Vec::new(), execution_count: None };
+                ide_host::ops::notebook::edit(&host, "main", id, version, edit)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                ide_host::ops::notebook::save(&host, "main", save_id).await.map_err(|err| err.to_string())
+            }
+            .await;
+            let _ = tx.unbounded_send(result);
+        });
+        self.cell_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    match result {
+                        Ok(snapshot) => panel.snapshot = Some(snapshot),
+                        Err(err) => panel.notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
     fn render_cells(&self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = &self.snapshot else {
             return div()
@@ -225,8 +460,18 @@ impl NotebookPanel {
                     this.open_cell_editor(&cell, window, cx);
                 }
             });
+            let running = self.executing.contains(&cell.id);
+            let run_id = cell.id.clone();
+            let run = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.execute_cells(vec![run_id.clone()], cx);
+            });
+            let clear_id = cell.id.clone();
+            let clear = cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                this.clear_outputs(clear_id.clone(), cx);
+            });
             let mut card = div()
                 .id(ElementId::Name(format!("notebook-cell-{}", cell.id).into()))
+                .test_support()
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, open)
                 .w_full()
@@ -236,7 +481,7 @@ impl NotebookPanel {
                 .p_2()
                 .rounded(px(4.))
                 .border_1()
-                .border_color(theme.border)
+                .border_color(if running { theme.accent } else { theme.border })
                 .bg(if code { theme.background } else { theme.muted })
                 .child(
                     div()
@@ -249,8 +494,52 @@ impl NotebookPanel {
                                 .text_color(if code { theme.accent } else { theme.info })
                                 .child(if code { format!("CODE {count}") } else { "MARKDOWN".to_owned() }),
                         )
+                        .when(running, |this| {
+                            this.child(
+                                div().text_size(px(9.5)).text_color(theme.warning).child("running…"),
+                            )
+                        })
                         .when(!cell.id.is_empty(), |this| {
                             this.child(div().text_size(px(9.)).text_color(theme.fg_muted()).child(cell.id.clone()))
+                        })
+                        .child(div().flex_1())
+                        .when(code, |this| {
+                            this.child(
+                                div()
+                                    .id(ElementId::Name(format!("notebook-run-{}", cell.id).into()))
+                                    .h(px(18.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .bg(theme.success.opacity(0.18))
+                                    .hover(move |this| this.bg(theme.success.opacity(0.3)))
+                                    .on_click(run)
+                                    .test_support()
+                                    .text_size(px(9.5))
+                                    .text_color(theme.success)
+                                    .child(Icon::new(IconName::Play).xsmall())
+                                    .child("Run"),
+                            )
+                        })
+                        .when(code && !cell.outputs.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .id(ElementId::Name(format!("notebook-clear-{}", cell.id).into()))
+                                    .h(px(18.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(move |this| this.bg(theme.list_hover))
+                                    .on_click(clear)
+                                    .text_size(px(9.5))
+                                    .text_color(theme.fg_secondary())
+                                    .child("Clear"),
+                            )
                         }),
                 )
                 .child(
@@ -307,11 +596,13 @@ impl Render for NotebookPanel {
         });
 
         div()
+            .id("notebook-panel")
             .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.background)
+            .test_support()
             .child(
                 div()
                     .h(px(28.))
@@ -333,6 +624,80 @@ impl Render for NotebookPanel {
                         )
                     })
                     .child(div().text_size(px(9.5)).text_color(theme.fg_muted()).child(counts))
+                    .when(self.snapshot.is_some(), |this| {
+                        let busy = !self.executing.is_empty();
+                        let success = theme.success;
+                        this.child(
+                            div()
+                                .id("notebook-run-all")
+                                .h(px(20.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .when(!busy, |this| {
+                                    this.bg(success.opacity(0.18))
+                                        .hover(move |this| this.bg(success.opacity(0.3)))
+                                        .on_click(
+                                            cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                                                this.run_all(cx)
+                                            }),
+                                        )
+                                })
+                                .test_support()
+                                .text_size(px(10.))
+                                .text_color(if busy { theme.fg_muted() } else { success })
+                                .child(Icon::new(IconName::Play).xsmall())
+                                .child("Run All"),
+                        )
+                    })
+                    .when(!self.executing.is_empty(), |this| {
+                        let danger = theme.danger;
+                        this.child(
+                            div()
+                                .id("notebook-interrupt")
+                                .h(px(20.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .bg(danger.opacity(0.18))
+                                .hover(move |this| this.bg(danger.opacity(0.3)))
+                                .on_click(
+                                    cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.interrupt(cx)),
+                                )
+                                .test_support()
+                                .text_size(px(10.))
+                                .text_color(danger)
+                                .child("Interrupt"),
+                        )
+                    })
+                    .when(self.snapshot.is_some(), |this| {
+                        let hover = hover;
+                        this.child(
+                            div()
+                                .id("notebook-restart")
+                                .h(px(20.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(theme.border)
+                                .hover(move |this| this.bg(hover))
+                                .on_click(
+                                    cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.restart(cx)),
+                                )
+                                .test_support()
+                                .text_size(px(10.))
+                                .text_color(theme.fg_secondary())
+                                .child("Restart"),
+                        )
+                    })
                     .child(
                         div()
                             .id("notebook-reload")
@@ -483,7 +848,7 @@ impl Render for NotebookPanel {
                     .border_color(theme.border)
                     .text_size(px(10.))
                     .text_color(theme.fg_muted())
-                    .child("Read-only viewer · kernel execution needs a Python env with ipykernel")
+                    .child("Python kernel")
                     .child(self.snapshot.as_ref().map_or(String::new(), |snapshot| {
                         format!("nbformat {}.{}", snapshot.nbformat, snapshot.nbformat_minor)
                     })),

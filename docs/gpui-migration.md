@@ -274,8 +274,16 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   a bottom tool window; opened from the active `.ipynb` tab. Clicking a cell
   opens a modal `EditorState`; Save applies `NotebookEdit::SetSource` and then
   `notebook_save` (so the `.ipynb` on disk changes), and a header Save writes
-  any dirty snapshot. Kernel execution still requires a Python env with
-  `ipykernel` (not installed here).
+  any dirty snapshot. Kernel execution is wired: *Run* per code cell, *Run All*
+  for the notebook's code cells in order, *Interrupt* (cancels the request), and
+  *Restart*; outputs stream in as `NotebookOutputEvent`s and the panel re-reads
+  the in-memory snapshot as each lands. *Clear Output* empties one cell through
+  `NotebookEdit::SetOutputs`. The interpreter is the project's Python SDK unless
+  `set_python` names one. Refusals (no notebook, kernel busy, blank interpreter)
+  land in the header notice before any request is sent. A live run needs a
+  Python with `ipykernel`; this machine has none, so the streaming path is
+  unverified at runtime here (the backend's admission, interrupt and drain have
+  their own tests in `ide-host`).
 - **Agents** (`Alt+9`, View menu, Bot in the tool stripe): provider list from
   `ops::agent::providers` (installed dot, PATH status), persisted tasks with
   their status, a streamed conversation (user/agent/thought/tool/plan/message/
@@ -515,7 +523,7 @@ Status of the Tauri shell's features in the native app.
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
 | Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings) | P2 (sound, Don't Show Again) |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
-| Notebook | yes | viewer + cell editing/save (cells, outputs, nbformat); Alt+8 | P2 (kernel execution) |
+| Notebook | yes | viewer, cell editing/save (cells, outputs, nbformat), kernel execution: Run Cell / Run All with streamed outputs, Interrupt, Restart, Clear Output, per-notebook Python selection; Alt+8 | — |
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
 | Notebooks, agents | yes | no | P3 |
