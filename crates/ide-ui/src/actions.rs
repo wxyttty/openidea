@@ -59,6 +59,7 @@ gpui_kit::actions!(
         Intentions,
         Rename,
         ShowDuplicates,
+        ShowStructural,
     ]
 );
 

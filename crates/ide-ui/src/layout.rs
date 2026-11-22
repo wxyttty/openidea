@@ -13,12 +13,12 @@ pub struct Layout {
     /// Problems, Terminal, Diff, Run, Debug, Database, HTTP, Notebook, Agents,
     /// Notifications. Indices are stable; new tabs append at the end so saved
     /// layouts keep their meaning.
-    pub heights: [f32; 11],
+    pub heights: [f32; 12],
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { left_width: 280., heights: [180., 366., 420., 320., 420., 420., 420., 420., 420., 420., 320.] }
+        Self { left_width: 280., heights: [180., 366., 420., 320., 420., 420., 420., 420., 420., 420., 420., 320.] }
     }
 }
 
@@ -63,7 +63,7 @@ impl Layout {
     }
 }
 
-const KEYS: [&str; 11] = [
+const KEYS: [&str; 12] = [
     "problems",
     "terminal",
     "diff",
@@ -74,6 +74,7 @@ const KEYS: [&str; 11] = [
     "notebook",
     "agents",
     "duplicates",
+    "structural",
     "notifications",
 ];
 

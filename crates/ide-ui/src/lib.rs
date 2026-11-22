@@ -41,6 +41,7 @@ pub mod rename;
 pub mod project_tree;
 pub mod run;
 pub mod search;
+pub mod structural;
 pub mod terminal;
 pub mod theme;
 pub mod vcs;

@@ -337,7 +337,15 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   closes). Applying goes through `ide-host`'s `lsp_apply_code_action`, so the
   edit lands in the shared document and the editor repaints through
   `DocPatched`. Rename has its own dialog; Locate Duplicates has its own tool
-  window; Search Structurally still has only a backend.
+  window; Search Structurally has its own tool window.
+- **Search Structurally** (View menu, `structural` tool window): an ast-grep
+  pattern (`$name` for one node, `$$$list` for any sequence) and an optional
+  replacement template over the whole project. Matches stream in file by file
+  with per-file counts and the match's first line; clicking a row opens it at
+  the position. Replace All re-runs the query with the template and applies
+  every match as one `WorkspaceEdit` through the shared `Documents`, so open
+  editors repaint from `DocPatched`. A language without a bundled grammar is
+  reported before the scan instead of returning nothing silently.
 - **Locate Duplicates** (View menu, `duplicates` tool window): scans the project
   with `ide-analysis`'s token-based clone detection on the host runtime. The
   header sets the minimum fragment length (`+20`/`-20`) and toggles identifier
@@ -482,7 +490,7 @@ Status of the Tauri shell's features in the native app.
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
-| Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions (quick fixes, refactorings, source actions: kind sections, preferred preselection, disabled reasons, filter) and `Shift+F6` rename (prepareRename check, impact summary, apply through `Documents`); Locate Duplicates and Search Structurally have backends but no UI | P2 (duplicates UI, structural search, structure view) |
+| Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions, `Shift+F6` rename, Locate Duplicates tool window, Search Structurally tool window (patterns, replacement, Replace All); Structure view still pending | P2 (structure view) |
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
