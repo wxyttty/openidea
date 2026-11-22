@@ -633,6 +633,10 @@ pub struct Workbench {
     plugins_list: Vec<PluginInfo>,
     plugins_notice: Option<SharedString>,
     plugin_task: Option<Task<()>>,
+    /// The task draining the plugin event stream.
+    plugin_event_task: Option<Task<()>>,
+    /// The plugin event stream (notifications and editor text insertions).
+    plugin_events: futures::channel::mpsc::UnboundedReceiver<ide_plugin::PluginEvent>,
     balloon_clock: Option<Task<()>>,
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
@@ -795,8 +799,13 @@ impl Workbench {
         })
         .detach();
         let recent = RecentProjects::load(&config.config_dir);
+        // Plugin events (notifications, `insertText`, `replaceSelection`) are
+        // queued here and drained by a task spawned once the workbench exists.
+        let (plugin_tx, plugin_rx) = futures::channel::mpsc::unbounded::<ide_plugin::PluginEvent>();
         let plugin_sink: Arc<dyn ide_plugin::PluginEventSink> =
-            Arc::new(|_: Option<&str>, _: ide_plugin::PluginEvent| {});
+            Arc::new(move |_: Option<&str>, event: ide_plugin::PluginEvent| {
+                let _ = plugin_tx.unbounded_send(event);
+            });
         let plugins =
             PluginHost::new(config.data_dir.join("plugins"), plugin_sink, Limits::default()).ok().map(Arc::new);
         if let Some(plugin_host) = &plugins {
@@ -883,6 +892,8 @@ impl Workbench {
             plugins_list: Vec::new(),
             plugins_notice: None,
             plugin_task: None,
+            plugin_event_task: None,
+            plugin_events: plugin_rx,
             balloon_clock: None,
             condition_input,
             log_input,
@@ -917,6 +928,26 @@ impl Workbench {
         this
     }
 
+    /// The `system` notification group's effective preferences (project
+    /// overrides the global settings); backend and plugin events share it.
+    fn notification_prefs(&self) -> NotificationPrefs {
+        let settings = self
+            .project
+            .as_ref()
+            .map(|project| project.settings.effective())
+            .unwrap_or_else(|| self.host.global_settings.effective());
+        let group = settings.notifications.groups.get("system");
+        NotificationPrefs {
+            balloons: settings.notifications.balloons,
+            display: match group.map(|group| group.display.as_str()) {
+                Some("none") => BalloonDisplay::None,
+                Some("sticky") => BalloonDisplay::Sticky,
+                _ => BalloonDisplay::Balloon,
+            },
+            log: group.map(|group| group.log).unwrap_or(true),
+        }
+    }
+
     fn on_event(&mut self, event: IdeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             IdeEvent::Notify { level, title, body } => {
@@ -928,21 +959,7 @@ impl Workbench {
                 // `system` group, as the Tauri shell's NotificationService did;
                 // `log: false` keeps them out of the history. Project settings
                 // override the global ones when a project is open.
-                let settings = self
-                    .project
-                    .as_ref()
-                    .map(|project| project.settings.effective())
-                    .unwrap_or_else(|| self.host.global_settings.effective());
-                let group = settings.notifications.groups.get("system");
-                let prefs = NotificationPrefs {
-                    balloons: settings.notifications.balloons,
-                    display: match group.map(|group| group.display.as_str()) {
-                        Some("none") => BalloonDisplay::None,
-                        Some("sticky") => BalloonDisplay::Sticky,
-                        _ => BalloonDisplay::Balloon,
-                    },
-                    log: group.map(|group| group.log).unwrap_or(true),
-                };
+                let prefs = self.notification_prefs();
                 // Balloons are hidden while the Notifications tool window is on
                 // screen (IDEA shows either the stack or the list).
                 let read = self.notifications_visible();
@@ -1231,7 +1248,62 @@ impl Workbench {
         }
     }
 
+    /// Drains plugin events for the workbench's lifetime: notifications go into
+    /// the Notifications log, `insertText` / `replaceSelection` reach the editor
+    /// at the caret.
+    fn ensure_plugin_events(&mut self, cx: &mut Context<Self>) {
+        if self.plugin_event_task.is_some() {
+            return;
+        }
+        let mut rx = std::mem::replace(
+            &mut self.plugin_events,
+            futures::channel::mpsc::unbounded().1,
+        );
+        self.plugin_event_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match event {
+                        ide_plugin::PluginEvent::InsertText { text, .. } => {
+                            this.insert_at_caret(&text, false, cx);
+                        }
+                        ide_plugin::PluginEvent::ReplaceSelection { text, .. } => {
+                            this.insert_at_caret(&text, true, cx);
+                        }
+                        ide_plugin::PluginEvent::Notification { level, title, body, .. } => {
+                            let level = match level {
+                                ide_plugin::NotificationLevel::Error => ide_core::event::NotifyLevel::Error,
+                                ide_plugin::NotificationLevel::Warning => ide_core::event::NotifyLevel::Warning,
+                                _ => ide_core::event::NotifyLevel::Info,
+                            };
+                            let prefs = this.notification_prefs();
+                            let visible = this.notifications_visible();
+                            this.notifications.update(cx, |log, cx| {
+                                log.set_prefs(prefs);
+                                log.push(level, format!("Plugin: {title}"), (!body.is_empty()).then_some(body));
+                                if visible {
+                                    log.mark_all_read();
+                                }
+                                cx.notify();
+                            });
+                        }
+                        ide_plugin::PluginEvent::CommandsChanged => this.refresh_plugins(cx),
+                        ide_plugin::PluginEvent::ThemeChanged { .. } => {}
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    /// Inserts `text` at the caret, or replaces the selection when
+    /// `replace_selection` is set (a plugin's `insertText` / `replaceSelection`).
+    fn insert_at_caret(&mut self, text: &str, replace_selection: bool, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| editor.insert_text_at_caret(text, replace_selection, cx));
+        cx.notify();
+    }
+
     fn run(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_plugin_events(cx);
         let tab_before = self.bottom;
         match cmd {
             Cmd::OpenProject => self.pick_project(window, cx),
@@ -1569,6 +1641,59 @@ impl Workbench {
                 let _ = this.update(cx, |this, cx| {
                     this.plugins_list = snapshot.plugins;
                     this.plugins_notice = None;
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Runs a plugin command (`git.commit`, a manifest's `commands[].id`) and
+    /// shows its return value, if any, in the status bar. Effects the plugin
+    /// asked for (insertions, notifications) arrive through the event stream.
+    pub fn run_plugin_command(
+        &mut self,
+        plugin_id: String,
+        command_id: String,
+        arg: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plugins) = self.plugins.clone() else {
+            self.status = "Plugins are unavailable".into();
+            cx.notify();
+            return;
+        };
+        // The plugin sees the unsaved buffer, so a command that formats or
+        // analyses the file works on what is on screen. The closure is taken
+        // once here (the editor is not shared across threads).
+        let active_path = self.editor.read(cx).active_info().map(|info| info.path);
+        let active_text = self.editor.read(cx).active_text();
+        let buffer_text: Option<ide_plugin::BufferText> = active_path.zip(active_text).map(|(path, text)| {
+            std::sync::Arc::new(move |asked: &std::path::Path| (asked == path).then(|| text.clone()))
+                as ide_plugin::BufferText
+        });
+        let workspace_root = self.project.as_ref().map(|project| project.root.clone());
+        let invocation =
+            ide_plugin::Invocation { client: Some("main".to_owned()), workspace_root, buffer_text };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Result<Option<String>, String>>();
+        let status_command = command_id.clone();
+        std::thread::Builder::new()
+            .name("plugin-command".into())
+            .spawn(move || {
+                let result = plugins
+                    .run_command(&plugin_id, &command_id, arg.as_deref(), invocation)
+                    .map_err(|err| err.to_string());
+                let _ = tx.unbounded_send(result);
+            })
+            .expect("plugin command thread");
+        self.plugin_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(Some(value)) if !value.is_empty() => this.status = value.into(),
+                        Ok(_) => this.status = format!("Ran {status_command}").into(),
+                        Err(err) => this.status = format!("{status_command} failed: {err}").into(),
+                    }
                     cx.notify();
                 });
             }
@@ -1921,9 +2046,43 @@ impl Workbench {
 
     fn palette_len(&self) -> usize {
         match self.palette_mode {
-            PaletteMode::Commands => self.filtered_palette().len(),
+            PaletteMode::Commands => {
+                let commands = self.filtered_palette().len();
+                let plugins = self.plugin_command_count();
+                commands + plugins
+            }
             PaletteMode::Files => self.quick.len(),
         }
+    }
+
+    /// The plugin commands the palette lists under the current query.
+    fn plugin_command_list(&self) -> Vec<(String, String, String)> {
+        let query = self.palette_query.to_lowercase();
+        self.plugins_list
+            .iter()
+            .filter(|plugin| plugin.enabled && plugin.status == PluginStatus::Active)
+            .flat_map(|plugin| {
+                let query = query.clone();
+                plugin.commands.iter().filter_map(move |command| {
+                    let title = command
+                        .category
+                        .as_ref()
+                        .map(|category| format!("{category}: {}", command.title))
+                        .unwrap_or_else(|| command.title.clone());
+                    (query.is_empty() || title.to_lowercase().contains(query.as_str()))
+                        .then(|| (plugin.id.clone(), command.id.clone(), title))
+                })
+            })
+            .collect()
+    }
+
+    fn plugin_command_count(&self) -> usize {
+        self.plugin_command_list().len()
+    }
+
+    /// The `(plugin id, command id)` of the palette's `index`-th plugin row.
+    fn plugin_command_at(&self, index: usize) -> Option<(String, String)> {
+        self.plugin_command_list().get(index).map(|(plugin, command, _)| (plugin.clone(), command.clone()))
     }
 
     /// Keys that the intentions popup owns while it is open: Up/Down walk the
@@ -1975,6 +2134,11 @@ impl Workbench {
                         let cmd = entry.cmd;
                         self.close_palette(window, cx);
                         self.run(cmd, window, cx);
+                    } else if let Some((plugin_id, command_id)) =
+                        self.plugin_command_at(self.palette_index.saturating_sub(entries.len()))
+                    {
+                        self.close_palette(window, cx);
+                        self.run_plugin_command(plugin_id, command_id, None, cx);
                     }
                 }
             }
@@ -2506,7 +2670,43 @@ impl Workbench {
                         ),
                 );
             }
-            if entries.is_empty() {
+            // Plugin commands follow the workbench's own, as IDEA lists them in
+            // one palette: `pluginId:commandId`, titled from the manifest.
+            let plugin_commands = self.plugin_command_list();
+            for (offset, (plugin_id, command_id, title)) in plugin_commands.iter().enumerate() {
+                let index = entries.len() + offset;
+                let selected = index == self.palette_index;
+                let plugin_id = plugin_id.clone();
+                let command_id = command_id.clone();
+                let click = cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                    this.close_palette(window, cx);
+                    this.run_plugin_command(plugin_id.clone(), command_id.clone(), None, cx);
+                });
+                list = list.child(
+                    div()
+                        .id(ElementId::Name(format!("palette-plugin-{offset}").into()))
+                        .h(px(28.))
+                        .px_3()
+                        .mx_1()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(theme.list_active))
+                        .hover(move |this| this.bg(theme.list_hover))
+                        .on_click(click)
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(if selected { theme.accent_foreground } else { theme.foreground })
+                                .child(title.clone()),
+                        )
+                        .child(div().text_size(px(11.)).text_color(theme.fg_muted()).child("plugin")),
+                );
+            }
+            if entries.is_empty() && plugin_commands.is_empty() {
                 list = list
                     .child(div().p_3().text_size(px(12.)).text_color(theme.fg_muted()).child("No matching command"));
             }

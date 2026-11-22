@@ -238,6 +238,39 @@ impl EditorArea {
         Some((tab.doc, position.line, position.character, state.selected_range()))
     }
 
+    /// Inserts `text` at the caret, or replaces the selection when
+    /// `replace_selection` is set (a plugin's `insertText` / `replaceSelection`).
+    ///
+    /// Called from the plugin event task, which has no `Window` to hand the
+    /// editor's own `insert`, so the text is spliced into the shared buffer
+    /// instead: the tab's editor reloads from the `DocPatched` event the host
+    /// emits, exactly like every other out-of-band edit.
+    pub fn insert_text_at_caret(&mut self, text: &str, replace_selection: bool, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.active else { return false };
+        let Some((doc, _line, _col, range)) = self.active_position(cx) else { return false };
+        let Some(project) = self.project.clone() else { return false };
+        let current = self.tabs[index].text.clone();
+        let range = if replace_selection { range } else { range.start..range.start };
+        let mut next = String::with_capacity(current.len() + text.len());
+        next.push_str(&current[..range.start.min(current.len())]);
+        next.push_str(text);
+        next.push_str(&current[range.end.min(current.len())..]);
+        let changes = ide_text::Document::new(&current).diff(&next);
+        match project.documents.edit(doc, self.tabs[index].version, changes) {
+            Ok(version) => {
+                self.tabs[index].version = version;
+                self.tabs[index].text = next;
+                self.tabs[index].dirty = true;
+                cx.notify();
+                true
+            }
+            Err(err) => {
+                tracing::warn!("plugin insert rejected: {err}");
+                false
+            }
+        }
+    }
+
     /// The active tab's text, for a code-action request's range conversion.
     pub fn active_text(&self) -> Option<String> {
         Some(self.tabs.get(self.active?)?.text.clone())
