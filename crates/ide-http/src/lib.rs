@@ -32,6 +32,16 @@ pub struct RunInput<'a> {
 /// Prepares and sends request `index` of `text`. Preparation errors (bad
 /// variables, missing includes) fail; transport errors are part of the exchange.
 pub async fn run(input: RunInput<'_>, cancel: &CancellationToken) -> IdeResult<HttpExchange> {
+    run_streaming(input, cancel, &mut |_| {}).await
+}
+
+/// Like [`run`], reporting each response body chunk as it arrives (timed and
+/// size-metered by the caller) so a streaming endpoint fills the viewer live.
+pub async fn run_streaming(
+    input: RunInput<'_>,
+    cancel: &CancellationToken,
+    on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+) -> IdeResult<HttpExchange> {
     let parsed = parse::parse(input.text);
     let raw = parsed
         .requests
@@ -43,7 +53,7 @@ pub async fn run(input: RunInput<'_>, cancel: &CancellationToken) -> IdeResult<H
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or_default();
-    let result = exec::execute(&request, cancel).await;
+    let result = exec::execute_streaming(&request, cancel, on_chunk).await;
     if let Err(e) = &result
         && e.kind == ide_core::error::ErrorKind::Cancelled
     {

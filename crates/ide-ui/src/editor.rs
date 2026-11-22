@@ -48,6 +48,8 @@ struct Tab {
     breakpoint_decorations: Option<RangeDecorationCollection>,
     /// Breakpoint marks in the gutter strip beside the line numbers.
     breakpoint_gutter: Option<GutterDecorationCollection>,
+    /// Run marks in the gutter of `.http` files: one per request line.
+    http_gutter: Option<GutterDecorationCollection>,
     /// Find-in-file match highlights.
     find_decorations: Option<RangeDecorationCollection>,
 }
@@ -310,6 +312,7 @@ impl EditorArea {
             _change: None,
             breakpoint_decorations: None,
             breakpoint_gutter: None,
+            http_gutter: None,
             find_decorations: None,
         });
         self.active = Some(self.tabs.len() - 1);
@@ -318,6 +321,7 @@ impl EditorArea {
         // The subscription must live as long as the tab.
         self.tabs[index]._change = Some(change);
         self.apply_breakpoints(index, cx);
+        self.apply_http_gutter(index, cx);
         cx.notify();
     }
 
@@ -400,6 +404,42 @@ impl EditorArea {
                 let collection =
                     state.update(cx, |state, cx| state.create_gutter_decorations_collection(gutter, cx));
                 self.tabs[index].breakpoint_gutter = Some(collection);
+            }
+        }
+    }
+
+    /// Repaint the run marks of `.http` files: one gutter mark per request
+    /// start, so a request line is obviously runnable (IDEA puts a ▶ there).
+    fn apply_http_gutter(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        if !matches!(language_for(&tab.path), "http") && tab.path.extension().is_none_or(|ext| ext != "http") {
+            return;
+        }
+        let state = tab.state.clone();
+        let ranges: Vec<std::ops::Range<usize>> = {
+            let state = state.read(cx);
+            let rope = state.text();
+            let text = rope.to_string();
+            let count = rope.lines_len();
+            crate::http::request_lines(&text)
+                .into_iter()
+                .filter_map(|line| {
+                    let start_line = (line as usize).min(count.saturating_sub(1));
+                    let start = rope.line_start_offset(start_line);
+                    Some(start..start)
+                })
+                .collect()
+        };
+        let mut mark = cx.theme().success;
+        mark.a = 0.85;
+        let gutter: Vec<GutterDecoration> =
+            ranges.into_iter().map(|range| GutterDecoration::new(range).with_color(mark)).collect();
+        match self.tabs[index].http_gutter.clone() {
+            Some(collection) => collection.set(gutter, cx),
+            None => {
+                let collection =
+                    state.update(cx, |state, cx| state.create_gutter_decorations_collection(gutter, cx));
+                self.tabs[index].http_gutter = Some(collection);
             }
         }
     }

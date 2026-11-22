@@ -125,6 +125,28 @@ fn looks_textual(content_type: Option<&str>, bytes: &[u8]) -> bool {
 
 /// Sends `req`; cancelled when `cancel` fires.
 pub async fn execute(req: &PreparedRequest, cancel: &CancellationToken) -> IdeResult<HttpResponse> {
+    execute_with(req, cancel, &mut |_| {}).await
+}
+
+/// Like [`execute`], but reports each body chunk as it arrives so a viewer can
+/// show a long response filling in (server-sent events, streaming JSON, large
+/// downloads) instead of waiting for the whole body.
+///
+/// The callback runs on the request task, in arrival order; the final
+/// [`HttpResponse`] still carries the collected body (capped at `MAX_BODY`).
+pub async fn execute_streaming(
+    req: &PreparedRequest,
+    cancel: &CancellationToken,
+    on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+) -> IdeResult<HttpResponse> {
+    execute_with(req, cancel, on_chunk).await
+}
+
+async fn execute_with(
+    req: &PreparedRequest,
+    cancel: &CancellationToken,
+    on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+) -> IdeResult<HttpResponse> {
     let client = crate::client::shared()?;
     let method = reqwest::Method::from_bytes(req.method.as_bytes())
         .map_err(|_| IdeError::invalid(format!("invalid method {}", req.method)))?;
@@ -165,6 +187,7 @@ pub async fn execute(req: &PreparedRequest, cancel: &CancellationToken) -> IdeRe
             let take = chunk.len().min(MAX_BODY - bytes.len());
             bytes.extend_from_slice(&chunk[..take]);
         }
+        on_chunk(&chunk);
     }
     let total = started.elapsed();
     let body = looks_textual(content_type.as_deref(), &bytes).then(|| String::from_utf8_lossy(&bytes).into_owned());

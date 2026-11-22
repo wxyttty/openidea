@@ -525,7 +525,7 @@ Status of the Tauri shell's features in the native app.
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer, cell editing/save (cells, outputs, nbformat), kernel execution: Run Cell / Run All with streamed outputs, Interrupt, Restart, Clear Output, per-notebook Python selection; Alt+8 | — |
 | Agents | yes | providers/tasks/conversation, create local task (local checkout or worktree), prompt, cancel, permission prompts with per-option answers, per-task settings cycled from the provider's advertised options, ACP Registry list/install/update; Alt+9 | — |
-| HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
+| HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save, gutter run marks per request line, streaming body shown live while a response arrives | — |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | SSH tool window (configurations, connect/test/disconnect with live session state); SFTP deploy actions and remote-development UI still pending | P3 (SFTP actions, remote host UI) |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, Keymap editor (every bound command, current shortcut, rebind/unbind written to `keymapOverrides`), theme, paths | P2 (full field coverage) |

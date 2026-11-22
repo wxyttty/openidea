@@ -1660,6 +1660,12 @@ impl Workbench {
         }
     }
 
+    /// Runs the `.http` request the caret is in (what the gutter run mark and
+    /// the `Ctrl+Alt+R` action both do).
+    pub fn run_http_at_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(Cmd::RunHttpAtCaret, window, cx);
+    }
+
     fn toggle_breakpoint(&mut self, cx: &mut Context<Self>) {
         let Some((path, line)) = self.editor.read(cx).active_location(cx) else {
             self.status = "Open a file to set a breakpoint".into();

@@ -13,6 +13,14 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_host::{Host, Project};
+
+/// What the streaming request task reports to the UI thread.
+enum StreamEvent {
+    /// The body so far (UTF-8 lossy), so the viewer fills in while reading.
+    Chunk(String),
+    /// The finished exchange and its error text, if any.
+    Done(Result<ide_http::HttpExchange, String>, String),
+}
 use ide_http::{HttpResponse, RunInput};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +43,8 @@ pub struct HttpPanel {
     headers: Entity<InputState>,
     body: Entity<InputState>,
     response: Option<HttpResponse>,
+    /// Body text accumulated so far while a response streams in.
+    streamed: Option<SharedString>,
     notice: Option<SharedString>,
     error: Option<SharedString>,
     running: bool,
@@ -79,6 +89,7 @@ impl HttpPanel {
             headers,
             body,
             response: None,
+            streamed: None,
             notice: None,
             error: None,
             running: false,
@@ -202,35 +213,57 @@ impl HttpPanel {
         self.error = None;
         self.response = None;
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        // Streaming: the body arrives chunk by chunk, so the viewer fills in
+        // while a long response (SSE, large JSON) is still being read.
+        let live = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let live_writer = live.clone();
+        let stream_tx = tx.clone();
         self.host.runtime.spawn(async move {
             let cancel = ide_core::CancellationToken::new();
             let run = RunInput { text: &text, index, file: file.as_deref(), root: Some(&root), env: env.as_deref() };
-            let result = ide_http::run(run, &cancel).await.map_err(|err| err.to_string());
-            let _ = tx.unbounded_send(result);
+            let mut on_chunk = |chunk: &[u8]| {
+                if let Ok(mut body) = live_writer.lock() {
+                    body.push_str(&String::from_utf8_lossy(chunk));
+                    let _ = stream_tx.unbounded_send(StreamEvent::Chunk(body.clone()));
+                }
+            };
+            let result = ide_http::run_streaming(run, &cancel, &mut on_chunk)
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(StreamEvent::Done(result, live.lock().map(|body| body.clone()).unwrap_or_default()));
         });
         self.task = Some(cx.spawn(async move |this, cx| {
-            while let Some(result) = rx.next().await {
+            while let Some(event) = rx.next().await {
                 let _ = this.update(cx, |this, cx| {
-                    this.running = false;
-                    match result {
-                        Ok(exchange) => {
-                            if let Some(error) = exchange.entry.error.clone() {
-                                this.error = Some(error.into());
-                            } else {
-                                this.response = exchange.response.clone();
-                            }
-                            if let Some(project) = this.project.clone() {
-                                let history = project.http_history.clone();
-                                let saved = exchange.clone();
-                                std::thread::spawn(move || {
-                                    let _ = history.add(&saved);
-                                });
-                                this.history = project.http_history.list();
-                            }
+                    match event {
+                        StreamEvent::Chunk(body) => {
+                            this.streamed = Some(body.into());
+                            cx.notify();
+                            return;
                         }
-                        Err(err) => this.error = Some(err.into()),
+                        StreamEvent::Done(result, _body) => {
+                            this.streamed = None;
+                            this.running = false;
+                            match result {
+                                Ok(exchange) => {
+                                    if let Some(error) = exchange.entry.error.clone() {
+                                        this.error = Some(error.into());
+                                    } else {
+                                        this.response = exchange.response.clone();
+                                    }
+                                    if let Some(project) = this.project.clone() {
+                                        let history = project.http_history.clone();
+                                        let saved = exchange.clone();
+                                        let _ = &history;
+                                        let _ = history.add(&saved);
+                                        this.history = project.http_history.list();
+                                    }
+                                }
+                                Err(err) => this.error = Some(err.into()),
+                            }
+                            cx.notify();
+                        }
                     }
-                    cx.notify();
                 });
             }
         }));
@@ -248,6 +281,28 @@ impl HttpPanel {
         }
         cx.notify();
     }
+}
+
+/// Zero-based lines that start an HTTP request in a `.http` file.
+///
+/// A request starts with a method and a target (`GET https://…`, `POST /items`,
+/// `PATCH {{host}}/x`), which is what IDEA's gutter run mark sits on. Comment
+/// lines (`#`, `//`) and the header/body lines of a request are skipped.
+pub fn request_lines(text: &str) -> Vec<u32> {
+    const METHODS: [&str; 9] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"];
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                return None;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let method = parts.next()?;
+            let target = parts.next();
+            (METHODS.contains(&method) && target.is_some()).then_some(index as u32)
+        })
+        .collect()
 }
 
 /// Writes the response body into `<project>/.openidea/exports/http-<ms>.<json|txt>`
@@ -292,6 +347,42 @@ impl Render for HttpPanel {
         let hover_bg = theme.list_hover;
 
         let mut response_area = div().flex_1().min_h_0().flex().flex_col();
+        // While a response streams in, the body text so far is shown live so a
+        // long download or an SSE stream is readable before it finishes.
+        let streamed = self.streamed.clone();
+        if let Some(body) = streamed {
+            response_area = response_area.child(
+                div()
+                    .h(px(24.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_size(px(10.))
+                    .text_color(theme.warning)
+                    .child("Streaming…")
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(theme.fg_muted())
+                            .child(format!("{} B received", body.len())),
+                    ),
+            );
+            response_area = response_area.child(
+                div()
+                    .id("http-streamed")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .font_family(mono.clone())
+                    .text_size(px(10.5))
+                    .text_color(theme.foreground)
+                    .child(body),
+            );
+        }
         if let Some(error) = error {
             response_area =
                 response_area.child(div().px_3().py_2().text_size(px(11.5)).text_color(theme.danger).child(error));
