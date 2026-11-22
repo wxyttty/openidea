@@ -349,6 +349,12 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
   expand/collapse; kinds get IDEA-like icons and colours; a click jumps to the
   symbol. It parses the buffer's *current* text, so unsaved edits show up without
   a save or a language server.
+- **SSH tool window** (View menu, `ssh`): the configurations of
+  Settings › Tools › SSH with their `user@host:port` label and a session dot.
+  Connect opens (or reuses) a session through `SshManager::session` on the host
+  runtime, Test runs the manager's connection test (host key, authentication, a
+  shell), and Disconnect drops it; unknown host keys and authentication failures
+  surface as the panel's notice instead of hanging a frame.
 - **Search Structurally** (View menu, `structural` tool window): an ast-grep
   pattern (`$name` for one node, `$$$list` for any sequence) and an optional
   replacement template over the whole project. Matches stream in file by file
@@ -513,7 +519,7 @@ Status of the Tauri shell's features in the native app.
 | Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
 | Notebooks, agents | yes | no | P3 |
-| Plugins (WASM), remote dev, SSH/SFTP | yes | no | P3 |
+| Plugins (WASM), remote dev, SSH/SFTP | yes | SSH tool window (configurations, connect/test/disconnect with live session state); SFTP deploy actions and remote-development UI still pending | P3 (SFTP actions, remote host UI) |
 | Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |

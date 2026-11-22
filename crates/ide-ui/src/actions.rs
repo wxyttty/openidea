@@ -61,6 +61,7 @@ gpui_kit::actions!(
         ShowDuplicates,
         ShowStructural,
         ShowStructure,
+        ShowSsh,
     ]
 );
 
