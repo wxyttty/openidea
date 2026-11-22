@@ -524,11 +524,11 @@ Status of the Tauri shell's features in the native app.
 | Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings) | P2 (sound, Don't Show Again) |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer, cell editing/save (cells, outputs, nbformat), kernel execution: Run Cell / Run All with streamed outputs, Interrupt, Restart, Clear Output, per-notebook Python selection; Alt+8 | — |
-| Agents | yes | providers/tasks/conversation, create local task, prompt, cancel; Alt+9 | P2 (permissions, worktrees, settings, registry) |
+| Agents | yes | providers/tasks/conversation, create local task (local checkout or worktree), prompt, cancel, permission prompts with per-option answers, per-task settings cycled from the provider's advertised options, ACP Registry list/install/update; Alt+9 | — |
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save | P2 (gutter run icons, streaming) |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | SSH tool window (configurations, connect/test/disconnect with live session state); SFTP deploy actions and remote-development UI still pending | P3 (SFTP actions, remote host UI) |
-| Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, theme, paths | P2 (keymap editor, full field coverage) |
+| Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, Keymap editor (every bound command, current shortcut, rebind/unbind written to `keymapOverrides`), theme, paths | P2 (full field coverage) |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder | P2 (commands, insert-text events, marketplace) |

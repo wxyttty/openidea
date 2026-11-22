@@ -28,6 +28,7 @@ ide-lsp.workspace = true
 ide-notebook.workspace = true
 ide-analysis.workspace = true
 ide-language.workspace = true
+ide-tools.workspace = true
 encoding_rs.workspace = true
 ide-plugin.workspace = true
 lsp-types.workspace = true
@@ -43,5 +44,6 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 # Workbench entry tests: a real `Host` (runtime + language registry) and temp dirs.
 tokio.workspace = true
 ide-language.workspace = true
+ide-tools.workspace = true
 encoding_rs.workspace = true
 tempfile.workspace = true

@@ -18,6 +18,8 @@
 //!   into the GPUI main thread.
 //!
 //! Migration status and the phase plan live in `docs/gpui-migration.md`.
+#![recursion_limit = "512"]
+
 
 pub mod actions;
 pub mod agents;
@@ -32,6 +34,7 @@ pub mod events;
 pub mod highlights;
 pub mod http;
 pub mod intentions;
+pub mod keymap;
 pub mod layout;
 pub mod lsp;
 pub mod notebook;

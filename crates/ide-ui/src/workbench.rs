@@ -505,6 +505,7 @@ enum LeftPanel {
 enum SettingsSection {
     Editor,
     Terminal,
+    Keymap,
     Appearance,
     General,
 }
@@ -581,6 +582,9 @@ pub struct Workbench {
     find_searched: bool,
     find_options: FindOptions,
     settings_open: bool,
+    /// The shortcut dialog (Settings › Keymap).
+    keymap_dialog: Entity<crate::keymap::KeymapDialog>,
+    keymap_accepted: Option<Subscription>,
     settings_section: SettingsSection,
     editor_font_size: f32,
     terminal_font_size: f32,
@@ -829,6 +833,8 @@ impl Workbench {
             find_searched: false,
             find_options: FindOptions::default(),
             settings_open: false,
+            keymap_dialog: cx.new(|cx| crate::keymap::KeymapDialog::new(window, cx)),
+            keymap_accepted: None,
             settings_section: SettingsSection::Editor,
             editor_font_size,
             terminal_font_size,
@@ -1584,6 +1590,61 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Opens the shortcut dialog for one command (Settings › Keymap).
+    fn open_keymap_dialog(
+        &mut self,
+        id: &'static str,
+        label: SharedString,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.keymap_dialog.update(cx, |dialog, cx| dialog.open(id, label, current, window, cx));
+        if self.keymap_accepted.is_none() {
+            let subscription = cx.subscribe(
+                &self.keymap_dialog,
+                |this: &mut Self, _dialog, _: &crate::keymap::KeymapAccepted, cx| {
+                    this.apply_keymap(cx);
+                },
+            );
+            self.keymap_accepted = Some(subscription);
+        }
+        cx.notify();
+    }
+
+    /// Writes the dialog's shortcut to `settings.keymap_overrides` and rebinds it
+    /// in the live keymap.
+    fn apply_keymap(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.keymap_dialog.read(cx).command else { return };
+        let keys = self.keymap_dialog.read(cx).keys(cx);
+        if let Err(error) = crate::keymap::validate_keystroke(&keys) {
+            self.keymap_dialog.update(cx, |dialog, cx| {
+                dialog.error = Some(error.into());
+                cx.notify();
+            });
+            return;
+        }
+        match crate::keymap::apply_override(cx, command, &keys) {
+            Ok(()) => {
+                let value = crate::keymap::override_value(&keys);
+                let json = if value.is_empty() {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!(value)
+                };
+                self.persist_setting(&format!("keymapOverrides.{command}"), json);
+                self.keymap_dialog.update(cx, |dialog, cx| dialog.close(cx));
+            }
+            Err(error) => {
+                self.keymap_dialog.update(cx, |dialog, cx| {
+                    dialog.error = Some(error.into());
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+
     fn persist_setting(&mut self, key: &str, value: serde_json::Value) {
         let store = match &self.project {
             Some(project) => project.settings.as_ref(),
@@ -1809,6 +1870,13 @@ impl Workbench {
     /// Keys that the intentions popup owns while it is open: Up/Down walk the
     /// list, Enter applies the selected action, Esc closes it.
     fn intentions_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.keymap_dialog.read(cx).is_open() {
+            if event.keystroke.key == "escape" {
+                self.keymap_dialog.update(cx, |dialog, cx| dialog.close(cx));
+                cx.stop_propagation();
+            }
+            return true;
+        }
         if self.rename_open {
             if event.keystroke.key == "escape" {
                 self.rename_open = false;
@@ -2615,6 +2683,17 @@ impl Render for Workbench {
         if self.palette_open {
             overlays.push(self.render_palette(&theme, cx));
         }
+        if self.keymap_dialog.read(cx).is_open() {
+            let origin = dialog_origin(window.bounds().size);
+            overlays.push(
+                div()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .child(self.keymap_dialog.clone())
+                    .into_any_element(),
+            );
+        }
         if self.settings_open {
             let list_hover = theme.list_hover;
             let settings = match &self.project {
@@ -2772,6 +2851,7 @@ impl Render for Workbench {
             for (section, label) in [
                 (SettingsSection::Editor, "Editor"),
                 (SettingsSection::Terminal, "Terminal"),
+                (SettingsSection::Keymap, "Keymap"),
                 (SettingsSection::Appearance, "Appearance"),
                 (SettingsSection::General, "General"),
             ] {
@@ -2898,6 +2978,64 @@ impl Render for Workbench {
                                 .text_color(theme.fg_muted())
                                 .child("Seven built-in schemes from src/styles/tokens.css."),
                         );
+                }
+                SettingsSection::Keymap => {
+                    let overrides = settings.keymap_overrides.clone();
+                    let rows = crate::keymap::rows(cx, &overrides);
+                    pane = pane
+                        .child(header("Keymap"))
+                        .child(info("Preset", settings.keymap.clone()))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.fg_muted())
+                                .child("Click a shortcut to change it; blank removes the binding"),
+                        );
+                    let mut list = div()
+                        .id("keymap-list")
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5();
+                    for row in rows {
+                        let id = row.id;
+                        let label = row.label;
+                        let current = row.current.clone();
+                        let overridden = row.overridden;
+                        let value = row.current.unwrap_or_else(|| "unbound".to_owned());
+                        list = list.child(
+                            div()
+                                .id(ElementId::Name(format!("keymap-row-{id}").into()))
+                                .h(px(22.))
+                                .px_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(move |this| this.bg(list_hover))
+                                .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                                    this.open_keymap_dialog(id, label.into(), current.clone(), window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .w(px(230.))
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.foreground)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(10.5))
+                                        .text_color(if overridden { theme.warning } else { theme.fg_muted() })
+                                        .child(value),
+                                ),
+                        );
+                    }
+                    pane = pane.child(list);
                 }
                 SettingsSection::General => {
                     pane = pane

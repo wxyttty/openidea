@@ -36,10 +36,33 @@ pub struct AgentPanel {
     subscribed: Option<PathBuf>,
     sending: bool,
     clear_prompt: bool,
+    /// How the next task is isolated: the shared checkout or its own worktree.
+    isolation: Isolation,
+    /// Whether the ACP Registry list is showing.
+    registry_open: bool,
+    /// Registry agents, when loaded.
+    registry: Vec<ide_agent::registry::RegistryAgent>,
+    /// The registry's notice (warning, install progress, failure).
+    registry_notice: Option<SharedString>,
+    /// Id of the registry agent being installed.
+    installing: Option<String>,
     _prompt_subscription: Subscription,
     event_task: Option<Task<()>>,
     request_task: Option<Task<()>>,
     focus_handle: FocusHandle,
+}
+
+/// Whether a permission option rejects (rendered as a dangerous action).
+pub fn permission_is_destructive(kind: &str) -> bool {
+    kind.starts_with("reject")
+}
+
+/// The label the isolation control shows.
+pub fn isolation_label(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::Local => "Isolation: local checkout",
+        Isolation::Worktree => "Isolation: worktree",
+    }
 }
 
 fn status_label(status: AgentStatus) -> &'static str {
@@ -84,6 +107,11 @@ impl AgentPanel {
             subscribed: None,
             sending: false,
             clear_prompt: false,
+            isolation: Isolation::Local,
+            registry_open: false,
+            registry: Vec::new(),
+            registry_notice: None,
+            installing: None,
             _prompt_subscription: prompt_subscription,
             event_task: None,
             request_task: None,
@@ -285,7 +313,7 @@ impl AgentPanel {
             prompt,
             provider: provider.id.clone(),
             config: Vec::new(),
-            isolation: Isolation::Local,
+            isolation: self.isolation,
             base: None,
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -321,6 +349,156 @@ impl AgentPanel {
         if let Err(err) = ide_host::ops::agent::cancel(&self.host, "main", task, None) {
             self.notice = Some(err.to_string().into());
         }
+        cx.notify();
+    }
+
+    /// Answers a pending permission request: `option` is one of the request's
+    /// option ids, or `None` to cancel the request.
+    ///
+    /// The agent blocks its turn until the request is answered, so this is what
+    /// lets a tool-needing task continue instead of waiting forever.
+    pub fn respond(&mut self, permission: u32, option: Option<String>, cx: &mut Context<Self>) {
+        let Some(task) = self.selected_task.clone() else { return };
+        match ide_host::ops::agent::respond(&self.host, "main", task.clone(), permission, option) {
+            Ok(()) => {
+                // Re-read the conversation so the entry shows its chosen option
+                // immediately, before the next streamed event arrives.
+                self.entries = ide_host::ops::agent::entries(&self.host, "main", task, None).unwrap_or_default();
+                self.notice = None;
+            }
+            Err(err) => self.notice = Some(err.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    /// The isolation a new task runs in (`Local` shares the checkout,
+    /// `Worktree` gives the agent its own branch).
+    pub fn isolation(&self) -> Isolation {
+        self.isolation
+    }
+
+    /// Switches how the next task is isolated.
+    pub fn set_isolation(&mut self, isolation: Isolation, cx: &mut Context<Self>) {
+        self.isolation = isolation;
+        cx.notify();
+    }
+
+    /// Opens the ACP Registry list (`registry_list`), showing what is installed
+    /// and what can be installed or updated.
+    pub fn open_registry(&mut self, cx: &mut Context<Self>) {
+        self.registry_open = true;
+        self.registry_notice = Some("Loading the registry…".into());
+        cx.notify();
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result = ide_host::ops::agent::registry_list(&host, "main", ide_core::RequestId::next())
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        self.request_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    match result {
+                        Ok(registry) => {
+                            panel.registry = registry.agents;
+                            panel.registry_notice = registry.warning.map(Into::into);
+                        }
+                        Err(err) => panel.registry_notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    pub fn close_registry(&mut self, cx: &mut Context<Self>) {
+        self.registry_open = false;
+        cx.notify();
+    }
+
+    /// Whether the registry list is showing (for tests and the header).
+    pub fn registry_is_open(&self) -> bool {
+        self.registry_open
+    }
+
+    pub fn registry_agents(&self) -> &[ide_agent::registry::RegistryAgent] {
+        &self.registry
+    }
+
+    /// Installs (or updates) one registry agent, streaming its progress.
+    pub fn install_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        self.installing = Some(id.clone());
+        self.registry_notice = Some(format!("Installing {id}…").into());
+        cx.notify();
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<String>();
+        let progress = tx.clone();
+        self.host.runtime.spawn(async move {
+            let channel = ide_host::ops::Channel::new(move |event: ide_tools::InstallEvent| {
+                if let ide_tools::InstallEvent::Line { text } = event {
+                    let _ = progress.unbounded_send(text);
+                }
+            });
+            let install_id = id.clone();
+            let result = ide_host::ops::agent::registry_install(
+                &host,
+                "main",
+                install_id,
+                ide_core::RequestId::next(),
+                channel,
+            )
+            .await
+            .map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(match result {
+                Ok(()) => format!("\u{2713} {id} installed"),
+                Err(err) => format!("Install failed: {err}"),
+            });
+        });
+        self.request_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(line) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    panel.installing = None;
+                    panel.registry_notice = Some(line.into());
+                    panel.refresh(cx);
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    /// The provider's offered settings (models, modes…) for the selected task.
+    pub fn config_options(&self) -> Vec<ide_agent::AgentConfigOption> {
+        self.selected_task
+            .as_ref()
+            .and_then(|id| self.tasks.iter().find(|task| &task.id == id))
+            .and_then(|task| self.providers.iter().find(|provider| provider.id == task.provider))
+            .map(|provider| provider.config.clone())
+            .unwrap_or_default()
+    }
+
+    /// Changes one of the task's settings (`model`, `mode`, …).
+    pub fn set_config(&mut self, option: String, value: String, cx: &mut Context<Self>) {
+        let Some(task) = self.selected_task.clone() else { return };
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result =
+                ide_host::ops::agent::set_config(&host, "main", task, option, value).await.map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        self.request_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |panel, cx| {
+                    match result {
+                        Ok(()) => panel.refresh(cx),
+                        Err(err) => panel.notice = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
         cx.notify();
     }
 
@@ -496,8 +674,73 @@ impl Render for AgentPanel {
                 div().text_size(px(11.)).text_color(theme.fg_muted()).child("Start a task by typing a prompt below."),
             );
         }
+        let entry_theme = theme.clone();
+        let warning = theme.warning;
+        let danger = theme.danger;
+        let success = theme.success;
+        let border = theme.border;
+        let list_hover = theme.list_hover;
+        let fg_secondary = theme.fg_secondary();
         for entry in &self.entries {
-            conversation = conversation.child(Self::entry_element(entry, &theme));
+            conversation = conversation.child(Self::entry_element(entry, &entry_theme));
+            // A pending permission renders its options as buttons: the agent
+            // blocks its turn until one is answered.
+            if let AgentEntry::Permission { id, title, options, chosen } = entry
+                && chosen.is_none()
+            {
+                let mut row = div().w_full().flex().items_center().gap_2().p_2().rounded(px(4.));
+                row = row.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(warning)
+                        .child(format!("Permission needed: {title}")),
+                );
+                for option in options {
+                    let option_id = option.id.clone();
+                    let permission = *id;
+                    let destructive = permission_is_destructive(&option.kind);
+                    let color = if destructive { danger } else { success };
+                    row = row.child(
+                        div()
+                            .id(ElementId::Name(format!("agent-permission-{id}-{}", option.id).into()))
+                            .h(px(20.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .bg(color.opacity(0.18))
+                            .hover(move |this| this.bg(color.opacity(0.32)))
+                            .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                this.respond(permission, Some(option_id.clone()), cx)
+                            }))
+                            .text_size(px(10.))
+                            .text_color(color)
+                            .child(option.name.clone()),
+                    );
+                }
+                let cancel_permission = *id;
+                row = row.child(
+                    div()
+                        .id(ElementId::Name(format!("agent-permission-cancel-{id}").into()))
+                        .h(px(20.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(border)
+                        .hover(move |this| this.bg(list_hover))
+                        .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                            this.respond(cancel_permission, None, cx)
+                        }))
+                        .text_size(px(10.))
+                        .text_color(fg_secondary)
+                        .child("Cancel"),
+                );
+                conversation = conversation.child(row);
+            }
         }
 
         let title = self
@@ -546,6 +789,95 @@ impl Render for AgentPanel {
                                 .text_color(theme.fg_secondary())
                                 .child("Cancel"),
                         )
+                    })
+                    .child(
+                        div()
+                            .id("agent-isolation")
+                            .h(px(18.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(move |this| this.bg(hover))
+                            .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                                let next = match this.isolation {
+                                    Isolation::Local => Isolation::Worktree,
+                                    Isolation::Worktree => Isolation::Local,
+                                };
+                                this.set_isolation(next, cx);
+                            }))
+                            .text_size(px(9.5))
+                            .text_color(theme.fg_secondary())
+                            .child(isolation_label(self.isolation)),
+                    )
+                    .child(
+                        div()
+                            .id("agent-registry")
+                            .h(px(18.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(move |this| this.bg(hover))
+                            .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                                this.open_registry(cx)
+                            }))
+                            .text_size(px(9.5))
+                            .text_color(theme.fg_secondary())
+                            .child("Registry"),
+                    )
+                    .when_some(self.config_options().first().cloned(), |this, option| {
+                        // One compact control per advertised setting: clicking
+                        // cycles to the next value (models, modes, thought levels).
+                        let theme = theme.clone();
+                        let config_hover = theme.list_hover;
+                        let choices = option.values.clone();
+                        let current = option
+                            .current
+                            .clone()
+                            .or_else(|| choices.first().map(|value| value.value.clone()))
+                            .unwrap_or_default();
+                        let label = choices
+                            .iter()
+                            .find(|value| value.value == current)
+                            .map(|value| value.name.clone())
+                            .unwrap_or_else(|| option.name.clone());
+                        this.child(
+                            div()
+                                .id("agent-config")
+                                .h(px(18.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(theme.border)
+                                .hover(move |this| this.bg(config_hover))
+                                .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                    let choices = choices.clone();
+                                    let current = current.clone();
+                                    let option_id = option.id.clone();
+                                    let next = choices
+                                        .iter()
+                                        .position(|value| value.value == current)
+                                        .map(|index| (index + 1) % choices.len().max(1))
+                                        .and_then(|index| choices.get(index))
+                                        .map(|value| value.value.clone());
+                                    if let Some(value) = next {
+                                        this.set_config(option_id, value, cx);
+                                    }
+                                }))
+                                .text_size(px(9.5))
+                                .text_color(theme.fg_secondary())
+                                .child(format!("{}: {label}", option.name)),
+                        )
                     }),
             )
             .child(
@@ -567,6 +899,164 @@ impl Render for AgentPanel {
                     )
                     .child(conversation),
             )
+            .when(self.registry_open, |this| {
+                let theme = theme.clone();
+                let hover = theme.list_hover;
+                let accent = theme.accent;
+                let foreground = theme.foreground;
+                let muted = theme.fg_muted();
+                let fg_muted = muted;
+                let agents = std::rc::Rc::new(
+                    self.registry
+                        .iter()
+                        .map(|agent| {
+                            (
+                                agent.id.clone(),
+                                agent.name.clone(),
+                                agent.version.clone(),
+                                agent.installed.clone(),
+                                agent.update,
+                                agent.distribution.is_some(),
+                                agent.description.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                this.child(
+                    div()
+                        .id("agent-registry-panel")
+                        .absolute()
+                        .top(px(30.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .bg(theme.background)
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(24.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .bg(theme.muted)
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.fg_secondary())
+                                        .child("ACP Registry"),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id("agent-registry-close")
+                                        .h(px(18.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .hover(move |this| this.bg(hover))
+                                        .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| {
+                                            this.close_registry(cx)
+                                        }))
+                                        .text_size(px(9.5))
+                                        .text_color(theme.fg_secondary())
+                                        .child("Close"),
+                                ),
+                        )
+                        .when_some(self.registry_notice.clone(), |this, notice| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(10.))
+                                    .text_color(theme.warning)
+                                    .child(notice),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("agent-registry-list")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .p_1()
+                                .flex()
+                                .flex_col()
+                                .children(agents.iter().enumerate().map(|(index, agent)| {
+                                    let (id, name, version, installed, update, installable, description) = agent.clone();
+                                    let hover = hover;
+                                    let detail = match (&installed, update) {
+                                        (Some(current), true) => format!("{current} → {version} (update)"),
+                                        (Some(current), false) => format!("installed {current}"),
+                                        (None, _) => version.clone(),
+                                    };
+                                    let install_id = id.clone();
+                                    div()
+                                        .id(ElementId::Name(format!("registry-agent-{index}").into()))
+                                        .h(px(28.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .rounded(px(3.))
+                                        .hover(move |this| this.bg(hover))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(11.))
+                                                        .text_color(foreground)
+                                                        .child(name),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(9.5))
+                                                        .text_color(fg_muted)
+                                                        .child(description),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(9.5))
+                                                .text_color(fg_muted)
+                                                .child(detail),
+                                        )
+                                        .when(installable, |this| {
+                                            this.child(
+                                                div()
+                                                    .id(ElementId::Name(format!("registry-install-{index}").into()))
+                                                    .h(px(18.))
+                                                    .px_2()
+                                                    .flex()
+                                                    .items_center()
+                                                    .rounded(px(3.))
+                                                    .cursor_pointer()
+                                                    .bg(accent.opacity(0.2))
+                                                    .hover(move |this| this.bg(accent.opacity(0.32)))
+                                                    .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                                        this.install_agent(install_id.clone(), cx)
+                                                    }))
+                                                    .text_size(px(9.5))
+                                                    .text_color(foreground)
+                                                    .child(if update { "Update" } else { "Install" }),
+                                            )
+                                        })
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
                     .p_2()
