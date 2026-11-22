@@ -508,15 +508,15 @@ Status of the Tauri shell's features in the native app.
 | Tabs, dirty state, close | yes | yes | — |
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
 | Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc, `Aa` case and `.*` regex toggles | — |
-| Replace in files | yes | Replace All over the search results, Documents-backed | P2 (preview, per-match replace) |
+| Replace in files | yes | Replace All over the search results, Documents-backed; per-match Replace on each result row with a replacement preview | — |
 | Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
-| Menu bar | native `menu.rs` (1.6k lines) | 6 menus, core actions | P2 (full menu set) |
+| Menu bar | native `menu.rs` (1.6k lines) | 9 menus (File, Edit, View, Navigate, Refactor, Git, Run, Debug, Help) with the actions the native workbench implements | P2 (remaining native-only entries) |
 | Command palette | yes | yes (13 commands) | grows with actions |
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
 | Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions, `Shift+F6` rename, Locate Duplicates, Search Structurally (patterns, replacement, Replace All), Structure view (symbol tree of the open buffer) | — |
-| Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
+| Search (find in path, replace) | yes | find in path with regex / case / whole-word / context (comments, strings) filters, include/exclude masks, replace preview and per-match replace | — |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, stage by hunk, commit | — |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop, gutter breakpoint marks | — |

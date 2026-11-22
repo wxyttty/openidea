@@ -62,6 +62,12 @@ gpui_kit::actions!(
         ShowStructural,
         ShowStructure,
         ShowSsh,
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        SelectAll,
     ]
 );
 
@@ -81,6 +87,12 @@ pub fn install(cx: &mut App) {
     bind("secondary-o", Box::new(OpenProject));
     bind("secondary-s", Box::new(SaveFile));
     bind("secondary-w", Box::new(CloseTab));
+    bind("secondary-z", Box::new(Undo));
+    bind("secondary-shift-z", Box::new(Redo));
+    bind("secondary-x", Box::new(Cut));
+    bind("secondary-c", Box::new(Copy));
+    bind("secondary-v", Box::new(Paste));
+    bind("secondary-a", Box::new(SelectAll));
     bind("secondary-shift-p", Box::new(CommandPalette));
     bind("secondary-p", Box::new(QuickOpen));
     bind("secondary-shift-f", Box::new(FindInPath));

@@ -33,6 +33,68 @@ struct SearchRow {
     col: u32,
     preview: String,
     count: usize,
+    /// The replacement preview for a hit (the query text with the replacement).
+    replacement: Option<String>,
+}
+
+/// The fields of IDEA's search bar: what to match, where it may lie, and which
+/// files to consider.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    pub is_regex: bool,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    /// Only in / only outside comments and strings.
+    pub context: SearchContext,
+    /// Whitespace-separated file masks (`*.rs`, `src/**`, `!*.test.ts`).
+    pub include: String,
+    pub exclude: String,
+}
+
+impl SearchOptions {
+    /// The backend query for `pattern` under these options.
+    pub fn query(&self, pattern: String) -> SearchQuery {
+        SearchQuery {
+            pattern,
+            is_regex: self.is_regex,
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            include: split_masks(&self.include),
+            exclude: split_masks(&self.exclude),
+            scope: SearchScope::Project,
+            max_matches: 10_000,
+            context: self.context,
+        }
+    }
+}
+
+/// The line text with the current query's ranges replaced, for the result row's
+/// preview of what Replace would do.
+pub fn replace_in_line(text: &str, ranges: &[(usize, usize)], replacement: &str) -> String {
+    if ranges.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, len) in ranges {
+        let start = (*start).min(text.len());
+        let end = (start + *len).min(text.len());
+        if start < cursor || start >= text.len() {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(replacement);
+        cursor = end;
+    }
+    out.push_str(&text[cursor.min(text.len())..]);
+    out
+}
+
+/// Splits a mask field into entries. A `!` prefix marks an exclusion, which the
+/// backend takes from the exclude list; `SearchOptions::query` keeps the two
+/// lists separate, so this only trims and drops blanks.
+fn split_masks(masks: &str) -> Vec<String> {
+    masks.split_whitespace().map(|mask| mask.trim_start_matches('!').to_owned()).filter(|mask| !mask.is_empty()).collect()
 }
 
 pub struct SearchPanel {
@@ -45,6 +107,13 @@ pub struct SearchPanel {
     running: bool,
     truncated: bool,
     message: Option<SharedString>,
+    /// Search options: regex, case, whole word, context, include/exclude masks.
+    options: SearchOptions,
+    /// Per-match replacements already applied from the results list.
+    replaced_files: std::collections::HashSet<(PathBuf, u32, u32)>,
+    /// The include / exclude mask fields.
+    include: Entity<InputState>,
+    exclude: Entity<InputState>,
     cancel: CancellationToken,
     generation: u64,
     focus_handle: FocusHandle,
@@ -77,6 +146,10 @@ impl SearchPanel {
             running: false,
             truncated: false,
             message: None,
+            options: SearchOptions::default(),
+            replaced_files: std::collections::HashSet::new(),
+            include: cx.new(|cx| InputState::new(window, cx).placeholder("File masks, e.g. *.rs src/**")),
+            exclude: cx.new(|cx| InputState::new(window, cx).placeholder("Exclude, e.g. *.test.ts")),
             cancel: CancellationToken::new(),
             generation: 0,
             request_task: None,
@@ -126,17 +199,7 @@ impl SearchPanel {
         tracing::debug!(pattern = %self.query.read(cx).value(), "search started");
         let (tx, mut rx) = unbounded::<FileMatches>();
         let root = project.root.clone();
-        let query = SearchQuery {
-            pattern,
-            is_regex: false,
-            case_sensitive: false,
-            whole_word: false,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            scope: SearchScope::Project,
-            max_matches: 10_000,
-            context: SearchContext::Any,
-        };
+        let query = self.options.query(pattern);
         std::thread::Builder::new()
             .name("openidea-search".into())
             .spawn(move || {
@@ -180,6 +243,107 @@ impl SearchPanel {
         .detach();
     }
 
+    /// The current search options.
+    pub fn options(&self) -> &SearchOptions {
+        &self.options
+    }
+
+    /// Toggles one option and re-runs the search when there already is a
+    /// pattern, so the result list always matches the bar.
+    pub fn set_option(&mut self, update: impl FnOnce(&mut SearchOptions), cx: &mut Context<Self>) {
+        update(&mut self.options);
+        if !self.query.read(cx).value().trim().is_empty() {
+            self.run(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Sets the file masks (include and exclude) and re-runs.
+    pub fn set_masks(&mut self, include: String, exclude: String, cx: &mut Context<Self>) {
+        self.options.include = include;
+        self.options.exclude = exclude;
+        if !self.query.read(cx).value().trim().is_empty() {
+            self.run(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Replaces one match and leaves every other result alone.
+    ///
+    /// This is what the "Replace" button on a result row does: IDEA's per-match
+    /// replace, the counterpart of Replace All.
+    pub fn replace_match(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        col: u32,
+        replacement: String,
+        cx: &mut Context<Self>,
+    ) {
+        let target = ReplaceTarget { path: ide_core::IpcPath(path.clone()), only: Some(vec![Pos { line, col }]) };
+        let query = self.options.query(self.query.read(cx).value().trim().to_owned());
+        let host = self.host.clone();
+        let summary = Arc::new(std::sync::Mutex::new(None));
+        let (tx, mut rx) = unbounded::<Result<(u32, u32), String>>();
+        self.host.runtime.spawn(async move {
+            let slot = summary.clone();
+            let channel = ide_host::ops::Channel::new(move |event: ReplaceEvent| {
+                if let ReplaceEvent::Done { summary } = event
+                    && let Ok(mut slot) = slot.lock()
+                {
+                    *slot = Some(summary);
+                }
+            });
+            let result = ide_host::ops::search::replace_in_files(
+                &host,
+                "main",
+                RequestId::next(),
+                query,
+                replacement,
+                false,
+                vec![target],
+                channel,
+            )
+            .await
+            .map_err(|err| err.to_string())
+            .map(|()| {
+                summary
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .map(|summary| (summary.replacements, summary.files))
+                    .unwrap_or((0, 0))
+            });
+            let _ = tx.unbounded_send(result);
+        });
+        self.request_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok((count, files)) => {
+                            this.replaced_files.insert((path.clone(), line, col));
+                            this.message = Some(format!("{count} replacement(s) in {files} file(s)").into());
+                        }
+                        Err(err) => this.message = Some(err.into()),
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+        cx.notify();
+    }
+
+    /// The preview text a match would become with the current replacement.
+    pub fn replace_preview(&self, matched: &str, cx: &App) -> String {
+        let replacement = self.replace.read(cx).value().to_string();
+        if replacement.is_empty() {
+            return matched.to_owned();
+        }
+        matched.to_owned().replace(matched, &replacement)
+    }
+
     fn replace_all(&mut self, cx: &mut Context<Self>) {
         let pattern = self.query.read(cx).value().trim().to_owned();
         if pattern.is_empty() {
@@ -193,17 +357,7 @@ impl SearchPanel {
             return;
         }
         let replacement = self.replace.read(cx).value().to_string();
-        let query = SearchQuery {
-            pattern,
-            is_regex: false,
-            case_sensitive: false,
-            whole_word: false,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            scope: SearchScope::Project,
-            max_matches: 10_000,
-            context: SearchContext::Any,
-        };
+        let query = self.options.query(pattern);
         let targets: Vec<ReplaceTarget> = self
             .files
             .iter()
@@ -272,7 +426,7 @@ impl SearchPanel {
         cx.notify();
     }
 
-    fn rows(&self) -> Vec<SearchRow> {
+    fn rows(&self, replacement: Option<&str>) -> Vec<SearchRow> {
         let mut rows = Vec::new();
         for file in &self.files {
             rows.push(SearchRow {
@@ -283,6 +437,7 @@ impl SearchPanel {
                 col: 0,
                 preview: String::new(),
                 count: file.matches.len(),
+                replacement: None,
             });
             for hit in &file.matches {
                 rows.push(SearchRow {
@@ -293,6 +448,11 @@ impl SearchPanel {
                     col: hit.ranges.first().map(|(start, _)| *start).unwrap_or(0),
                     preview: hit.text.clone(),
                     count: 0,
+                    replacement: replacement.map(|replacement| {
+                        let ranges: Vec<(usize, usize)> =
+                            hit.ranges.iter().map(|(start, len)| (*start as usize, *len as usize)).collect();
+                        replace_in_line(&hit.text, &ranges, replacement)
+                    }),
                 });
             }
         }
@@ -309,7 +469,11 @@ impl Focusable for SearchPanel {
 impl Render for SearchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let rows = Rc::new(self.rows());
+        let replacement = {
+            let value = self.replace.read(cx).value().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        let rows = Rc::new(self.rows(replacement.as_deref()));
         let total_matches: usize = self.files.iter().map(|f| f.matches.len()).sum();
         let summary = if self.running {
             format!("Searching… {} files, {total_matches} matches", self.files.len())
@@ -332,6 +496,12 @@ impl Render for SearchPanel {
         let list_rows = rows.clone();
         let list_theme = theme.clone();
         let on_open = on_open.clone();
+        let on_replace: Rc<dyn Fn((PathBuf, u32, u32), &mut Window, &mut App)> =
+            Rc::new(cx.processor(|this: &mut Self, (path, line, col): (PathBuf, u32, u32), _window, cx| {
+                let replacement = this.replace.read(cx).value().to_string();
+                this.replace_match(path, line, col, replacement, cx);
+            }));
+        let replaced = self.replaced_files.clone();
 
         div()
             .size_full()
@@ -385,6 +555,7 @@ impl Render for SearchPanel {
                             .child("Replace All"),
                     ),
             )
+            .child(option_row(self, &theme, cx))
             .child(
                 div()
                     .flex_1()
@@ -404,7 +575,13 @@ impl Render for SearchPanel {
                     .when(!rows.is_empty(), |this| {
                         this.child(
                             uniform_list("search-results", list_rows.len(), move |range, _window, _cx| {
-                                range.map(|index| render_row(&list_rows[index], &list_theme, on_open.clone())).collect()
+                                range
+                                    .map(|index| {
+                                        let row = &list_rows[index];
+                                        let is_replaced = replaced.contains(&(row.path.clone(), row.line, row.col));
+                                        render_row(row, &list_theme, on_open.clone(), on_replace.clone(), is_replaced)
+                                    })
+                                    .collect()
                             })
                             .size_full(),
                         )
@@ -413,10 +590,115 @@ impl Render for SearchPanel {
     }
 }
 
+/// The option row under the search fields: regex, case, whole word, context and
+/// the include/exclude masks, each a chip that re-runs the search.
+fn option_row(panel: &mut SearchPanel, theme: &gpui_kit::component::Theme, cx: &mut Context<SearchPanel>) -> AnyElement {
+    let hover = theme.list_hover;
+    let chip = |id: &'static str,
+                label: &'static str,
+                active: bool,
+                theme: &gpui_kit::component::Theme,
+                hover: Hsla|
+     -> gpui_kit::Stateful<gpui_kit::Div> {
+        div()
+            .id(id)
+            .h(px(18.))
+            .px_1()
+            .flex()
+            .items_center()
+            .rounded(px(3.))
+            .cursor_pointer()
+            .when(active, |this| this.bg(theme.accent.opacity(0.22)))
+            .hover(move |this| this.bg(hover))
+            .text_size(px(9.5))
+            .text_color(if active { theme.foreground } else { theme.fg_muted() })
+            .child(label)
+    };
+    let regex = panel.options.is_regex;
+    let case = panel.options.case_sensitive;
+    let word = panel.options.whole_word;
+    let context = panel.options.context;
+    let include = panel.options.include.clone();
+    let exclude = panel.options.exclude.clone();
+
+    div()
+        .id("search-options")
+        .px_2()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            chip("search-regex", ".*", regex, theme, hover)
+                .on_click(cx.listener(|this: &mut SearchPanel, _: &ClickEvent, _window, cx| {
+                    this.set_option(|options| options.is_regex = !options.is_regex, cx)
+                })),
+        )
+        .child(
+            chip("search-case", "Aa", case, theme, hover)
+                .on_click(cx.listener(|this: &mut SearchPanel, _: &ClickEvent, _window, cx| {
+                    this.set_option(|options| options.case_sensitive = !options.case_sensitive, cx)
+                })),
+        )
+        .child(
+            chip("search-word", "Word", word, theme, hover)
+                .on_click(cx.listener(|this: &mut SearchPanel, _: &ClickEvent, _window, cx| {
+                    this.set_option(|options| options.whole_word = !options.whole_word, cx)
+                })),
+        )
+        .child(
+            chip("search-context", context_label(context), context != SearchContext::Any, theme, hover)
+                .on_click(cx.listener(|this: &mut SearchPanel, _: &ClickEvent, _window, cx| {
+                    this.set_option(|options| options.context = next_context(options.context), cx)
+                })),
+        )
+        .child(div().flex_1())
+        .child(div().w(px(160.)).child(Input::new(&panel.include).text_size(px(10.))))
+        .child(div().w(px(120.)).child(Input::new(&panel.exclude).text_size(px(10.))))
+        .child(
+            chip("search-masks", "Apply", false, theme, hover).on_click(cx.listener(
+                |this: &mut SearchPanel, _: &ClickEvent, _window, cx| {
+                    let include = this.include.read(cx).value().to_string();
+                    let exclude = this.exclude.read(cx).value().to_string();
+                    this.set_masks(include, exclude, cx);
+                },
+            )),
+        )
+        .into_any_element()
+}
+
+/// The label for a search context filter.
+pub fn context_label(context: SearchContext) -> &'static str {
+    match context {
+        SearchContext::Any => "Anywhere",
+        SearchContext::InComments => "In comments",
+        SearchContext::InStringLiterals => "In strings",
+        SearchContext::ExceptComments => "Not comments",
+        SearchContext::ExceptStringLiterals => "Not strings",
+        SearchContext::ExceptCommentsAndStringLiterals => "Plain code",
+    }
+}
+
+/// The next context filter, in IDEA's order.
+pub fn next_context(context: SearchContext) -> SearchContext {
+    match context {
+        SearchContext::Any => SearchContext::InComments,
+        SearchContext::InComments => SearchContext::InStringLiterals,
+        SearchContext::InStringLiterals => SearchContext::ExceptComments,
+        SearchContext::ExceptComments => SearchContext::ExceptStringLiterals,
+        SearchContext::ExceptStringLiterals => SearchContext::ExceptCommentsAndStringLiterals,
+        SearchContext::ExceptCommentsAndStringLiterals => SearchContext::Any,
+    }
+}
+
 fn render_row(
     row: &SearchRow,
     theme: &gpui_kit::component::Theme,
     on_open: Rc<dyn Fn((PathBuf, u32, u32), &mut Window, &mut App)>,
+    on_replace: Rc<dyn Fn((PathBuf, u32, u32), &mut Window, &mut App)>,
+    replaced: bool,
 ) -> AnyElement {
     if row.header {
         return div()
@@ -436,6 +718,8 @@ fn render_row(
     let line = row.line;
     let col = row.col;
     let preview = row.preview.clone();
+    let replace_path = row.path.clone();
+    let hover = theme.list_hover;
     div()
         .id(ElementId::Name(format!("search-hit-{}-{}", path.display(), line).into()))
         .h(px(22.))
@@ -445,9 +729,51 @@ fn render_row(
         .items_center()
         .gap_2()
         .cursor_pointer()
-        .hover(move |this| this.bg(theme.list_hover))
+        .hover(move |this| this.bg(hover))
         .on_click(move |_: &ClickEvent, window, cx| on_open((path.clone(), line, col), window, cx))
         .child(div().w(px(36.)).text_size(px(10.5)).text_color(theme.fg_muted()).child(format!("{}", line + 1)))
-        .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.foreground).child(preview))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(11.5))
+                .text_color(if replaced { theme.fg_muted() } else { theme.foreground })
+                .child(preview),
+        )
+        .when_some(row.replacement.clone(), |this, replacement| {
+            this.child(
+                div()
+                    .max_w(px(220.))
+                    .truncate()
+                    .text_size(px(10.5))
+                    .text_color(theme.success)
+                    .child(replacement),
+            )
+        })
+        .when(replaced, |this| {
+            this.child(div().text_size(px(9.5)).text_color(theme.success).child("replaced"))
+        })
+        .when(!replaced, |this| {
+            this.child(
+                div()
+                    .id(ElementId::Name(format!("search-replace-{}-{}", replace_path.display(), line).into()))
+                    .h(px(18.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.border)
+                    .hover(move |this| this.bg(hover))
+                    .on_click(move |_: &ClickEvent, window, cx| {
+                        on_replace((replace_path.clone(), line, col), window, cx)
+                    })
+                    .text_size(px(9.5))
+                    .text_color(theme.fg_secondary())
+                    .child("Replace"),
+            )
+        })
         .into_any_element()
 }

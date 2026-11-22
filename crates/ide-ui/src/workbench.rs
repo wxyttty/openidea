@@ -63,23 +63,36 @@ pub struct WorkbenchConfig {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuKind {
     File,
+    Edit,
     View,
     Navigate,
+    Refactor,
     Git,
     Run,
     Debug,
     Help,
 }
 
-const MENU_KINDS: [MenuKind; 7] =
-    [MenuKind::File, MenuKind::View, MenuKind::Navigate, MenuKind::Git, MenuKind::Run, MenuKind::Debug, MenuKind::Help];
+const MENU_KINDS: [MenuKind; 9] = [
+    MenuKind::File,
+    MenuKind::Edit,
+    MenuKind::View,
+    MenuKind::Navigate,
+    MenuKind::Refactor,
+    MenuKind::Git,
+    MenuKind::Run,
+    MenuKind::Debug,
+    MenuKind::Help,
+];
 
 impl MenuKind {
     fn label(self) -> &'static str {
         match self {
             MenuKind::File => "File",
+            MenuKind::Edit => "Edit",
             MenuKind::View => "View",
             MenuKind::Navigate => "Navigate",
+            MenuKind::Refactor => "Refactor",
             MenuKind::Git => "Git",
             MenuKind::Run => "Run",
             MenuKind::Debug => "Debug",
@@ -94,6 +107,12 @@ enum Cmd {
     RecentProjects,
     GoToLine,
     FindInEditor,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -181,7 +200,6 @@ const VIEW_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Notifications", shortcut: None, cmd: Cmd::ShowNotifications },
     MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
-    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Zoom In", shortcut: None, cmd: Cmd::ZoomIn },
@@ -194,7 +212,6 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
     MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
-    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
     MenuEntry { label: "Find in Path…", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
@@ -203,10 +220,27 @@ const NAVIGATE_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Previous Tab", shortcut: Some("Ctrl+Shift+Tab"), cmd: Cmd::PrevTab },
 ];
 
+const EDIT_MENU: &[MenuEntry] = &[
+    MenuEntry { label: "Undo", shortcut: Some("Ctrl+Z"), cmd: Cmd::Undo },
+    MenuEntry { label: "Redo", shortcut: Some("Ctrl+Shift+Z"), cmd: Cmd::Redo },
+    MenuEntry { label: "Cut", shortcut: Some("Ctrl+X"), cmd: Cmd::Cut },
+    MenuEntry { label: "Copy", shortcut: Some("Ctrl+C"), cmd: Cmd::Copy },
+    MenuEntry { label: "Paste", shortcut: Some("Ctrl+V"), cmd: Cmd::Paste },
+    MenuEntry { label: "Select All", shortcut: Some("Ctrl+A"), cmd: Cmd::SelectAll },
+    MenuEntry { label: "Find in File", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
+    MenuEntry { label: "Find in Path", shortcut: Some("Ctrl+Shift+F"), cmd: Cmd::FindInPath },
+];
+
+const REFACTOR_MENU: &[MenuEntry] = &[
+    MenuEntry { label: "Rename Symbol", shortcut: Some("Shift+F6"), cmd: Cmd::Rename },
+    MenuEntry { label: "Show Context Actions", shortcut: Some("Alt+Enter"), cmd: Cmd::Intentions },
+    MenuEntry { label: "Locate Duplicates…", shortcut: None, cmd: Cmd::ShowDuplicates },
+    MenuEntry { label: "Search Structurally…", shortcut: None, cmd: Cmd::ShowStructural },
+    MenuEntry { label: "Structure…", shortcut: None, cmd: Cmd::ShowStructure },
+];
+
 const GIT_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Show Git Tool Window", shortcut: None, cmd: Cmd::ShowVcs },
-    MenuEntry { label: "Show Notebook", shortcut: Some("Alt+8"), cmd: Cmd::ShowNotebook },
-    MenuEntry { label: "Show Agents", shortcut: Some("Alt+9"), cmd: Cmd::ShowAgents },
     MenuEntry { label: "Refresh Status", shortcut: None, cmd: Cmd::RefreshVcs },
 ];
 
@@ -304,6 +338,8 @@ fn menu_entries(kind: MenuKind) -> &'static [MenuEntry] {
         MenuKind::File => FILE_MENU,
         MenuKind::View => VIEW_MENU,
         MenuKind::Navigate => NAVIGATE_MENU,
+        MenuKind::Edit => EDIT_MENU,
+        MenuKind::Refactor => REFACTOR_MENU,
         MenuKind::Git => GIT_MENU,
         MenuKind::Run => RUN_MENU,
         MenuKind::Debug => DEBUG_MENU,
@@ -319,7 +355,6 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Settings…", shortcut: Some("Ctrl+Alt+S"), cmd: Cmd::Settings },
     MenuEntry { label: "Go to Line…", shortcut: Some("Ctrl+G"), cmd: Cmd::GoToLine },
     MenuEntry { label: "Find in File…", shortcut: Some("Ctrl+F"), cmd: Cmd::FindInEditor },
-    MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Plugins…", shortcut: None, cmd: Cmd::Plugins },
     MenuEntry { label: "Float Tool Window", shortcut: None, cmd: Cmd::FloatBottom },
     MenuEntry { label: "Dock Tool Window", shortcut: None, cmd: Cmd::DockBottom },
@@ -1386,6 +1421,12 @@ impl Workbench {
                     http.run_current(cx);
                 });
             }
+            Cmd::Undo => self.dispatch_editor(&gpui_kit::base::input::Undo, window, cx),
+            Cmd::Redo => self.dispatch_editor(&gpui_kit::base::input::Redo, window, cx),
+            Cmd::Cut => self.dispatch_editor(&gpui_kit::base::input::Cut, window, cx),
+            Cmd::Copy => self.dispatch_editor(&gpui_kit::base::input::Copy, window, cx),
+            Cmd::Paste => self.dispatch_editor(&gpui_kit::base::input::Paste, window, cx),
+            Cmd::SelectAll => self.dispatch_editor(&gpui_kit::base::input::SelectAll, window, cx),
             Cmd::ToggleBreakpoint => self.toggle_breakpoint(cx),
             Cmd::ViewBreakpoints => {
                 self.breakpoints_open = true;
@@ -1658,6 +1699,18 @@ impl Workbench {
                 self.status = format!("Cannot save {key}: {err}").into();
             }
         }
+    }
+
+    /// Sends an editor action (Undo, Copy, …) to the focused editor.
+    ///
+    /// The Edit menu dispatches through here: the actions are the editor's own,
+    /// so a menu click and the keystroke do exactly the same thing. Without an
+    /// editor focus (or with no tab open) the action simply does nothing.
+    fn dispatch_editor(&mut self, action: &dyn gpui_kit::Action, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        focus.dispatch_action(action, window, cx);
+        cx.notify();
     }
 
     /// Runs the `.http` request the caret is in (what the gutter run mark and
@@ -4179,6 +4232,12 @@ impl Render for Workbench {
                 cx.listener(|this, _: &ShowStructure, window, cx| this.run(Cmd::ShowStructure, window, cx)),
             )
             .on_action(cx.listener(|this, _: &ShowSsh, window, cx| this.run(Cmd::ShowSsh, window, cx)))
+            .on_action(cx.listener(|this, _: &Undo, window, cx| this.run(Cmd::Undo, window, cx)))
+            .on_action(cx.listener(|this, _: &Redo, window, cx| this.run(Cmd::Redo, window, cx)))
+            .on_action(cx.listener(|this, _: &Cut, window, cx| this.run(Cmd::Cut, window, cx)))
+            .on_action(cx.listener(|this, _: &Copy, window, cx| this.run(Cmd::Copy, window, cx)))
+            .on_action(cx.listener(|this, _: &Paste, window, cx| this.run(Cmd::Paste, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, window, cx| this.run(Cmd::SelectAll, window, cx)))
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| {
                 if this.find_open {
                     this.find_open = false;
