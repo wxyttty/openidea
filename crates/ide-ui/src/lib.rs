@@ -51,6 +51,7 @@ pub mod ssh;
 pub mod structure;
 pub mod terminal;
 pub mod theme;
+pub mod updater;
 pub mod vcs;
 pub mod workbench;
 

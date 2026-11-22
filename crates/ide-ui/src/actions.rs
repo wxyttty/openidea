@@ -64,6 +64,7 @@ gpui_kit::actions!(
         ShowSsh,
         ShowDeploy,
         ShowRemoteHost,
+        CheckUpdates,
         Undo,
         Redo,
         Cut,

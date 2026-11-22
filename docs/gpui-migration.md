@@ -533,7 +533,7 @@ Status of the Tauri shell's features in the native app.
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom) + floating card with edge docking | P2 (persisted dock layout) |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder; commands listed in the command palette and run through `PluginHost::run_command`; `insertText`/`replaceSelection` reach the editor at the caret; plugin notifications land in the Notifications log | P2 (marketplace) |
 | Multi-window / window groups | yes | multi-window: File › New Window opens a second workbench with its own project slot (`window-N`), editor state and event subscription; the bridge fans backend events out to every window and drops closed ones. Window groups (drag a tab between windows) not implemented | P3 (window groups) |
-| Updater, single instance, window-state | yes | single instance (a second launch forwards its project/file to the running window over a socket and exits) and window state (geometry restored from `ui.json`, saved on move/resize); updater still pending | P3 (updater) |
+| Updater, single instance, window-state | yes | single instance (a second launch forwards its project/file to the running window over a socket and exits), window state (geometry restored from `ui.json`, saved on move/resize), and Help › Check for Updates (reads the GitHub release feed of `OPENIDEA_UPDATE_REPO`, compares versions including prerelease ordering, names the asset for this platform; installing stays a manual download) | — |
 | Playwright e2e | yes | no | P2 (`gpui_kit::test`) |
 
 Rough size of what remains: the TypeScript UI is ~267k lines across 400 `.tsx`

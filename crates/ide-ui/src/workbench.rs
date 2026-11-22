@@ -179,6 +179,7 @@ enum Cmd {
     ShowSsh,
     ShowDeploy,
     ShowRemoteHost,
+    CheckUpdates,
     NewWindow,
     Quit,
 }
@@ -286,7 +287,10 @@ const DEBUG_MENU: &[MenuEntry] = &[
     MenuEntry { label: "Run HTTP Request at Caret", shortcut: Some("Ctrl+Alt+R"), cmd: Cmd::RunHttpAtCaret },
 ];
 
-const HELP_MENU: &[MenuEntry] = &[MenuEntry { label: "About OpenIDEA", shortcut: None, cmd: Cmd::About }];
+const HELP_MENU: &[MenuEntry] = &[
+    MenuEntry { label: "About OpenIDEA", shortcut: None, cmd: Cmd::About },
+    MenuEntry { label: "Check for Updates…", shortcut: None, cmd: Cmd::CheckUpdates },
+];
 
 fn parse_goto(text: &str) -> Option<(u32, u32)> {
     let mut parts = text.split(':');
@@ -1199,6 +1203,46 @@ impl Workbench {
         &self.notifications
     }
 
+    /// Checks the configured release feed and reports the result in the status
+    /// bar (plus a notification when a newer build exists).
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.status = "Checking for updates…".into();
+        let host = self.host.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.host.runtime.spawn(async move {
+            let result = crate::updater::check_configured().await.map_err(|err| err.to_string());
+            let _ = tx.unbounded_send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(result) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = match result {
+                        Ok(crate::updater::Check::UpToDate) => "OpenIDEA is up to date".into(),
+                        Ok(crate::updater::Check::Unconfigured) => {
+                            "No update feed configured (set OPENIDEA_UPDATE_REPO)".into()
+                        }
+                        Ok(crate::updater::Check::Available(release)) => {
+                            let asset = crate::updater::asset_for(
+                                &release.assets,
+                                std::env::consts::OS,
+                                std::env::consts::ARCH,
+                            );
+                            let detail = asset
+                                .map(|asset| format!(" · {}", asset.name))
+                                .unwrap_or_default();
+                            format!("OpenIDEA {} is available{}", release.version(), detail).into()
+                        }
+                        Err(err) => format!("Update check failed: {err}").into(),
+                    };
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        let _ = host;
+        cx.notify();
+    }
+
     /// Opens a second window over the same backend: its own project slot, its
     /// own editor state and its own event subscription, like a second IDEA
     /// window. The window keeps the geometry and theme of this one.
@@ -1742,6 +1786,7 @@ impl Workbench {
                 self.bottom = BottomTab::RemoteHost;
                 cx.notify();
             }
+            Cmd::CheckUpdates => self.check_for_updates(cx),
             Cmd::NewWindow => self.open_new_window(window, cx),
             Cmd::Quit => cx.quit(),
         }
@@ -4698,6 +4743,9 @@ impl Render for Workbench {
             )
             .on_action(
                 cx.listener(|this, _: &ShowRemoteHost, window, cx| this.run(Cmd::ShowRemoteHost, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CheckUpdates, window, cx| this.run(Cmd::CheckUpdates, window, cx)),
             )
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.run(Cmd::Undo, window, cx)))
             .on_action(cx.listener(|this, _: &Redo, window, cx| this.run(Cmd::Redo, window, cx)))
