@@ -509,12 +509,12 @@ Status of the Tauri shell's features in the native app.
 | Go to File / Line | yes | Ctrl+P, Ctrl+G (line[:column]) | — |
 | Find in file | yes | Ctrl+F bar, count, next/prev, highlight all, Esc, `Aa` case and `.*` regex toggles | — |
 | Replace in files | yes | Replace All over the search results, Documents-backed; per-match Replace on each result row with a replacement preview | — |
-| Editor zoom | yes | View menu, persisted `editor.fontSize` | P2 (keybindings) |
+| Editor zoom | yes | View menu + Ctrl+= / Ctrl+- / Ctrl+0, persisted `editor.fontSize` | — |
 | Menu bar | native `menu.rs` (1.6k lines) | 9 menus (File, Edit, View, Navigate, Refactor, Git, Run, Debug, Help) with the actions the native workbench implements | P2 (remaining native-only entries) |
 | Command palette | yes | yes (13 commands) | grows with actions |
 | Status bar | yes | language/encoding/line ending/dirty/messages | P1 |
 | Light/dark + 7 palettes | yes | all 7 + Appearance dialog + persistence | — |
-| LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
+| LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers; the completion and hover popups are `gpui-base`'s own (theme-aware, keyboard-navigable) | — |
 | Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions, `Shift+F6` rename, Locate Duplicates, Search Structurally (patterns, replacement, Replace All), Structure view (symbol tree of the open buffer) | — |
 | Search (find in path, replace) | yes | find in path with regex / case / whole-word / context (comments, strings) filters, include/exclude masks, replace preview and per-match replace | — |
 | VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, stage by hunk, commit | — |
@@ -528,7 +528,7 @@ Status of the Tauri shell's features in the native app.
 | HTTP client | yes | fields, `.http` files with block/env selectors, history, editor auto-load + run-at-caret, response body save, gutter run marks per request line, streaming body shown live while a response arrives | — |
 | Notebooks, agents | yes | no | P3 |
 | Plugins (WASM), remote dev, SSH/SFTP | yes | SSH tool window (configurations, connect/test/disconnect with live session state); Deployment tool window (server picker, upload file / upload project / download file / compare with per-file sync status, reports as cancellable background tasks); Remote Host tool window (browse a deployment server's files, open a remote file's cached copy) | — |
-| Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, Keymap editor (every bound command, current shortcut, rebind/unbind written to `keymapOverrides`), theme, paths | P2 (full field coverage) |
+| Settings windows | yes | sectioned tree: editor/terminal sizes, tab size, soft-wrap/insert-spaces/format-on-save/copy-on-selection toggles, Keymap editor, theme, paths, plus **All settings (JSON)** — every effective setting as an editable tree, saveable section by section so no field is unreachable | — |
 | Panel resizing / layout persistence | yes | drag splitters, per-tab heights in `ui.json` | — |
 | Dockable/floating tool windows, drag-to-split | yes | bottom `DockArea` (shared tabs, drag between groups, zoom, pane tree persisted into `ui.json` › `layout.dock` and restored unless the saved version is incompatible) + floating card with edge docking | — |
 | Plugins (WASM) | yes | native dialog: list/status, enable/disable, reload, remove, install from folder; commands listed in the command palette and run through `PluginHost::run_command`; `insertText`/`replaceSelection` reach the editor at the caret; plugin notifications land in the Notifications log | P2 (marketplace) |

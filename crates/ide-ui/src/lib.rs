@@ -31,6 +31,7 @@ pub mod deploy;
 pub mod diff;
 pub mod duplicates;
 pub mod editor;
+pub mod editor_input;
 pub mod events;
 pub mod highlights;
 pub mod http;

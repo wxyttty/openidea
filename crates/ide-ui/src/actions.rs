@@ -65,6 +65,9 @@ gpui_kit::actions!(
         ShowDeploy,
         ShowRemoteHost,
         CheckUpdates,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         Undo,
         Redo,
         Cut,
@@ -128,6 +131,9 @@ pub fn install(cx: &mut App) {
     bind("escape", Box::new(CloseFind));
     bind("alt-enter", Box::new(Intentions));
     bind("alt-shift-f6", Box::new(Rename));
+    bind("secondary-equal", Box::new(ZoomIn));
+    bind("secondary-minus", Box::new(ZoomOut));
+    bind("secondary-0", Box::new(ZoomReset));
     cx.bind_keys(bindings);
 
     // Editor-local bindings. `gpui-base` implements multi-cursor (Alt+click,

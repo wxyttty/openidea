@@ -573,6 +573,9 @@ enum SettingsSection {
     Keymap,
     Appearance,
     General,
+    /// Every effective setting as editable JSON (covers the sections that have
+    /// no dedicated page).
+    AllSettings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -656,6 +659,8 @@ pub struct Workbench {
     /// The shared event bridge, so a new window can subscribe.
     bridge: crate::events::EventBridge,
     window_state: crate::layout::WindowState,
+    /// The "All settings (JSON)" editor.
+    settings_json: Entity<crate::editor_input::JsonEditor>,
     /// Titles the user suppressed with "Don't Show Again".
     suppressed: crate::notifications::Suppressed,
     /// The shortcut dialog (Settings › Keymap).
@@ -944,6 +949,7 @@ impl Workbench {
             find_options: FindOptions::default(),
             settings_open: false,
             suppressed: Default::default(),
+            settings_json: cx.new(|cx| crate::editor_input::JsonEditor::new(window, cx)),
             window_name: "main".to_owned(),
             bridge: config.bridge.clone(),
             window_state,
@@ -1228,6 +1234,48 @@ impl Workbench {
     /// The notification history (the Notifications tool window's state).
     pub fn notifications(&self) -> &Entity<NotificationLog> {
         &self.notifications
+    }
+
+    /// Writes the JSON settings editor's contents into the settings file, key by
+    /// key: only keys that actually changed are persisted, so a save cannot
+    /// silently rewrite unrelated values.
+    fn save_settings_json(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.settings_json.read(cx).text(cx);
+        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.status = format!("Settings are not valid JSON: {err}").into();
+                let focus = self.settings_json.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+                cx.notify();
+                return;
+            }
+        };
+        let current = match &self.project {
+            Some(project) => project.settings.effective(),
+            None => self.host.global_settings.effective(),
+        };
+        let current = serde_json::to_value(&current).unwrap_or(serde_json::Value::Null);
+        let Some(sections) = parsed.as_object() else {
+            self.status = "Settings must be a JSON object".into();
+            cx.notify();
+            return;
+        };
+        let mut written = 0usize;
+        for (section, value) in sections {
+            let before = current.get(section).cloned().unwrap_or(serde_json::Value::Null);
+            if &before == value {
+                continue;
+            }
+            self.persist_setting(section, value.clone());
+            written += 1;
+        }
+        self.status = if written == 0 {
+            "Settings unchanged".into()
+        } else {
+            format!("Wrote {written} settings section(s)").into()
+        };
+        cx.notify();
     }
 
     /// Checks the configured release feed and reports the result in the status
@@ -1760,6 +1808,14 @@ impl Workbench {
             }
             Cmd::Settings => {
                 self.settings_open = true;
+                // Seed the JSON page with the effective settings; the page reads
+                // it when the user switches to it.
+                let settings = match &self.project {
+                    Some(project) => project.settings.effective(),
+                    None => self.host.global_settings.effective(),
+                };
+                let text = serde_json::to_string_pretty(&settings).unwrap_or_default();
+                self.settings_json.update(cx, |editor, cx| editor.set_text(text, window, cx));
                 cx.notify();
             }
             Cmd::Appearance => {
@@ -3449,6 +3505,7 @@ impl Render for Workbench {
                 (SettingsSection::Keymap, "Keymap"),
                 (SettingsSection::Appearance, "Appearance"),
                 (SettingsSection::General, "General"),
+                (SettingsSection::AllSettings, "All settings (JSON)"),
             ] {
                 let selected = self.settings_section == section;
                 let hover = list_hover;
@@ -3631,6 +3688,47 @@ impl Render for Workbench {
                         );
                     }
                     pane = pane.child(list);
+                }
+                SettingsSection::AllSettings => {
+                    // The whole effective settings tree, editable as JSON: every
+                    // field has a UI here even where no dedicated page exists.
+                    let text = serde_json::to_string_pretty(&settings).unwrap_or_default();
+                    let input = self.settings_json.clone();
+                    pane = pane
+                        .child(header("All settings"))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.fg_muted())
+                                .child("Every effective setting. Saving writes the changed keys to the settings file."),
+                        )
+                        .child(
+                            div()
+                                .h(px(320.))
+                                .border_1()
+                                .border_color(theme.border)
+                                .rounded(px(4.))
+                                .child(input),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                div()
+                                    .id("settings-json-save")
+                                    .h(px(24.))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .bg(theme.primary)
+                                    .on_click(cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
+                                        this.save_settings_json(window, cx)
+                                    }))
+                                    .text_size(px(11.))
+                                    .text_color(theme.primary_foreground)
+                                    .child("Save"),
+                            ),
+                        );
                 }
                 SettingsSection::General => {
                     pane = pane
