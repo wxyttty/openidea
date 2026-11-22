@@ -63,6 +63,7 @@ gpui_kit::actions!(
         ShowStructure,
         ShowSsh,
         ShowDeploy,
+        ShowRemoteHost,
         Undo,
         Redo,
         Cut,

@@ -12,6 +12,7 @@ use crate::breakpoints::Breakpoints;
 use crate::db::DbPanel;
 use crate::debug::{DebugAction, DebugPanel};
 use crate::deploy::DeployPanel;
+use crate::remote_host::RemoteHostPanel;
 use crate::diff::DiffPanel;
 use crate::duplicates::DuplicatesPanel;
 use crate::dock::ToolPanel;
@@ -177,6 +178,7 @@ enum Cmd {
     ShowStructure,
     ShowSsh,
     ShowDeploy,
+    ShowRemoteHost,
     NewWindow,
     Quit,
 }
@@ -394,6 +396,7 @@ const PALETTE: &[MenuEntry] = &[
     MenuEntry { label: "Structure…", shortcut: None, cmd: Cmd::ShowStructure },
     MenuEntry { label: "SSH Connections…", shortcut: None, cmd: Cmd::ShowSsh },
     MenuEntry { label: "Deployment…", shortcut: None, cmd: Cmd::ShowDeploy },
+    MenuEntry { label: "Remote Host…", shortcut: None, cmd: Cmd::ShowRemoteHost },
     MenuEntry { label: "Toggle Problems", shortcut: Some("Alt+6"), cmd: Cmd::ToggleProblems },
     MenuEntry { label: "Toggle Terminal", shortcut: Some("Alt+2"), cmd: Cmd::ToggleTerminal },
     MenuEntry { label: "Refresh Project Tree", shortcut: None, cmd: Cmd::RefreshProject },
@@ -420,6 +423,7 @@ enum BottomTab {
     Structure,
     Ssh,
     Deploy,
+    RemoteHost,
     Notifications,
 }
 
@@ -440,6 +444,7 @@ impl BottomTab {
             BottomTab::Structure => "Structure",
             BottomTab::Ssh => "SSH",
             BottomTab::Deploy => "Deployment",
+            BottomTab::RemoteHost => "Remote Host",
             BottomTab::Notifications => "Notifications",
         }
     }
@@ -460,7 +465,8 @@ impl BottomTab {
             BottomTab::Structure => 11,
             BottomTab::Ssh => 12,
             BottomTab::Deploy => 13,
-            BottomTab::Notifications => 14,
+            BottomTab::RemoteHost => 14,
+            BottomTab::Notifications => 15,
         }
     }
 }
@@ -592,6 +598,7 @@ pub struct Workbench {
     structure: Entity<StructurePanel>,
     ssh: Entity<SshPanel>,
     deploy: Entity<DeployPanel>,
+    remote_host: Entity<RemoteHostPanel>,
     /// The bottom tool area: a dock, so panels move between groups and the
     /// layout persists.
     intentions: Entity<IntentionSection>,
@@ -744,6 +751,7 @@ impl Workbench {
         let structure = cx.new(|cx| StructurePanel::new(editor.clone(), host.syntax(), cx));
         let ssh = cx.new(|cx| SshPanel::new(host.clone(), cx));
         let deploy = cx.new(|cx| DeployPanel::new(host.clone(), editor.clone(), cx));
+        let remote_host = cx.new(|cx| RemoteHostPanel::new(host.clone(), editor.clone(), window, cx));
         let rename = cx.new(|cx| RenameDialog::new(window, cx));
         let rename_done = cx.subscribe(&rename, |this: &mut Self, _dialog, _: &RenameDone, cx| {
             this.rename_open = false;
@@ -780,6 +788,8 @@ impl Workbench {
             cx.new(|cx| ToolPanel::new("structure", "Structure", crate::structure::ICON, structure.clone(), cx));
         let ssh_panel = cx.new(|cx| ToolPanel::new("ssh", "SSH", IconName::Cloud, ssh.clone(), cx));
         let deploy_panel = cx.new(|cx| ToolPanel::new("deploy", "Deployment", crate::deploy::ICON, deploy.clone(), cx));
+        let remote_host_panel =
+            cx.new(|cx| ToolPanel::new("remote-host", "Remote Host", crate::remote_host::ICON, remote_host.clone(), cx));
         let dock_panels = vec![
             (BottomTab::Problems, problems_panel.entity_id()),
             (BottomTab::Terminal, terminal_panel.entity_id()),
@@ -795,6 +805,7 @@ impl Workbench {
             (BottomTab::Structure, structure_panel.entity_id()),
             (BottomTab::Ssh, ssh_panel.entity_id()),
             (BottomTab::Deploy, deploy_panel.entity_id()),
+            (BottomTab::RemoteHost, remote_host_panel.entity_id()),
             (BottomTab::Notifications, notifications_panel.entity_id()),
         ]
         .into_iter()
@@ -815,6 +826,7 @@ impl Workbench {
             .panel(structure_panel)
             .panel(ssh_panel)
             .panel(deploy_panel)
+            .panel(remote_host_panel)
             .panel(notifications_panel);
         dock_entity.update(cx, |dock, cx| {
             dock.set_dock(DockPlacement::Bottom, bottom_layout, window, cx);
@@ -868,6 +880,7 @@ impl Workbench {
             structure,
             ssh,
             deploy,
+            remote_host,
             intentions,
             rename,
             rename_open: false,
@@ -1722,6 +1735,11 @@ impl Workbench {
                 self.show_bottom = true;
                 self.bottom = BottomTab::Deploy;
                 self.deploy.update(cx, |panel, cx| panel.reload(cx));
+                cx.notify();
+            }
+            Cmd::ShowRemoteHost => {
+                self.show_bottom = true;
+                self.bottom = BottomTab::RemoteHost;
                 cx.notify();
             }
             Cmd::NewWindow => self.open_new_window(window, cx),
@@ -2610,6 +2628,7 @@ impl Workbench {
             BottomTab::Structure => div().flex_1().min_h_0().child(self.structure.clone()),
             BottomTab::Ssh => div().flex_1().min_h_0().child(self.ssh.clone()),
             BottomTab::Deploy => div().flex_1().min_h_0().child(self.deploy.clone()),
+            BottomTab::RemoteHost => div().flex_1().min_h_0().child(self.remote_host.clone()),
             BottomTab::Notifications => div().flex_1().min_h_0().child(self.notifications.clone()),
         }
         .into_any_element()
@@ -4676,6 +4695,9 @@ impl Render for Workbench {
             .on_action(cx.listener(|this, _: &ShowSsh, window, cx| this.run(Cmd::ShowSsh, window, cx)))
             .on_action(
                 cx.listener(|this, _: &ShowDeploy, window, cx| this.run(Cmd::ShowDeploy, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowRemoteHost, window, cx| this.run(Cmd::ShowRemoteHost, window, cx)),
             )
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.run(Cmd::Undo, window, cx)))
             .on_action(cx.listener(|this, _: &Redo, window, cx| this.run(Cmd::Redo, window, cx)))

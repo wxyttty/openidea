@@ -6831,6 +6831,7 @@ dependencies = [
  "ide-remote",
  "ide-run",
  "ide-search",
+ "ide-ssh",
  "ide-terminal",
  "ide-text",
  "ide-tools",

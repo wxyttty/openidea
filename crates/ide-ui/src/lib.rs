@@ -41,6 +41,7 @@ pub mod lsp;
 pub mod notebook;
 pub mod notifications;
 pub mod problems;
+pub mod remote_host;
 pub mod rename;
 pub mod project_tree;
 pub mod run;

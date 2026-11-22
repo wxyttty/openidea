@@ -10,5 +10,5 @@ pub use deploy::{
     Deployment, DeploymentCoverage, SyncAction, SyncEntry, SyncStatus, SyncStep, TransferReport, coverage,
 };
 pub use mapping::{Excludes, Mappings};
-pub use service::{DeployedPath, RemoteService};
+pub use service::{DeployedPath, RemoteService, server, run_target};
 pub use target::{RemoteRuns, RemoteStart};
