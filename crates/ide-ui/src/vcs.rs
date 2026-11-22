@@ -37,7 +37,21 @@ pub struct VcsPanel {
     upstream: Option<SharedString>,
     repos: usize,
     message: Option<SharedString>,
+    /// Line hunks of the file whose hunks are listed, with its current text.
+    hunks: Vec<HunkRow>,
+    /// The file the hunks belong to.
+    hunk_file: Option<PathBuf>,
     focus_handle: FocusHandle,
+}
+
+/// One line hunk of the inspected file, for the change list.
+#[derive(Clone)]
+struct HunkRow {
+    index: usize,
+    title: SharedString,
+    /// Zero-based first line in the current text (deletions: the following line).
+    start: u32,
+    lines: u32,
 }
 
 impl VcsPanel {
@@ -52,6 +66,8 @@ impl VcsPanel {
             upstream: None,
             repos: 0,
             message: None,
+            hunks: Vec::new(),
+            hunk_file: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -83,6 +99,81 @@ impl VcsPanel {
         match repo.stage(&paths) {
             Ok(()) => self.message = Some(format!("Staged {} files", paths.len()).into()),
             Err(err) => self.message = Some(format!("Stage failed: {err}").into()),
+        }
+        drop(repos);
+        self.refresh(cx);
+    }
+
+    /// Lists the line hunks of `path` (the editor's buffer when open, else the
+    /// file on disk) so the user can stage them one by one.
+    pub fn inspect_hunks(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else { return };
+        let text = self
+            .editor
+            .read(cx)
+            .active_text()
+            .filter(|_| self.editor.read(cx).active_info().is_some_and(|info| info.path == path))
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        let repos = project.repos.read();
+        let Some(repo) = repos.primary() else {
+            self.message = Some("No Git repository".into());
+            cx.notify();
+            return;
+        };
+        match repo.line_hunks(&path, &text, false, encoding_rs::UTF_8) {
+            Ok(hunks) => {
+                self.hunk_file = Some(path);
+                self.hunks = hunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, hunk)| HunkRow {
+                        index,
+                        title: hunk_title(hunk.kind, hunk.start, hunk.lines, hunk.old_lines).into(),
+                        start: hunk.start,
+                        lines: hunk.lines,
+                    })
+                    .collect();
+                self.message = Some(format!("{} hunk(s)", self.hunks.len()).into());
+            }
+            Err(err) => self.message = Some(format!("Cannot read hunks: {err}").into()),
+        }
+        drop(repos);
+        cx.notify();
+    }
+
+    /// Stages exactly the listed hunks of the inspected file.
+    pub fn stage_hunks(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else { return };
+        let Some(path) = self.hunk_file.clone() else { return };
+        if selected.is_empty() {
+            self.message = Some("Select at least one hunk".into());
+            cx.notify();
+            return;
+        }
+        let text = self
+            .editor
+            .read(cx)
+            .active_text()
+            .filter(|_| self.editor.read(cx).active_info().is_some_and(|info| info.path == path))
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        let repos = project.repos.read();
+        let Some(repo) = repos.primary() else {
+            self.message = Some("No Git repository".into());
+            cx.notify();
+            return;
+        };
+        // The backend takes the hunks' indices in the same order `line_hunks`
+        // returned them, which is what `HunkRow::index` holds.
+        let count = selected.len();
+        match repo.stage_hunks(&path, &text, &selected, encoding_rs::UTF_8) {
+            Ok(()) => {
+                self.message = Some(format!("Staged {count} hunk(s)").into());
+                self.hunks.clear();
+                self.hunk_file = None;
+            }
+            Err(err) => self.message = Some(format!("Stage hunk failed: {err}").into()),
         }
         drop(repos);
         self.refresh(cx);
@@ -175,6 +266,10 @@ impl Render for VcsPanel {
         let on_diff: Rc<dyn Fn(PathBuf, &mut Window, &mut App)> =
             Rc::new(cx.processor(|_this: &mut Self, path: PathBuf, _window, cx| {
                 cx.emit(OpenDiffRequest(path));
+            }));
+        let on_hunks: Rc<dyn Fn(PathBuf, &mut Window, &mut App)> =
+            Rc::new(cx.processor(|this: &mut Self, path: PathBuf, _window, cx| {
+                this.inspect_hunks(path, cx);
             }));
         let refresh = cx.listener(|this: &mut Self, _: &ClickEvent, _window, cx| this.refresh(cx));
         let branch_label = self.branch.clone().unwrap_or_else(|| "No branch".into());
@@ -269,11 +364,18 @@ impl Render for VcsPanel {
                         let rows = rows.clone();
                         let on_open = on_open.clone();
                         let on_diff = on_diff.clone();
+                        let on_hunks = on_hunks.clone();
                         this.child(
                             uniform_list("vcs-files", rows.len(), move |range, _window, _cx| {
                                 range
                                     .map(|index| {
-                                        render_row(&rows[index], &list_theme, on_open.clone(), on_diff.clone())
+                                        render_row(
+                                            &rows[index],
+                                            &list_theme,
+                                            on_open.clone(),
+                                            on_diff.clone(),
+                                            on_hunks.clone(),
+                                        )
                                     })
                                     .collect()
                             })
@@ -281,6 +383,89 @@ impl Render for VcsPanel {
                         )
                     }),
             )
+            .when(!self.hunks.is_empty(), |this| {
+                let theme = theme.clone();
+                let hover = theme.list_hover;
+                let all: Vec<usize> = self.hunks.iter().map(|hunk| hunk.index).collect();
+                let stage_all = all.clone();
+                this.child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted)
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.fg_secondary())
+                                        .child(format!(
+                                            "{} · {} change(s)",
+                                            self.hunk_file
+                                                .as_ref()
+                                                .and_then(|path| path.file_name())
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or_default(),
+                                            self.hunks.len()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("vcs-stage-hunks")
+                                        .h(px(18.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .cursor_pointer()
+                                        .bg(theme.accent.opacity(0.22))
+                                        .hover(move |this| this.bg(hover))
+                                        .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                            this.stage_hunks(stage_all.clone(), cx)
+                                        }))
+                                        .text_size(px(9.5))
+                                        .text_color(theme.foreground)
+                                        .child("Stage All Hunks"),
+                                ),
+                        )
+                        .children(self.hunks.iter().map(|hunk| {
+                            let hover = theme.list_hover;
+                            let index = hunk.index;
+                            div()
+                                .id(ElementId::Name(format!("vcs-hunk-{index}").into()))
+                                .h(px(20.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(move |this| this.bg(hover))
+                                .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                    this.stage_hunks(vec![index], cx)
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.foreground)
+                                        .child(hunk.title.clone()),
+                                )
+                                .child(
+                                    div().text_size(px(9.)).text_color(theme.fg_muted()).child("stage"),
+                                )
+                        })),
+                )
+            })
             .when_some(self.message.clone(), |this, message| {
                 this.child(div().px_2().py_1().text_size(px(10.5)).text_color(theme.fg_muted()).child(message))
             })
@@ -328,6 +513,16 @@ impl Render for VcsPanel {
     }
 }
 
+/// The change list's one-line description of a hunk (1-based lines for the
+/// reader, as the editor's line numbers are).
+fn hunk_title(kind: ide_vcs::HunkKind, start: u32, lines: u32, old_lines: u32) -> String {
+    match kind {
+        ide_vcs::HunkKind::Added => format!("+{lines} line(s) at {}", start + 1),
+        ide_vcs::HunkKind::Modified => format!("~{lines} line(s) at {} (was {old_lines})", start + 1),
+        ide_vcs::HunkKind::Deleted => format!("-{old_lines} line(s) after {start}"),
+    }
+}
+
 fn kind_letter(kind: ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Added => "A",
@@ -355,6 +550,7 @@ fn render_row(
     theme: &gpui_kit::component::Theme,
     on_open: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
     on_diff: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
+    on_hunks: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
 ) -> AnyElement {
     let hover = theme.list_hover;
     let shown = row.kind.or(row.staged);
@@ -364,6 +560,7 @@ fn render_row(
     };
     let path = row.path.clone();
     let diff_path = row.path.clone();
+    let hunk_path = row.path.clone();
     div()
         .id(ElementId::Name(format!("vcs-{}", row.rel).into()))
         .h(px(22.))
@@ -381,6 +578,19 @@ fn render_row(
         )
         .child(
             div()
+                .id(ElementId::Name(format!("vcs-hunks-{}", row.rel).into()))
+                .px_2()
+                .py(px(1.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .text_size(px(10.))
+                .text_color(theme.fg_secondary())
+                .hover(move |this| this.bg(hover))
+                .on_click(move |_: &ClickEvent, window, cx| on_hunks(hunk_path.clone(), window, cx))
+                .child("Hunks"),
+        )
+        .child(
+            div()
                 .id(ElementId::Name(format!("vcs-diff-{}", row.rel).into()))
                 .px_2()
                 .py(px(1.))
@@ -393,4 +603,27 @@ fn render_row(
                 .child("Diff"),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod hunk_tests {
+    use super::hunk_title;
+    use ide_vcs::HunkKind;
+
+    #[test]
+    fn hunk_titles_use_one_based_lines_for_additions() {
+        assert_eq!(hunk_title(HunkKind::Added, 0, 3, 0), "+3 line(s) at 1");
+        assert_eq!(hunk_title(HunkKind::Added, 9, 1, 0), "+1 line(s) at 10");
+    }
+
+    #[test]
+    fn modified_hunks_mention_the_original_size() {
+        assert_eq!(hunk_title(HunkKind::Modified, 4, 2, 3), "~2 line(s) at 5 (was 3)");
+    }
+
+    #[test]
+    fn deletions_point_at_the_following_line() {
+        // `start` is the line of the current text that now follows the removal.
+        assert_eq!(hunk_title(HunkKind::Deleted, 7, 0, 4), "-4 line(s) after 7");
+    }
 }

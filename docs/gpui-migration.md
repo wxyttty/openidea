@@ -216,6 +216,11 @@ cargo run -p openidea-gpui -- path/to/file # open the file's project and the fil
 - **Git** tool window: changed files of every repository (`ide-vcs`), status
   letters/colours, refresh on `VcsChanged`, branch in the status bar, and
   *Stage All* / *Commit* controls backed by `Repo::stage` / `Repo::commit`.
+  **Stage by hunk**: a file's *Hunks* button lists its line hunks
+  (`Repo::line_hunks`, one line per change with its size and position); clicking
+  a hunk stages just that one through `Repo::stage_hunks`, and *Stage All Hunks*
+  stages the file's changes together. The working tree keeps the unstaged
+  hunks — only the index changes.
 - **Terminal**: `ide-terminal` PTY + a native VT grid (`vt100`): zsh prompt,
   split panes (the split button starts a second shell and renders both VT grids
   side by side at half width; clicking a pane routes keys to that session),
@@ -498,7 +503,7 @@ Status of the Tauri shell's features in the native app.
 | LSP: diagnostics, completion, hover, goto, inline | yes | diagnostics, completion/hover/goto and inline completion providers | P1 polish (popup styling) |
 | Code insight: inspections, refactors, structure | yes | `Alt+Enter` context actions, `Shift+F6` rename, Locate Duplicates, Search Structurally (patterns, replacement, Replace All), Structure view (symbol tree of the open buffer) | — |
 | Search (find in path, replace) | yes | find in path (no replace/scope UI yet) | P1/P2 |
-| VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, commit | P2 polish (hunks) |
+| VCS tool window, diff, commit | yes | changed files, diff vs HEAD, stage all, stage by hunk, commit | — |
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop, gutter breakpoint marks | — |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
