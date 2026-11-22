@@ -656,6 +656,8 @@ pub struct Workbench {
     /// The shared event bridge, so a new window can subscribe.
     bridge: crate::events::EventBridge,
     window_state: crate::layout::WindowState,
+    /// Titles the user suppressed with "Don't Show Again".
+    suppressed: crate::notifications::Suppressed,
     /// The shortcut dialog (Settings › Keymap).
     keymap_dialog: Entity<crate::keymap::KeymapDialog>,
     keymap_accepted: Option<Subscription>,
@@ -928,6 +930,7 @@ impl Workbench {
             find_searched: false,
             find_options: FindOptions::default(),
             settings_open: false,
+            suppressed: Default::default(),
             window_name: "main".to_owned(),
             bridge: config.bridge.clone(),
             window_state,
@@ -1028,12 +1031,20 @@ impl Workbench {
                 _ => BalloonDisplay::Balloon,
             },
             log: group.map(|group| group.log).unwrap_or(true),
+            sound: settings.notifications.sound,
         }
     }
 
     fn on_event(&mut self, event: IdeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             IdeEvent::Notify { level, title, body } => {
+                // "Don't Show Again" suppresses the title for the rest of the
+                // session; the status bar still shows it once.
+                if self.suppressed.contains(&title) {
+                    self.status = title.clone().into();
+                    cx.notify();
+                    return;
+                }
                 self.status = match body.as_deref() {
                     Some(body) if !body.is_empty() => format!("{title} — {body}").into(),
                     _ => title.clone().into(),
@@ -1049,6 +1060,9 @@ impl Workbench {
                 self.notifications.update(cx, |log, cx| {
                     log.set_prefs(prefs);
                     log.push(level, title, body);
+                    if prefs.sound {
+                        crate::notifications::play_sound();
+                    }
                     if read {
                         log.mark_all_read();
                     }
@@ -1497,6 +1511,9 @@ impl Workbench {
                             this.notifications.update(cx, |log, cx| {
                                 log.set_prefs(prefs);
                                 log.push(level, format!("Plugin: {title}"), (!body.is_empty()).then_some(body));
+                                if prefs.sound {
+                                    crate::notifications::play_sound();
+                                }
                                 if visible {
                                     log.mark_all_read();
                                 }
@@ -4360,6 +4377,13 @@ impl Render for Workbench {
         // Balloons: bottom-right stack, hidden while the Notifications tool
         // window is on screen (IDEA shows either the stack or the list).
         if !self.notifications_visible() {
+            // The log records suppressed titles as the user clicks "Don't show
+            // again"; feed them to the workbench's filter each frame.
+            for title in self.notifications.read(cx).suppressed_titles() {
+                if !self.suppressed.contains(&title) {
+                    self.suppressed.suppress(title);
+                }
+            }
             let balloons = self.notifications.update(cx, |log, cx| log.render_balloons(&theme, cx));
             if !balloons.is_empty() {
                 overlays.push(

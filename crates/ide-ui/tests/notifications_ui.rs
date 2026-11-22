@@ -464,7 +464,7 @@ fn only_the_newest_three_balloons_stack(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn display_none_keeps_balloons_away_but_logs(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let log = timed_log(cx, NotificationPrefs { balloons: true, display: BalloonDisplay::None, log: true });
+    let log = timed_log(cx, NotificationPrefs { balloons: true, display: BalloonDisplay::None, log: true, sound: false });
     cx.update(|cx| {
         log.update(cx, |log, cx| {
             log.push(NotifyLevel::Info, "no popup", None::<String>);
@@ -475,7 +475,7 @@ fn display_none_keeps_balloons_away_but_logs(cx: &mut TestAppContext) {
     });
 
     // `log: false` + `display: none` drops the event entirely.
-    let log = timed_log(cx, NotificationPrefs { balloons: true, display: BalloonDisplay::None, log: false });
+    let log = timed_log(cx, NotificationPrefs { balloons: true, display: BalloonDisplay::None, log: false, sound: false });
     cx.update(|cx| {
         log.update(cx, |log, cx| {
             log.push(NotifyLevel::Info, "dropped", None::<String>);

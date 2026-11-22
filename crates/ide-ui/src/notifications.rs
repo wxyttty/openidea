@@ -41,6 +41,31 @@ pub enum BalloonDisplay {
     None,
 }
 
+/// Titles the user asked not to see again (`notifications.suppressed`), kept per
+/// workbench session.
+#[derive(Default)]
+pub struct Suppressed {
+    titles: std::collections::HashSet<String>,
+}
+
+impl Suppressed {
+    pub fn contains(&self, title: &str) -> bool {
+        self.titles.contains(title)
+    }
+
+    pub fn suppress(&mut self, title: impl Into<String>) {
+        self.titles.insert(title.into());
+    }
+
+    pub fn len(&self) -> usize {
+        self.titles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.titles.is_empty()
+    }
+}
+
 /// The effective notification preferences of the `system` group, which is where
 /// backend `Notify` events land (the Tauri shell's `notificationPrefs`).
 #[derive(Clone, Copy, Debug)]
@@ -50,11 +75,32 @@ pub struct NotificationPrefs {
     pub display: BalloonDisplay,
     /// Also list it in the Notifications tool window (`…groups.system.log`).
     pub log: bool,
+    /// Play the system alert sound (`notifications.sound`).
+    pub sound: bool,
+}
+
+/// Plays the platform's alert sound for an arriving notification.
+///
+/// The Tauri shell delegated this to the OS; a native build shells out to the
+/// platform's own sound player, and a missing player is not an error (the
+/// notification itself already landed).
+pub fn play_sound() {
+    let command = if cfg!(target_os = "macos") { "afplay" } else { "paplay" };
+    let sound = if cfg!(target_os = "macos") {
+        "/System/Library/Sounds/Glass.aiff"
+    } else {
+        "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
+    };
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new(command).arg(sound).spawn();
+    } else if std::path::Path::new(sound).exists() {
+        let _ = std::process::Command::new(command).arg(sound).spawn();
+    }
 }
 
 impl Default for NotificationPrefs {
     fn default() -> Self {
-        Self { balloons: true, display: BalloonDisplay::Balloon, log: true }
+        Self { balloons: true, display: BalloonDisplay::Balloon, log: true, sound: false }
     }
 }
 
@@ -94,6 +140,9 @@ impl NotificationItem {
 
 /// Newest-first notification history, rendered as the Notifications tool window.
 pub struct NotificationLog {
+    /// Titles this panel suppressed ("Don't show again"), mirrored into the
+    /// workbench's filter.
+    suppressed: std::collections::HashSet<String>,
     items: Vec<NotificationItem>,
     next_id: u64,
     prefs: NotificationPrefs,
@@ -103,7 +152,13 @@ pub struct NotificationLog {
 
 impl NotificationLog {
     pub fn new() -> Self {
-        Self { items: Vec::new(), next_id: 0, prefs: NotificationPrefs::default(), ticking: false }
+        Self {
+            suppressed: std::collections::HashSet::new(),
+            items: Vec::new(),
+            next_id: 0,
+            prefs: NotificationPrefs::default(),
+            ticking: false,
+        }
     }
 
     /// Applies the effective `system`-group preferences; called before pushing
@@ -279,6 +334,22 @@ impl NotificationLog {
     /// The balloon stack (oldest first, i.e. newest at the bottom) as floating
     /// cards for the window's bottom-right corner. Empty when balloons are off
     /// or none are up.
+    /// Suppresses `title`: its balloon and any later notification with the same
+    /// title stay out of the log for the rest of the session (IDEA's "Don't Show
+    /// Again"). The item leaves the balloons; a logged entry stays in history.
+    pub fn suppressed_titles(&self) -> Vec<String> {
+        self.suppressed.iter().cloned().collect()
+    }
+
+    pub fn suppress(&mut self, title: String, cx: &mut Context<Self>) {
+        self.suppressed.insert(title.clone());
+        let ids: Vec<u64> = self.balloons().into_iter().filter(|item| item.title.as_ref() == title).map(|item| item.id).collect();
+        for id in ids {
+            self.dismiss_balloon(id);
+        }
+        cx.notify();
+    }
+
     pub fn render_balloons(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if !self.prefs.balloons || self.prefs.display == BalloonDisplay::None {
             return Vec::new();
@@ -354,6 +425,30 @@ impl NotificationLog {
                                 .child(body),
                         )
                     })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .child({
+                                let title = item.title.to_string();
+                                div()
+                                    .id(ElementId::Name(format!("balloon-suppress-{id}").into()))
+                                    .test_support()
+                                    .h(px(16.))
+                                    .px_1()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(move |this| this.bg(hovering))
+                                    .on_click(cx.listener(move |this: &mut Self, _: &ClickEvent, _window, cx| {
+                                        this.suppress(title.clone(), cx)
+                                    }))
+                                    .text_size(px(9.))
+                                    .text_color(theme.fg_muted())
+                                    .child("Don't show again")
+                            }),
+                    )
                     .into_any_element()
             })
             .collect()

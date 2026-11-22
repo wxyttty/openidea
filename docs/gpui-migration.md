@@ -521,7 +521,7 @@ Status of the Tauri shell's features in the native app.
 | Run configurations, run tool window | yes | detect/run/stop/console + F5 | — |
 | Debugger (DAP) | yes | sessions, stack, variables, watches, REPL, editable conditions/logpoints, step/stop, gutter breakpoint marks | — |
 | Terminal | xterm.js + `ide-terminal` | native VT grid, tabs, split panes, auto PTY resize, font size | P2 |
-| Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings) | P2 (sound, Don't Show Again) |
+| Problems / notifications panels | yes | Problems with real diagnostics; Notifications tool window (history, unread, settings-aware) + balloons (fade, hover/activation pause, 3-up, display/log settings, optional alert sound, "Don't show again" suppresses a title for the session) | — |
 | Database tool window | yes | sources, sidebar with tables/views + columns/indexes/FKs/triggers + DDL modal + refresh, SQL console, paged grid, row/cell edit, delete/insert, CSV export, auto-connect | P2 |
 | Notebook | yes | viewer, cell editing/save (cells, outputs, nbformat), kernel execution: Run Cell / Run All with streamed outputs, Interrupt, Restart, Clear Output, per-notebook Python selection; Alt+8 | — |
 | Agents | yes | providers/tasks/conversation, create local task (local checkout or worktree), prompt, cancel, permission prompts with per-option answers, per-task settings cycled from the provider's advertised options, ACP Registry list/install/update; Alt+9 | — |
