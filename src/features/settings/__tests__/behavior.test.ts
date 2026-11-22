@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { formatPattern, formatTimestamp } from "@/platform/dateFormat";
 import { resolveThemeId } from "@/workbench/theme";
-import { nextZoom } from "../appearanceRuntime";
-import { validateAppearanceExtras, validateNotifications } from "../model/behaviorSchema";
+import { useCompactMode } from "@/ui/density";
+import { applyAppearanceOptions, nextZoom, SMALL_TREE_INDENT } from "../appearanceRuntime";
+import { validateSettings } from "../model/schema";
+import { validateGeneralExtras, validateAppearanceExtras, validateNotifications } from "../model/behaviorSchema";
 
 describe("appearance & behavior settings", () => {
+  it("defaults automatic update checks to on and respects an explicit opt-out", () => {
+    expect(validateSettings({}).general.autoCheckUpdates).toBe(true);
+    expect(validateSettings({ general: { autoCheckUpdates: false } }).general.autoCheckUpdates).toBe(false);
+    expect(validateSettings({ general: { autoCheckUpdates: "off" } }).general.autoCheckUpdates).toBe(true);
+  });
+
   it("steps zoom within 50–300%", () => {
     expect(nextZoom(100, 1)).toBe(110);
     expect(nextZoom(100, -1)).toBe(90);
@@ -21,6 +29,143 @@ describe("appearance & behavior settings", () => {
     expect(validateAppearanceExtras({ theme: "system" }).syncWithOs).toBe(true);
   });
 
+  it("keeps valid file icon theme options and drops or clamps the rest", () => {
+    expect(validateAppearanceExtras({}).fileIconThemeOptions).toEqual({});
+    const options = validateAppearanceExtras({
+      fileIconThemeOptions: {
+        "p/t": {
+          groups: { tests: true, bad: "yes" },
+          choices: { arrows: "plus", bad: 1 },
+          hideFiles: true,
+          hollowFolders: "x",
+          hideUiIcons: true,
+          hidePsiIcons: 1,
+          monochrome: "#546E7A",
+          saturation: 50,
+          opacity: 1,
+          iconSize: 20.4,
+          rowHeight: 100,
+          accent: "red",
+        },
+        "not a key": { hideFiles: true },
+        "p/u": 5,
+      },
+    }).fileIconThemeOptions;
+    expect(options).toEqual({
+      "p/t": {
+        groups: { tests: true },
+        choices: { arrows: "plus" },
+        hideFiles: true,
+        hideFolders: false,
+        hollowFolders: false,
+        hideUiIcons: true,
+        hidePsiIcons: false,
+        monochrome: "#546E7A",
+        saturation: 20,
+        opacity: 10,
+        iconSize: 20,
+        rowHeight: 48,
+        accent: null,
+      },
+    });
+  });
+
+  it("keeps Welcome and saved tabs unless the user turns the new close behaviour on", () => {
+    const fresh = validateSettings({});
+    expect(fresh.general.closeWithoutWelcome).toBe(false);
+    expect(fresh.general.closeTabsWithWindow).toBe(false);
+    const on = validateSettings({ general: { closeWithoutWelcome: true, closeTabsWithWindow: true } });
+    expect(on.general.closeWithoutWelcome).toBe(true);
+    expect(on.general.closeTabsWithWindow).toBe(true);
+    expect(
+      validateSettings({ general: { closeWithoutWelcome: "yes", closeTabsWithWindow: 1 } } as never).general,
+    ).toMatchObject({
+      closeWithoutWelcome: false,
+      closeTabsWithWindow: false,
+    });
+  });
+
+  it("defaults Show tool window badges to on and honours the stored value", () => {
+    expect(validateAppearanceExtras({}).showToolWindowBadges).toBe(true);
+    expect(validateAppearanceExtras({ showToolWindowBadges: false }).showToolWindowBadges).toBe(false);
+    expect(validateAppearanceExtras({ showToolWindowBadges: 1 }).showToolWindowBadges).toBe(true);
+  });
+
+  it("defaults the Navigation Bar to the status bar and migrates the legacy boolean", () => {
+    expect(validateAppearanceExtras({}).navigationBar).toBe("statusBar");
+    expect(validateAppearanceExtras({ navigationBar: "top" }).navigationBar).toBe("top");
+    expect(validateAppearanceExtras({ navigationBar: "hidden" }).navigationBar).toBe("hidden");
+    // Older settings stored the choice as `showNavigationBar: bool`
+    // (`true` meant shown, which was the status bar).
+    expect(validateAppearanceExtras({ showNavigationBar: true }).navigationBar).toBe("statusBar");
+    expect(validateAppearanceExtras({ showNavigationBar: false }).navigationBar).toBe("hidden");
+    expect(validateAppearanceExtras({ showNavigationBar: true, navigationBar: "top" }).navigationBar).toBe("top");
+    expect(validateAppearanceExtras({ showNavigationBar: false, navigationBar: "statusBar" }).navigationBar).toBe(
+      "statusBar",
+    );
+    // Anything that is neither a position nor a boolean falls back to the default.
+    expect(validateAppearanceExtras({ navigationBar: "everywhere" }).navigationBar).toBe("statusBar");
+  });
+
+  it("applies Compact mode to the root attribute and the JS density store", () => {
+    const root = document.createElement("div");
+    applyAppearanceOptions(validateSettings({ appearance: { compactMode: true } }), root);
+    expect(root.dataset.compact).toBe("");
+    expect(useCompactMode.getState()).toBe(true);
+    applyAppearanceOptions(validateSettings({}), root);
+    expect(root.dataset.compact).toBeUndefined();
+    expect(useCompactMode.getState()).toBe(false);
+  });
+
+  it("defaults Use smaller indents in trees to off and applies the indent variable", () => {
+    expect(validateAppearanceExtras({}).smallTreeIndents).toBe(false);
+    expect(validateAppearanceExtras({ smallTreeIndents: true }).smallTreeIndents).toBe(true);
+    expect(validateAppearanceExtras({ smallTreeIndents: "on" }).smallTreeIndents).toBe(false);
+    const root = document.createElement("div");
+    applyAppearanceOptions(validateSettings({ appearance: { smallTreeIndents: true } }), root);
+    expect(root.style.getPropertyValue("--tree-indent")).toBe(SMALL_TREE_INDENT);
+    // Off (or a stored non-boolean) restores the default indents.
+    applyAppearanceOptions(validateSettings({}), root);
+    expect(root.style.getPropertyValue("--tree-indent")).toBe("");
+    applyAppearanceOptions(validateSettings({ appearance: { smallTreeIndents: false } }), root);
+    expect(root.style.getPropertyValue("--tree-indent")).toBe("");
+  });
+
+  it("defaults Smooth scrolling to on", () => {
+    expect(validateAppearanceExtras({}).smoothScrolling).toBe(true);
+    expect(validateAppearanceExtras({ smoothScrolling: false }).smoothScrolling).toBe(false);
+    expect(validateAppearanceExtras({ smoothScrolling: "off" }).smoothScrolling).toBe(true);
+  });
+
+  it("opens Settings in a separate window unless turned off", () => {
+    expect(validateAppearanceExtras({}).settingsInSeparateWindow).toBe(true);
+    expect(validateAppearanceExtras({ settingsInSeparateWindow: false }).settingsInSeparateWindow).toBe(false);
+    expect(validateAppearanceExtras({ settingsInSeparateWindow: "off" }).settingsInSeparateWindow).toBe(true);
+  });
+
+  it("keeps the UI fallback font empty by default and trims a stored one", () => {
+    expect(validateAppearanceExtras({}).uiFontFallback).toBe("");
+    expect(validateAppearanceExtras({ uiFontFallback: " 思源黑体 " }).uiFontFallback).toBe("思源黑体");
+    expect(validateAppearanceExtras({ uiFontFallback: 5 }).uiFontFallback).toBe("");
+  });
+
+  it("applies and clears the UI fallback, and removes custom fonts when disabled", () => {
+    const root = document.createElement("div");
+    const settings = validateSettings({
+      appearance: { useCustomFont: true, uiFontFamily: "Menlo", uiFontFallback: "Songti SC" },
+    });
+    applyAppearanceOptions(settings, root);
+    expect(root.style.getPropertyValue("--font-ui")).toBe(
+      '"Menlo", "Songti SC", system-ui, sans-serif, var(--font-icons)',
+    );
+    settings.appearance.uiFontFallback = "";
+    applyAppearanceOptions(settings, root);
+    expect(root.style.getPropertyValue("--font-ui")).toBe('"Menlo", system-ui, sans-serif, var(--font-icons)');
+    settings.appearance.useCustomFont = false;
+    applyAppearanceOptions(settings, root);
+    expect(root.style.getPropertyValue("--font-ui")).toBe("");
+  });
+
   it("formats dates with an override pattern and pretty dates", () => {
     const d = new Date(2026, 0, 5, 14, 7);
     expect(formatPattern(d, "dd.MM.yyyy")).toBe("05.01.2026");
@@ -34,7 +179,26 @@ describe("appearance & behavior settings", () => {
     expect(validateNotifications({ groups: { vcs: { display: "weird", log: false } }, sound: 1 })).toEqual({
       balloons: true,
       sound: false,
+      systemNotifications: true,
+      terminalCompletion: "longRunning",
+      terminalThresholdSeconds: 10,
       groups: { vcs: { display: "balloon", log: false } },
     });
+    expect(validateNotifications({ systemNotifications: false }).systemNotifications).toBe(false);
+    expect(validateNotifications({ terminalCompletion: "sometimes", terminalThresholdSeconds: "10" })).toMatchObject({
+      terminalCompletion: "longRunning",
+      terminalThresholdSeconds: 10,
+    });
+    // Out-of-range numbers clamp, as every numeric setting does.
+    expect(validateNotifications({ terminalThresholdSeconds: 0 }).terminalThresholdSeconds).toBe(1);
+    expect(validateNotifications({ terminalCompletion: "all", terminalThresholdSeconds: 5 })).toMatchObject({
+      terminalCompletion: "all",
+      terminalThresholdSeconds: 5,
+    });
   });
+});
+
+it("loads an old attach setting as ask", () => {
+  expect(validateGeneralExtras({ openProjectIn: "attach" }).openProjectIn).toBe("ask");
+  expect(validateGeneralExtras({ openProjectIn: "tab" }).openProjectIn).toBe("tab");
 });

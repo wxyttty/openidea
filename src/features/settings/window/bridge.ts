@@ -1,15 +1,17 @@
 /**
  * Settings window ↔ its project window.
  *
- * Settings live in a native child window `settings-<parent>` (see
- * src-tauri/src/windows.rs) that only runs the settings pages. The action
+ * Settings live in a separate window `settings-<parent>` (see
+ * src-tauri/src/windows.rs) that only runs the settings pages (a native
+ * child of the parent on macOS/Linux; top-level on Windows so DWM paints
+ * its shadow). The action
  * registry stays in the project window: it sends the settings window a
  * description of every action (Keymap page, links that run actions) and runs
  * the actions the settings window forwards.
  */
 import { emitTo } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { allActions, executeAction, getAction, registerAction, useActions, type Action } from "@/platform/actions";
+import { allActions, executeAction, getAction, registerActions, useActions, type Action } from "@/platform/actions";
 import { isTauri } from "@/platform/ipc";
 
 const SETTINGS_PREFIX = "settings-";
@@ -19,7 +21,7 @@ const EXEC = "openidea://settings/exec";
 
 export type ActionInfo = Pick<
   Action,
-  "id" | "title" | "category" | "description" | "icon" | "when" | "keywords" | "hidden"
+  "id" | "title" | "category" | "description" | "icon" | "when" | "keywords" | "hidden" | "keymap"
 >;
 
 function currentLabel(): string | null {
@@ -37,7 +39,7 @@ export function settingsWindowParent(label = currentLabel()): string | null {
 }
 
 export function describeActions(actions: Iterable<Action> = allActions()): ActionInfo[] {
-  return [...actions].map(({ id, title, category, description, icon, when, keywords, hidden }) => ({
+  return [...actions].map(({ id, title, category, description, icon, when, keywords, hidden, keymap }) => ({
     id,
     title,
     category,
@@ -46,6 +48,7 @@ export function describeActions(actions: Iterable<Action> = allActions()): Actio
     when,
     keywords,
     hidden,
+    keymap,
   }));
 }
 
@@ -96,19 +99,19 @@ export function installSettingsHost(): () => void {
  * the parent. Actions registered locally (e.g. `file.settings`) win.
  */
 export function installActionProxies(parent: string): () => void {
-  const proxies = new Map<string, () => void>();
+  let disposeProxies = () => {};
   const sync = (infos: ActionInfo[]) => {
-    proxies.forEach((dispose) => dispose());
-    proxies.clear();
+    disposeProxies();
+    const proxies: Action[] = [];
     for (const info of infos) {
       if (getAction(info.id)) continue;
-      const proxy: Action = { ...info, run: ({ arg }) => void emitTo(parent, EXEC, { id: info.id, arg }) };
-      proxies.set(info.id, registerAction(proxy));
+      proxies.push({ ...info, run: ({ arg }) => void emitTo(parent, EXEC, { id: info.id, arg }) });
     }
+    disposeProxies = registerActions(proxies);
   };
   const off = listen<ActionInfo[]>(ACTIONS, sync, () => void emitTo(parent, REQUEST_ACTIONS, null).catch(() => {}));
   return () => {
     off();
-    proxies.forEach((dispose) => dispose());
+    disposeProxies();
   };
 }

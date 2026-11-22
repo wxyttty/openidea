@@ -1,8 +1,9 @@
 /**
  * CodeMirror setup for the VCS viewers (diff, merge, local history): token
- * based theme + syntax colours and lazy language loading by file name.
+ * based theme + syntax colours and lazy language loading through the editor's
+ * language pipeline, so colours match the editor.
  */
-import { HighlightStyle, LanguageDescription, syntaxHighlighting, type LanguageSupport } from "@codemirror/language";
+import { syntaxHighlighting, type LanguageSupport } from "@codemirror/language";
 import {
   Compartment,
   EditorState,
@@ -18,10 +19,14 @@ import {
   EditorView,
   GutterMarker,
   ViewPlugin,
+  gutter,
   gutterLineClass,
   highlightActiveLine,
   keymap,
+  lineNumberMarkers,
+  lineNumberWidgetMarker,
   lineNumbers,
+  tooltips,
   WidgetType,
   type DecorationSet,
   type ViewUpdate,
@@ -29,14 +34,19 @@ import {
 import { getChunks, mergeViewSiblings, type Chunk } from "@codemirror/merge";
 import { defaultKeymap } from "@codemirror/commands";
 import { search, searchKeymap } from "@codemirror/search";
-import { tags as t } from "@lezer/highlight";
+import { scrollbarMarks, type ScrollbarMark } from "@/editor/api";
+import { openideaHighlightStyle } from "@/editor/core/cm/highlight";
+import { languageDescriptionFor, loadSupport } from "@/editor/core/cm/languages";
+import { occurrenceSearch } from "@/editor/core/cm/editing";
 import { findExtension } from "@/editor/core/cm/find";
+import { overviewLane } from "@/editor/core/cm/lanes";
+import { LINE_INSET } from "@/editor/core/cm/lineInset";
 import { caretExtension } from "@/editor/core/cm/prefs";
-import { fontExtension } from "@/editor/core/cm/setup";
-import { caretStyles, findLocals, findStyles } from "@/editor/core/cm/theme";
+import { fontExtension, tooltipBounds } from "@/editor/core/cm/setup";
+import { caretStyles, findLocals, findStyles, markWidgetStyles, overviewStyles } from "@/editor/core/cm/theme";
 import { editorPrefs } from "@/platform/editorSettings";
 import { useProject } from "@/platform/project";
-import { hasInnerFragments } from "./diffOptions";
+import { getDiffInsights, hasInnerFragments } from "./diffOptions";
 
 /** IDEA's change types (TextDiffType): both sides have text, only the new side, only the old side. */
 export type DiffKind = "modified" | "inserted" | "deleted";
@@ -142,6 +152,10 @@ function wordDeco(view: EditorView): DecorationSet {
   const isA = info.side === "a";
   const { from: vpFrom, to: vpTo } = view.viewport;
   const builder = new RangeSetBuilder<Decoration>();
+  const moved = getDiffInsights(info.chunks)
+    .moves.map((m) => (isA ? { from: m.fromA, to: m.toA } : { from: m.fromB, to: m.toB }))
+    .sort((a, b) => a.from - b.from);
+  let moveIndex = 0;
   for (const chunk of info.chunks) {
     const base = isA ? chunk.fromA : chunk.fromB;
     if (base > vpTo) break;
@@ -149,8 +163,20 @@ function wordDeco(view: EditorView): DecorationSet {
     for (const c of chunk.changes) {
       const [from, to] = isA ? [c.fromA, c.toA] : [c.fromB, c.toB];
       const kind = kindOf(c.fromA !== c.toA, c.fromB !== c.toB);
-      if (from < to) builder.add(base + from, base + to, wordDecos[kind]);
-      else builder.add(base + from, base + from, emptyWordDecos[kind]);
+      let cursor = base + from;
+      const end = base + to;
+      while (moveIndex < moved.length && moved[moveIndex]!.to <= cursor) moveIndex++;
+      if (from === to) {
+        if (!moved[moveIndex] || moved[moveIndex]!.from > cursor) builder.add(cursor, cursor, emptyWordDecos[kind]);
+        continue;
+      }
+      // Moved ranges have their own comparison against the actual counterpart.
+      for (let i = moveIndex; i < moved.length && moved[i]!.from < end; i++) {
+        const move = moved[i]!;
+        if (move.from > cursor) builder.add(cursor, Math.min(move.from, end), wordDecos[kind]);
+        cursor = Math.max(cursor, move.to);
+      }
+      if (cursor < end) builder.add(cursor, end, wordDecos[kind]);
     }
   }
   return builder.finish();
@@ -186,7 +212,7 @@ function changedGutterMarkers(state: EditorState): RangeSet<GutterMarker> {
 }
 
 /** Recomputes `build` when the document, viewport or chunks change. */
-const chunkDecorations = (build: (view: EditorView) => DecorationSet) =>
+export const chunkDecorations = (build: (view: EditorView) => DecorationSet) =>
   ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
@@ -207,6 +233,59 @@ const chunkDecorations = (build: (view: EditorView) => DecorationSet) =>
 
 const changedLines = chunkDecorations(lineDeco);
 
+/** Stripe colours by type (TextDiffType.getMarkerColor: the keys' ERROR_STRIPE_COLOR). */
+const stripeColor = byKind((kind) => `var(--diff-${kind}-stripe)`);
+
+/** The diff viewer's layouts, as the overview lane sees them. */
+export type DiffLayout = "split" | "unified";
+
+/**
+ * The changes on the overview lane as marks across its width, after IDEA's diff error stripe
+ * (DiffDrawUtil.LineHighlighterBuilder): a side-by-side pane marks each chunk's lines in the
+ * chunk's type, an empty side a point where the lines would be. The unified view has no modified type: the old lines are marked deleted and the
+ * new ones inserted (createUnifiedChunkHighlighters); the old lines sit above the new ones in a
+ * widget, so their mark is a point on top of the inserted lines.
+ */
+export function diffScrollbarMarks(state: EditorState, unified: boolean): ScrollbarMark[] {
+  const info = getChunks(state);
+  if (!info) return [];
+  if (unified)
+    return info.chunks.flatMap((c) => {
+      const marks: ScrollbarMark[] = [];
+      if (c.fromB !== c.toB) marks.push({ from: c.fromB, to: c.endB, color: stripeColor.inserted, kind: "full" });
+      if (c.fromA !== c.toA) marks.push({ from: c.fromB, color: stripeColor.deleted, kind: "full", priority: 1 });
+      return marks;
+    });
+  const isA = info.side === "a";
+  return info.chunks.map((c) => ({
+    from: isA ? c.fromA : c.fromB,
+    to: isA ? c.endA : c.endB,
+    color: stripeColor[chunkKind(c)],
+    kind: "full",
+  }));
+}
+
+type ChunkMarks = { chunks: readonly Chunk[] | undefined; marks: readonly ScrollbarMark[] };
+
+/** Recomputed when the chunks change, which can happen without a document change (MergeView, `updateOriginalDoc`). */
+const chunkMarks = (unified: boolean) =>
+  StateField.define<ChunkMarks>({
+    create: (state) => ({ chunks: getChunks(state)?.chunks, marks: diffScrollbarMarks(state, unified) }),
+    update: (value, tr) => {
+      const chunks = getChunks(tr.state)?.chunks;
+      return chunks === value.chunks ? value : { chunks, marks: diffScrollbarMarks(tr.state, unified) };
+    },
+    provide: (f) => scrollbarMarks.from(f, (v) => v.marks),
+  });
+
+/**
+ * The overview lane with the diff's changes, over the pane's scrollbar. Every
+ * diff pane scrolls itself, so each carries its own lane.
+ */
+export function diffOverview(layout: DiffLayout): Extension {
+  return [chunkMarks(layout === "unified"), overviewLane];
+}
+
 /**
  * IDEA's "Highlight words" for a side-by-side pane: the inner fragments of
  * chunks whose words were compared, over their lighter line background.
@@ -216,30 +295,11 @@ export const diffWords: Extension = [
   EditorView.editorAttributes.of({ class: "cm-diffWords" }),
 ];
 
-export const viewerHighlight = HighlightStyle.define([
-  {
-    tag: [t.keyword, t.modifier, t.controlKeyword, t.operatorKeyword, t.definitionKeyword],
-    color: "var(--syn-keyword)",
-  },
-  { tag: [t.string, t.special(t.string), t.regexp, t.character], color: "var(--syn-string)" },
-  { tag: [t.typeName, t.className, t.namespace, t.tagName], color: "var(--syn-type)" },
-  { tag: [t.function(t.variableName), t.function(t.propertyName)], color: "var(--syn-function)" },
-  { tag: [t.comment, t.lineComment, t.blockComment, t.docComment], color: "var(--syn-comment)", fontStyle: "italic" },
-  { tag: [t.annotation, t.meta, t.attributeName], color: "var(--syn-annotation)" },
-  { tag: [t.number, t.bool, t.null, t.atom], color: "var(--syn-number)" },
-  { tag: [t.constant(t.variableName), t.standard(t.variableName)], color: "var(--syn-constant)" },
-  { tag: [t.punctuation, t.bracket, t.operator], color: "var(--syn-punct)" },
-  { tag: [t.propertyName], color: "var(--syn-property)" },
-  { tag: [t.variableName], color: "var(--syn-variable)" },
-  { tag: t.invalid, color: "var(--syn-invalid)" },
-  { tag: t.heading, fontWeight: "var(--fw-code-bold, 700)", color: "var(--fg-strong)" },
-  { tag: t.link, color: "var(--link)", textDecoration: "underline" },
-]);
-
 export const viewerTheme = EditorView.theme(
   {
+    ...overviewStyles,
+    "&.cm-editor": { height: "100%" },
     "&": {
-      height: "100%",
       backgroundColor: "var(--bg-app)",
       color: "var(--fg)",
       fontSize: "var(--openidea-editor-font-size, var(--fs-code))",
@@ -252,10 +312,22 @@ export const viewerTheme = EditorView.theme(
       fontVariantLigatures: "none",
     },
     "&.cm-openidea-ligatures .cm-scroller": { fontVariantLigatures: "normal" },
-    ".cm-content": { caretColor: "var(--caret, var(--fg-strong))", WebkitUserSelect: "text", userSelect: "text" },
+    ".cm-content": {
+      padding: "0 0 4px",
+      caretColor: "var(--caret, var(--fg-strong))",
+      WebkitUserSelect: "text",
+      userSelect: "text",
+    },
+    ".cm-line": { padding: `0 2px 0 ${LINE_INSET}px` },
     ...caretStyles,
     "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, ::selection": {
       backgroundColor: "var(--bg-selected-strong)",
+      // Unset (the default `inherit`): the declaration drops and the syntax colours show through.
+      color: "var(--fg-editor-selection)",
+    },
+    ".cm-openidea-selected, &.cm-focused .cm-openidea-selected": {
+      "--openidea-selected-bg": "var(--bg-selected-strong)",
+      color: "var(--fg-editor-selection)",
     },
     ".cm-activeLine": { backgroundColor: "var(--bg-current-line)" },
     ".cm-gutters": {
@@ -264,6 +336,7 @@ export const viewerTheme = EditorView.theme(
       border: "none",
     },
     ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px 0 12px", minWidth: "32px" },
+    ".cm-gutters-after .cm-lineNumbers .cm-gutterElement": { padding: "0 12px 0 8px" },
     ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--fg-secondary)" },
     // Side-by-side panes colour lines by their chunk's type (changedLines) instead of the library's tint.
     "&.cm-merge-a .cm-changedLine, &.cm-merge-b .cm-changedLine": { backgroundColor: "transparent" },
@@ -305,25 +378,58 @@ export const viewerTheme = EditorView.theme(
       margin: "0 -1px",
       verticalAlign: "top",
     },
-    // The unified view: old lines deleted, new lines inserted.
+    // The unified view: old lines deleted, new lines inserted. The old lines of a chunk whose words
+    // were compared sit right above its first new line and take the lighter colour too.
     ".cm-deletedChunk": { backgroundColor: diffTint("deleted", 70) },
-    "&.cm-diffWords .cm-deletedChunk": { backgroundColor: diffTint("deleted", 28) },
-    ".cm-deletedChunk .cm-deletedText": { background: diffTint("deleted", 85) },
+    "&.cm-diffWords .cm-deletedChunk:has(+ .cm-diffLine-fine)": { backgroundColor: diffTint("deleted", 28) },
+    // Full line height, as `.cm-diffWord`.
+    ".cm-deletedChunk .cm-deletedText": { display: "inline-block", background: diffTint("deleted", 85) },
     "&.cm-merge-a .cm-changedText": { background: diffTint("deleted", 85) },
-    "&.cm-merge-b .cm-changedText": { background: diffTint("inserted", 85) },
+    "&.cm-merge-b .cm-changedText": { display: "inline-block", background: diffTint("inserted", 85) },
     ".cm-changeGutter": { width: "3px", paddingLeft: "0" },
     "&.cm-merge-a .cm-changedLineGutter, .cm-deletedLineGutter": { background: "var(--gutter-deleted)" },
     "&.cm-merge-b .cm-changedLineGutter": { background: "var(--gutter-modified)" },
     ".cm-collapsedLines": {
-      padding: "2px 10px",
-      background: "var(--bg-elev)",
-      color: "var(--fg-subtle)",
+      WebkitUserSelect: "none",
+      userSelect: "none",
+      padding: "0",
+      background: "var(--bg-editor)",
+    },
+    ".cm-collapsedLines > button": {
+      display: "flex",
+      alignItems: "center",
+      gap: "var(--space-1)",
+      width: "100%",
+      minHeight: "max(27px, var(--openidea-editor-line-height, var(--lh-code)))",
+      padding: "0 var(--space-3)",
+      color: "var(--fg-secondary)",
       fontFamily: "var(--font-ui)",
-      fontSize: "var(--fs-small)",
+      fontSize: "var(--fs-ui)",
+      lineHeight: "1.4",
+      textAlign: "start",
       cursor: "pointer",
+    },
+    ".cm-collapsedLines > button:hover, .cm-collapsedLines > button:focus-visible": {
+      backgroundColor: "var(--bg-hover)",
+      color: "var(--fg-strong)",
+    },
+    ".cm-collapsedLines > button:focus-visible": { outlineOffset: "-2px" },
+    ".cm-collapsedLines > button::after": {
+      content: '""',
+      flex: "1",
+      height: "var(--space-1)",
+      marginInlineStart: "var(--space-2)",
+      background: "repeating-linear-gradient(-45deg, var(--diff-separator-wave) 0 1px, transparent 1px 5px)",
+    },
+    ".cm-diffCollapseLabel": {
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
     },
     ".cm-collapsedLines:before": { content: "none" },
     ".cm-collapsedLines:after": { content: "none" },
+    // Clear of the overview lane over the scrollbar (12px wide).
+    "&.cm-openidea-withOverview .cm-deletedChunk .cm-chunkButtons": { insetInlineEnd: "17px" },
     ".cm-chunkButtons button": {
       font: "inherit",
       fontFamily: "var(--font-ui)",
@@ -337,6 +443,7 @@ export const viewerTheme = EditorView.theme(
     ".cm-panels": { backgroundColor: "var(--bg-elev)", color: "var(--fg)" },
     ".cm-searchMatch": { backgroundColor: "color-mix(in srgb, var(--accent) 22%, transparent)" },
     ...findStyles,
+    ...markWidgetStyles,
   },
   { dark: true },
 );
@@ -375,41 +482,102 @@ function viewerEditorLook(): Extension {
   ];
 }
 
+class LineNumber extends GutterMarker {
+  constructor(readonly number: string) {
+    super();
+  }
+  eq(other: LineNumber) {
+    return this.number === other.number;
+  }
+  toDOM() {
+    return document.createTextNode(this.number);
+  }
+}
+
+function maxLineNumber(lines: number): number {
+  let last = 9;
+  while (last < lines) last = last * 10 + 9;
+  return last;
+}
+
+/**
+ * Line numbers after the text, facing the divider: IDEA mirrors the left editor of a
+ * side-by-side diff (TwosideTextDiffViewer moves its scrollbar to the left, and a mirrored
+ * editor draws its gutter on the right). `lineNumbers()` has no `side`, so this is its gutter.
+ */
+const lineNumbersAfter: Extension = gutter({
+  class: "cm-lineNumbers",
+  side: "after",
+  renderEmptyElements: false,
+  markers: (view) => view.state.facet(lineNumberMarkers),
+  lineMarker: (view, line, others) =>
+    others.some((m) => m.toDOM) ? null : new LineNumber(String(view.state.doc.lineAt(line.from).number)),
+  widgetMarker: (view, widget, block) => {
+    for (const marker of view.state.facet(lineNumberWidgetMarker)) {
+      const result = marker(view, widget, block);
+      if (result) return result;
+    }
+    return null;
+  },
+  initialSpacer: (view) => new LineNumber(String(maxLineNumber(view.state.doc.lines))),
+  updateSpacer: (spacer, update) => {
+    const max = String(maxLineNumber(update.view.state.doc.lines));
+    return (spacer as LineNumber).number === max ? spacer : new LineNumber(max);
+  },
+});
+
 /**
  * Base extensions for a read-only (or editable) viewer pane. `findBar`: the
  * viewer shows the editor's find bar (FindPanel) instead of CodeMirror's panel.
+ * `lineNumbers: "after"` puts them on the right, for the left pane of a side-by-side diff.
  */
-export function viewerBase(opts: { readOnly: boolean; lineNumbers?: boolean; findBar?: boolean }): Extension[] {
+export function viewerBase(opts: {
+  readOnly: boolean;
+  lineNumbers?: boolean | "after";
+  findBar?: boolean;
+}): Extension[] {
   return [
-    opts.lineNumbers === false ? [] : lineNumbers(),
+    opts.lineNumbers === false ? [] : opts.lineNumbers === "after" ? lineNumbersAfter : lineNumbers(),
     viewerEditorLook(),
     highlightActiveLine(),
     opts.findBar
       ? [findExtension(), keymap.of(defaultKeymap)]
       : [search({ top: true }), keymap.of([...searchKeymap, ...defaultKeymap])],
-    syntaxHighlighting(viewerHighlight),
+    syntaxHighlighting(openideaHighlightStyle),
     viewerTheme,
     changedLines,
     EditorState.readOnly.of(opts.readOnly),
     EditorView.editable.of(!opts.readOnly),
+    // Add Selection for Next Occurrence, Clone Caret: several carets, as in the editor.
+    EditorState.allowMultipleSelections.of(true),
+    occurrenceSearch,
     // Non-editable revision panes still need keyboard selection and copy.
     opts.readOnly ? EditorView.contentAttributes.of({ tabindex: "0" }) : [],
   ];
 }
 
-let languagesPromise: Promise<readonly LanguageDescription[]> | null = null;
-const cache = new Map<string, Promise<LanguageSupport | null>>();
+/**
+ * Tooltips of a pane showing an open document (quick docs, ⌘-hover info), parented to the
+ * body as the editor's are, so the pane neither clips them nor keeps them under the tool
+ * window stripes, and they move left to fit.
+ */
+export const documentTooltips: Extension = tooltips({
+  parent: typeof document === "undefined" ? undefined : document.body,
+  tooltipSpace: tooltipBounds,
+});
 
-/** Loads the language for `fileName` (by extension / name), or null. */
-export function languageFor(fileName: string): Promise<LanguageSupport | null> {
-  const name = fileName.slice(fileName.lastIndexOf("/") + 1);
-  const hit = cache.get(name);
-  if (hit) return hit;
-  languagesPromise ??= import("@codemirror/language-data").then((m) => m.languages);
-  const p = languagesPromise
-    .then((langs) => LanguageDescription.matchFilename(langs, name))
-    .then((desc) => (desc ? desc.load() : null))
+/** The first line of a side's text, which decides hashbang-only scripts' language. */
+export const firstLineOf = (text: string): string => text.slice(0, text.search(/\r?\n|$/));
+
+/**
+ * Loads the language `path` is shown with in the editor (`languageDescriptionFor`: Override
+ * File Type, File Types patterns, hashbangs, framework modes, then the extension) through
+ * the editor's pipeline (`loadSupport`): the same modes, tag patches and `data-language`
+ * attribute, so colours match. `firstLine` is the shown text's (`firstLineOf`); without it
+ * the file's own counts.
+ */
+export function languageFor(path: string, firstLine?: string | null): Promise<LanguageSupport | null> {
+  return languageDescriptionFor(path, firstLine ?? undefined)
+    .then((desc) => (desc ? loadSupport(desc) : null))
     .catch(() => null);
-  cache.set(name, p);
-  return p;
 }

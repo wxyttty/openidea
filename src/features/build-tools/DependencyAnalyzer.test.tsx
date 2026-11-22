@@ -1,20 +1,34 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
-import type { BuildModel, MavenDependency } from "@/platform/ipc";
+import type { BuildModel, GradleDependency, GradleModel, MavenDependency } from "@/platform/ipc";
 import { menuGroupItems, provideEditorService, type EditorService } from "@/workbench/contributions";
 import { DependencyAnalyzer } from "./DependencyAnalyzer";
 import { activate } from "./index";
 import { ANALYZER_KIND, useAnalyzer, useBuild } from "./store";
 
-const ipc = vi.hoisted(() => ({ exclude: vi.fn(), declaration: vi.fn() }));
+const ipc = vi.hoisted(() => ({
+  exclude: vi.fn(),
+  declaration: vi.fn(),
+  gradle: vi.fn(),
+  cancel: vi.fn(async () => {}),
+  sync: vi.fn(),
+}));
 vi.mock("@/platform/ipc", async (original) => {
   const real = await original<typeof import("@/platform/ipc")>();
   return {
     ...real,
     call: (value: unknown) => value,
-    commands: { ...real.commands, mavenExcludeDependency: ipc.exclude, mavenDependencyDeclaration: ipc.declaration },
+    commands: {
+      ...real.commands,
+      mavenExcludeDependency: ipc.exclude,
+      mavenDependencyDeclaration: ipc.declaration,
+      gradleDependencies: ipc.gradle,
+      cancelRequest: ipc.cancel,
+      buildSync: ipc.sync,
+      runConfigs: async () => [],
+    },
   };
 });
 
@@ -66,7 +80,7 @@ const model: BuildModel = {
     stale: false,
     syncError: null,
   },
-  gradle: null,
+  gradle: [],
 };
 
 describe("dependency analyzer", () => {
@@ -88,7 +102,7 @@ describe("dependency analyzer", () => {
   it("opens as an editor tab from the action and from a pom.xml's menus", async () => {
     await executeAction("maven.analyzeDependencies", { pom: "pom.xml" });
     expect(openInput).toHaveBeenCalledWith(expect.objectContaining({ kind: ANALYZER_KIND }), { focus: true });
-    expect(useAnalyzer.getState().pom).toBe("pom.xml");
+    expect(useAnalyzer.getState().module).toBe("pom.xml");
     for (const menu of ["editor", "projectView", "editorTab"] as const) {
       const items = menuGroupItems(menu, { paths: ["/p/pom.xml"] });
       expect(items[0]).toMatchObject({ action: "maven.analyzeDependencies", arg: { pom: "pom.xml" } });
@@ -100,7 +114,8 @@ describe("dependency analyzer", () => {
   it("marks conflicts, shows their usages and excludes through the direct dependency", async () => {
     ipc.exclude.mockResolvedValue({ path: "/p/pom.xml", range: {} });
     render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
-    fireEvent.click(screen.getByRole("checkbox", { name: "Show conflicts only" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show conflicts only", pressed: false }));
+    expect(screen.getByRole("button", { name: "Show conflicts only", pressed: true })).toBeTruthy();
     expect(screen.queryByText("com.google.inject:guice")).toBeNull();
     fireEvent.mouseDown(screen.getByText("com.google.guava:guava").closest("[role=treeitem]")!, { button: 0 });
     expect(screen.getByText("omitted for conflict with 32.1.3-jre")).toBeTruthy();
@@ -114,5 +129,206 @@ describe("dependency analyzer", () => {
       { groupId: "com.google.inject", artifactId: "guice" },
       { groupId: "com.google.guava", artifactId: "guava" },
     );
+  });
+});
+
+function gradleDep(coords: string, selected: string | null, children: GradleDependency[] = []): GradleDependency {
+  const [group, name, requested] = coords.split(":");
+  return {
+    group: group!,
+    name: name!,
+    requested: requested ?? null,
+    selected,
+    project: false,
+    repeated: false,
+    constraint: false,
+    unresolved: false,
+    children,
+  };
+}
+
+const gradle: GradleModel = {
+  dir: "",
+  projects: [
+    {
+      path: ":",
+      name: "demo",
+      dir: "",
+      buildFile: "build.gradle",
+      tasks: [],
+      resolvableConfigurations: ["reviewTools", "runtimeClasspath"],
+    },
+    {
+      path: ":app",
+      name: "app",
+      dir: "app",
+      buildFile: "app/build.gradle.kts",
+      tasks: [],
+      resolvableConfigurations: ["runtimeClasspath"],
+    },
+  ],
+  javaVersion: null,
+  command: "gradle",
+  env: {},
+  syncedAt: null,
+  stale: false,
+  syncError: null,
+};
+
+describe("dependency analyzer for Gradle", () => {
+  let dispose: () => void = () => {};
+  const openInput = vi.fn(() => Promise.resolve());
+  beforeEach(() => {
+    provideEditorService({ openInput, activePath: () => null } as unknown as EditorService);
+    setContext("projectOpen", true);
+    dispose = activate();
+    act(() => useBuild.setState({ root: "/g", model: { maven: null, gradle: [gradle] } }));
+  });
+  afterEach(() => {
+    dispose();
+    setContext("projectOpen", false);
+    vi.clearAllMocks();
+  });
+
+  it("opens for a project from the action and from its build script's menus", async () => {
+    await executeAction("gradle.analyzeDependencies", { gradlePath: ":app" });
+    expect(openInput).toHaveBeenCalledWith(expect.objectContaining({ kind: ANALYZER_KIND }), { focus: true });
+    expect(useAnalyzer.getState().module).toBe('gradle:["",":app"]');
+    const items = menuGroupItems("projectView", { paths: ["/g/app/build.gradle.kts"] });
+    expect(items).toContainEqual(
+      expect.objectContaining({ action: "gradle.analyzeDependencies", arg: { path: "/g/app/build.gradle.kts" } }),
+    );
+    await executeAction("gradle.analyzeDependencies", { path: "/g/build.gradle" });
+    expect(useAnalyzer.getState().module).toBe('gradle:["",":"]');
+    expect(menuGroupItems("editor", { paths: ["/g/other/build.gradle"] })).toEqual([]);
+  });
+
+  it("reads the configuration's report and marks versions Gradle replaced", async () => {
+    ipc.gradle.mockResolvedValue([
+      gradleDep("org.springframework.boot:spring-boot-starter-json", "3.2.0", [
+        gradleDep("com.fasterxml.jackson.core:jackson-databind:2.15.0", "2.15.3"),
+      ]),
+      gradleDep("com.fasterxml.jackson.core:jackson-databind:2.15.3", null),
+    ]);
+    act(() => useAnalyzer.setState({ module: 'gradle:["",":app"]' }));
+    render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+    expect(ipc.gradle).toHaveBeenCalledWith(":app", "runtimeClasspath", false, expect.any(Number), "");
+    await screen.findByText("com.fasterxml.jackson.core:jackson-databind");
+    fireEvent.click(screen.getByRole("button", { name: "Show conflicts only", pressed: false }));
+    expect(screen.queryByText("org.springframework.boot:spring-boot-starter-json")).toBeNull();
+    fireEvent.mouseDown(screen.getByText("com.fasterxml.jackson.core:jackson-databind").closest("[role=treeitem]")!, {
+      button: 0,
+    });
+    expect(screen.getByText("requested 2.15.0")).toBeTruthy();
+    expect(screen.getByText("org.springframework.boot:spring-boot-starter-json:3.2.0")).toBeTruthy();
+    // Exclude and Jump to Source edit a pom.xml: not offered for Gradle.
+    expect(screen.queryByRole("button", { name: "Exclude" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Jump to Source" })).toBeNull();
+  });
+
+  it("offers only the selected Gradle project's resolvable configurations", async () => {
+    ipc.gradle.mockImplementation(async (_project: string, configuration: string) =>
+      configuration === "reviewTools" ? [{ ...gradleDep("::", null), name: ":support", project: true }] : [],
+    );
+    act(() => useBuild.setState({ root: "/configuration-list" }));
+    render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+    const selector = screen.getByRole("button", { name: "Configuration" });
+    expect(selector).toHaveTextContent("runtimeClasspath");
+    fireEvent.click(selector);
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["reviewTools", "runtimeClasspath"]);
+    fireEvent.click(screen.getByRole("option", { name: "reviewTools" }));
+    await waitFor(() => expect(ipc.gradle).toHaveBeenLastCalledWith(":", "reviewTools", false, expect.any(Number), ""));
+    expect(await screen.findByRole("treeitem", { name: ":support" })).toBeInTheDocument();
+
+    act(() => useAnalyzer.setState({ module: 'gradle:["",":app"]' }));
+    expect(selector).toHaveTextContent("runtimeClasspath");
+    await waitFor(() =>
+      expect(ipc.gradle).toHaveBeenLastCalledWith(":app", "runtimeClasspath", false, expect.any(Number), ""),
+    );
+  });
+
+  it("loads missing configuration metadata through the linked build's normal sync", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", { transformCallback: () => 1 });
+    const linked = { ...gradle, dir: "linked", projects: [gradle.projects[0]!] };
+    let complete!: (model: BuildModel) => void;
+    ipc.sync.mockReturnValueOnce(new Promise<BuildModel>((resolve) => (complete = resolve)));
+    ipc.gradle.mockResolvedValue([]);
+    try {
+      act(() =>
+        useBuild.setState({
+          root: "/configuration-discovery",
+          model: {
+            maven: null,
+            gradle: [{ ...linked, projects: [{ ...linked.projects[0]!, resolvableConfigurations: undefined }] }],
+          },
+        }),
+      );
+      render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+      expect(ipc.sync).toHaveBeenCalledExactlyOnceWith(
+        "gradle",
+        expect.any(Number),
+        false,
+        [],
+        "linked",
+        expect.anything(),
+      );
+      expect(ipc.gradle).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Configuration" })).toBeDisabled();
+      await act(async () => complete({ maven: null, gradle: [linked] }));
+      expect(ipc.gradle).toHaveBeenCalledExactlyOnceWith(":", "runtimeClasspath", false, expect.any(Number), "linked");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("shows an empty configuration list without running a dependency report or syncing again", () => {
+    act(() =>
+      useBuild.setState({
+        model: {
+          maven: null,
+          gradle: [{ ...gradle, projects: [{ ...gradle.projects[0]!, resolvableConfigurations: [] }] }],
+        },
+      }),
+    );
+    render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+    expect(screen.getByText("No resolvable Gradle configurations")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Configuration" })).toBeDisabled();
+    expect(ipc.gradle).not.toHaveBeenCalled();
+    expect(ipc.sync).not.toHaveBeenCalled();
+  });
+
+  it("routes identical project paths and report caches by linked build", async () => {
+    const builds = ["one", "two"].map((dir) => ({
+      ...gradle,
+      dir,
+      syncedAt: 1,
+      projects: gradle.projects.map((p) => ({ ...p, dir: `${dir}/${p.dir}`, buildFile: `${dir}/${p.buildFile}` })),
+    }));
+    ipc.gradle.mockResolvedValue([]);
+    act(() => {
+      useBuild.setState({ model: { maven: null, gradle: builds } });
+      useAnalyzer.setState({ module: 'gradle:["one",":app"]' });
+    });
+    render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+    await waitFor(() =>
+      expect(ipc.gradle).toHaveBeenCalledWith(":app", "runtimeClasspath", false, expect.any(Number), "one"),
+    );
+    act(() => useAnalyzer.setState({ module: 'gradle:["two",":app"]' }));
+    await waitFor(() =>
+      expect(ipc.gradle).toHaveBeenLastCalledWith(":app", "runtimeClasspath", false, expect.any(Number), "two"),
+    );
+    expect(ipc.gradle).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows why Gradle could not resolve the configuration", async () => {
+    ipc.gradle.mockRejectedValue(new Error("Could not resolve all files for configuration ':app:runtimeClasspath'."));
+    act(() => useAnalyzer.setState({ module: 'gradle:["",":"]' }));
+    render(<DependencyAnalyzer input={{ kind: ANALYZER_KIND, key: ANALYZER_KIND }} />);
+    expect(await screen.findByText("Cannot resolve dependencies")).toBeTruthy();
+    expect(screen.getByText(/Could not resolve all files/)).toBeTruthy();
+    ipc.gradle.mockResolvedValue([]);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry" })));
+    expect(ipc.gradle).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText("No dependencies")).toBeTruthy();
   });
 });

@@ -1,3 +1,6 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   _resetI18nForTests,
@@ -7,14 +10,14 @@ import {
   registerMessages,
   resolveLocale,
   setLocale,
+  SUPPORTED_LOCALES,
   t,
   tx,
+  txPart,
   txTemplate,
   useI18n,
 } from "./i18n";
 import en from "./locales/en.json";
-import zh from "./locales/zh.json";
-import zhText from "./locales/text/zh.json";
 
 afterEach(() => _resetI18nForTests());
 
@@ -44,6 +47,15 @@ describe("formatMessage", () => {
     expect(formatMessage(m, { count: 1 }, "en")).toBe("1 one");
   });
 
+  it("uses CLDR rules of the locale (French zero is singular, `many` falls back to `other`)", () => {
+    const m = "{count, plural, one {# fichier} other {# fichiers}}";
+    expect(formatMessage(m, { count: 0 }, "fr")).toBe("0 fichier");
+    expect(formatMessage(m, { count: 2 }, "fr")).toBe("2 fichiers");
+    expect(formatMessage(m, { count: 1_000_000 }, "fr")).toBe(
+      `${new Intl.NumberFormat("fr").format(1_000_000)} fichiers`,
+    );
+  });
+
   it("supports select and nesting", () => {
     const m = "{os, select, macos {Finder} windows {Explorer} other {Files}}";
     expect(formatMessage(m, { os: "macos" })).toBe("Finder");
@@ -70,8 +82,24 @@ describe("t / locales", () => {
   it("resolves locale tags", () => {
     expect(resolveLocale("zh-CN")).toBe("zh");
     expect(resolveLocale("zh_Hans")).toBe("zh");
+    expect(resolveLocale("zh-Hans-HK")).toBe("zh");
+    expect(resolveLocale("zh-TW")).toBe("zh-TW");
+    expect(resolveLocale("zh_tw")).toBe("zh-TW");
+    expect(resolveLocale("zh-HK")).toBe("zh-TW");
+    expect(resolveLocale("zh-Hant")).toBe("zh-TW");
+    expect(resolveLocale("zh-Hant-TW")).toBe("zh-TW");
+    expect(resolveLocale("ko-KR")).toBe("ko");
+    expect(resolveLocale("pt-BR")).toBe("pt");
+    expect(resolveLocale("pt_PT")).toBe("pt");
     expect(resolveLocale("EN-us")).toBe("en");
-    expect(resolveLocale("fr")).toBe("en");
+    expect(resolveLocale("fr")).toBe("fr");
+    expect(resolveLocale("fr-CA")).toBe("fr");
+    expect(resolveLocale("pl_PL")).toBe("pl");
+    expect(resolveLocale("tr-TR")).toBe("tr");
+    expect(resolveLocale("pl-PL")).toBe("pl");
+    expect(resolveLocale("es-MX")).toBe("es");
+    expect(resolveLocale("es_MX")).toBe("es");
+    expect(resolveLocale("xx")).toBe("en");
     expect(resolveLocale(undefined)).toBe(resolveLocale(navigator.language));
   });
 
@@ -91,10 +119,22 @@ describe("t / locales", () => {
     );
     await setLocale("zh-CN");
     expect(t("app.keymap.count", { count: 1 })).toBe("1 个快捷键");
+    await setLocale("zh-Hant-TW");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 個快速鍵");
+    await setLocale("pt-BR");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 atalho");
+    expect(t("app.keymap.count", { count: 5 })).toBe("5 atalhos");
+  });
+
+  it("switches to Korean", async () => {
+    await setLocale("ko-KR");
+    expect(useI18n.getState().locale).toBe("ko");
+    expect(t("common.cancel")).toBe("취소");
+    expect(tx("Cancel")).toBe("취소");
   });
 
   it("falls back to English for unsupported locales", async () => {
-    await setLocale("de");
+    await setLocale("xx");
     expect(useI18n.getState().locale).toBe("en");
   });
 
@@ -132,6 +172,16 @@ describe("t / locales", () => {
     expect(txTemplate("Retry failed")).toBe(`${tx("Retry")}失败`);
     expect(txTemplate("Sync with OS")).toBe("与操作系统同步");
     expect(txTemplate("Something else entirely")).toBe("Something else entirely");
+    expect(
+      txTemplate(
+        "The PHP language server can't rename this symbol; renaming only the plugin's indexed names would leave it half renamed",
+      ),
+    ).toBe("语言服务器无法重命名此符号（PHP）；仅重命名插件索引的名称会导致重命名不完整");
+    expect(
+      txTemplate(
+        "The Ruby language server can't rename this symbol; renaming only the plugin's indexed names would leave it half renamed",
+      ),
+    ).toBe("语言服务器无法重命名此符号（Ruby 语言）；仅重命名插件索引的名称会导致重命名不完整");
   });
 
   it("translates text built by the tx tag, again after the locale changes", async () => {
@@ -146,12 +196,58 @@ describe("t / locales", () => {
     expect(txTemplate(built)).toBe("运行 'orders'");
     const zh = tx`Run '${name}'`;
     expect(zh).toBe("运行 'orders'");
-    // Substituted text is translated when the catalog has it.
-    expect(tx`Run '${"Retry"}'`).toBe(`运行 '${tx("Retry")}'`);
+    // Values are inserted as written, even when the catalog has an entry for them…
+    expect(tx`Rename directory '${"tasks"}' and its usages to:`).toBe("将目录“tasks”及其用法重命名为：");
+    expect(tx`Run '${"Retry"}'`).toBe("运行 'Retry'");
+    // …unless they are marked as UI text, which is translated again after a locale change.
+    const marked = tx`Run '${txPart("Retry")}'`;
+    expect(marked).toBe(`运行 '${tx("Retry")}'`);
     // Values are inserted as they are, braces included.
     expect(tx`Drop ${"stash@{0}"}? This cannot be undone.`).toBe("是否丢弃 stash@{0}？此操作无法撤消。");
     await setLocale("en");
     expect(tx(zh)).toBe("Run 'orders'");
+    expect(tx(marked)).toBe("Run 'Retry'");
+  });
+
+  it("loads the Portuguese catalogs", async () => {
+    await setLocale("pt-BR");
+    expect(useI18n.getState().locale).toBe("pt");
+    expect(t("common.cancel")).toBe("Cancelar");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 atalho");
+    expect(t("app.keymap.count", { count: 5 })).toBe("5 atalhos");
+  });
+
+  it("loads the French catalogs", async () => {
+    await setLocale("fr-FR");
+    expect(useI18n.getState().locale).toBe("fr");
+    expect(t("common.cancel")).toBe("Annuler");
+    expect(t("app.keymap.count", { count: 0 })).toBe("0 raccourci");
+    expect(tx("Sync with OS")).toBe("Synchroniser avec le système");
+    expect(tx`Run '${"orders"}'`).toBe("Exécuter 'orders'");
+    expect(txTemplate("ruff is not installed")).toBe("ruff n'est pas installé");
+  });
+
+  it("loads the Polish catalogs", async () => {
+    await setLocale("pl-PL");
+    expect(useI18n.getState().locale).toBe("pl");
+    expect(t("common.cancel")).toBe("Anuluj");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 skrót");
+    expect(t("app.keymap.count", { count: 5 })).toBe("5 skrótów");
+  });
+
+  it("loads the Turkish catalogs", async () => {
+    await setLocale("tr-TR");
+    expect(useI18n.getState().locale).toBe("tr");
+    expect(t("common.cancel")).toBe("İptal");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 kısayol");
+  });
+
+  it("loads the Spanish catalogs", async () => {
+    await setLocale("es-MX");
+    expect(useI18n.getState().locale).toBe("es");
+    expect(t("common.cancel")).toBe("Cancelar");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 atajo");
+    expect(t("app.keymap.count", { count: 5 })).toBe("5 atajos");
   });
 
   it("lists keys by prefix", () => {
@@ -162,23 +258,144 @@ describe("t / locales", () => {
 });
 
 describe("catalogs", () => {
-  const catalogs: Record<string, Record<string, string>> = { en, zh };
+  type Catalog = Record<string, string>;
+  const LOCALES_DIR = join(dirname(fileURLToPath(import.meta.url)), "locales");
+  /** Catalog files of a folder as `{ locale: catalog }`, read from disk so that a new file is always seen. */
+  const readCatalogs = (dir: string) =>
+    Object.fromEntries(
+      readdirSync(dir)
+        .filter((file) => file.endsWith(".json"))
+        .map((file) => [file.slice(0, -5), JSON.parse(readFileSync(join(dir, file), "utf8")) as Catalog]),
+    );
 
-  it("translate source text into non-empty, different text", () => {
-    for (const [source, text] of Object.entries(zhText as Record<string, string>)) {
-      expect(text.trim(), source).not.toBe("");
-      expect(text, source).not.toBe(source);
+  const { en: _en, ...translations } = readCatalogs(LOCALES_DIR);
+  const texts = readCatalogs(join(LOCALES_DIR, "text"));
+  const catalogs: Record<string, Catalog> = { en, ...translations };
+  /** Must have every key; the other locales show English for keys they lack. */
+  const COMPLETE = ["zh"];
+  /** Written in another script, so a text equal to its English source was not translated. */
+  const OWN_SCRIPT = new Set(["zh", "ko"]);
+  /** Product names intentionally kept as written in every locale. */
+  const SAME_AS_ENGLISH = new Set([
+    "Flutter DevTools",
+    "4096 MB",
+    "6144 MB",
+    "8192 MB",
+    "12288 MB",
+    "16384 MB",
+    "Docker",
+    "URL",
+    "ID:",
+    "Code Vision",
+    "JUnit",
+    "⌘Enter",
+    "Fork",
+    "Shell",
+    "ID",
+    "my-agent",
+    "Java",
+    "Python",
+    "Python {short}",
+    "C/C++",
+    "C#",
+    "Go",
+    "Rust",
+    "Kotlin",
+    "Claude Code",
+    "GitHub Copilot",
+    "Codex",
+    "SKILL.md",
+    "context: fork",
+    "paths ({count})",
+    "paths",
+    "Cursor",
+    "PHP",
+    "SQL",
+    "COPY",
+    "INSERT",
+    "pg_restore",
+    "psql",
+    "JavaScript",
+    "TypeScript",
+    "HTML",
+    "CSS",
+    "JSON",
+    "YAML",
+    "XML",
+    "Maven",
+    "Flutter",
+    "Thymeleaf",
+    "sbt",
+    "Gradle",
+    "npm",
+    "pnpm",
+    "Yarn",
+    "Cargo",
+    "CMake",
+    "f-string",
+    "Tailwind CSS",
+    "Bun",
+    "Deno",
+    "Node.js",
+    "bun-dap (Bun)",
+  ]);
+  const translated = SUPPORTED_LOCALES.filter((locale) => locale !== "en").sort();
+
+  it("exist for exactly the supported locales", () => {
+    expect(translated.length).toBeGreaterThan(0);
+    expect(Object.keys(translations).sort()).toEqual(translated);
+    expect(Object.keys(texts).sort()).toEqual([...SUPPORTED_LOCALES].sort());
+  });
+
+  it("are the locales the backend picks from the OS language on first launch", () => {
+    const rust = readFileSync(join(LOCALES_DIR, "../../../crates/ide-workspace/src/settings.rs"), "utf8");
+    const list = /pub const UI_LOCALES: &\[&str\] = &\[([^\]]*)\]/.exec(rust)?.[1] ?? "";
+    expect([...list.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()).toEqual([...SUPPORTED_LOCALES].sort());
+  });
+
+  it("list every key once", () => {
+    // JSON.parse keeps the last of two equal keys, so a merge that adds a key twice goes unnoticed.
+    for (const dir of [LOCALES_DIR, join(LOCALES_DIR, "text")]) {
+      for (const file of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
+        const keys = [...readFileSync(join(dir, file), "utf8").matchAll(/^ {2}("(?:[^"\\]|\\.)*"):/gm)].map(
+          (m) => JSON.parse(m[1]!) as string,
+        );
+        const seen = new Set<string>();
+        const repeated = keys.filter((key) => seen.has(key) || !seen.add(key));
+        expect(repeated, `${file} in ${dir}`).toEqual([]);
+      }
     }
+  });
+
+  it("translate source text into non-empty text", () => {
+    for (const [locale, catalog] of Object.entries(texts))
+      for (const [source, text] of Object.entries(catalog)) expect(text.trim(), `${locale}:${source}`).not.toBe("");
+  });
+
+  it("translate source text into text different from English, in locales with another script", () => {
+    for (const [locale, catalog] of Object.entries(texts))
+      if (OWN_SCRIPT.has(locale))
+        for (const [source, text] of Object.entries(catalog))
+          if (!SAME_AS_ENGLISH.has(source)) expect(text, `${locale}:${source}`).not.toBe(source);
   });
 
   it("keep the placeholders of source-text templates", () => {
     const names = (m: string) => [...m.matchAll(/\{(\w+)\}/g)].map((x) => x[1]).sort();
-    for (const [source, text] of Object.entries(zhText as Record<string, string>))
-      expect(names(text), source).toEqual(names(source));
+    for (const [locale, catalog] of Object.entries(texts))
+      for (const [source, text] of Object.entries(catalog))
+        expect(names(text), `${locale}:${source}`).toEqual(names(source));
   });
 
-  it("have the same keys", () => {
-    expect(Object.keys(zh).sort()).toEqual(Object.keys(en).sort());
+  it.each(COMPLETE)("have the same keys as English (%s)", (locale) => {
+    expect(Object.keys(translations[locale]!).sort()).toEqual(Object.keys(en).sort());
+  });
+
+  it("have no keys English lacks", () => {
+    for (const [locale, catalog] of Object.entries(translations))
+      expect(
+        Object.keys(catalog).filter((key) => !Object.hasOwn(en, key)),
+        locale,
+      ).toEqual([]);
   });
 
   it("contain only well-formed messages", () => {
@@ -189,9 +406,8 @@ describe("catalogs", () => {
 
   it("use the same parameters across locales", () => {
     const params = (m: string) => [...m.matchAll(/\{\s*([a-z]\w*)\s*[,}]/g)].map((x) => x[1]).sort();
-    for (const key of Object.keys(en))
-      expect(params((zh as Record<string, string>)[key] ?? ""), key).toEqual(
-        params((en as Record<string, string>)[key]!),
-      );
+    for (const [locale, catalog] of Object.entries(translations))
+      for (const [key, message] of Object.entries(catalog))
+        expect(params(message), `${locale}:${key}`).toEqual(params((en as Record<string, string>)[key] ?? ""));
   });
 });

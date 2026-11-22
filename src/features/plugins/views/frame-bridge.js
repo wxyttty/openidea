@@ -1,0 +1,210 @@
+/*
+ * `window.openidea` inside a plugin view's sandboxed frame: the frame's only
+ * way to the IDE. Shared by both kinds of frames: inlined into the `html`
+ * bodies plugin code renders (src/features/plugins/views/frame.ts) and
+ * injected by the desktop into the pages of web views
+ * (src-tauri/src/plugin_web.rs). Part of the plugin API: members are only
+ * ever added.
+ *
+ * The file is one function expression, called with the IDE theme when it is
+ * known up front (null otherwise: the workbench posts it once the frame has
+ * loaded).
+ *
+ * Editor panels (`[[contributes.editorPanels]]`) load their page with
+ * `?openidea=editor-panel`; only there is `openidea.editor`. The workbench answers
+ * its requests only from the frames of editor panels.
+ */
+(initialTheme) => {
+  const TAG = "openidea-view";
+  const listeners = [];
+  const themeListeners = [];
+  const documentListeners = [];
+  const editorListeners = {
+    target: [],
+    viewport: [],
+    highlights: [],
+    problems: [],
+    layout: [],
+    selections: [],
+    changes: [],
+  };
+  const editorPanel = /(?:^|[?&])openidea=editor-panel(?:&|$)/.test(location.search.slice(1));
+  const pending = new Map();
+  const root = document.documentElement;
+  let theme = null;
+  let applied = [];
+  let nextCall = 1;
+
+  const safely = (fn, value) => {
+    try {
+      fn(value);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const applyTheme = (t) => {
+    if (!t || typeof t !== "object" || !t.vars || typeof t.vars !== "object") return;
+    const vars = {};
+    for (const [k, v] of Object.entries(t.vars)) if (k.startsWith("--openidea-") && typeof v === "string") vars[k] = v;
+    for (const k of applied) if (!(k in vars)) root.style.removeProperty(k);
+    for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+    applied = Object.keys(vars);
+    root.dataset.theme = t.dark ? "dark" : "light";
+    // Chromium (WebView2) paints an opaque backdrop behind a frame whose color-scheme differs from the
+    // workbench's, so web view pages (no BASE_STYLE) would turn white under a dark theme.
+    root.style.colorScheme = t.dark ? "dark" : "light";
+    theme = Object.freeze({ dark: !!t.dark, vars: Object.freeze(vars) });
+    for (const l of themeListeners) safely(l, theme);
+  };
+
+  /** A request to the workbench; resolves with its reply. */
+  const call = (op, args, transfer) =>
+    new Promise((resolve, reject) => {
+      const id = nextCall++;
+      pending.set(id, { resolve, reject });
+      window.parent.postMessage({ tag: TAG, call: id, op, args }, "*", transfer || []);
+    });
+
+  const bytesOf = async (data) => {
+    if (typeof data === "string") return new TextEncoder().encode(data);
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
+    throw new TypeError("data must be a string, bytes or a Blob");
+  };
+
+  if (initialTheme) applyTheme(initialTheme);
+
+  const stepFrameFontZoom = (delta) => {
+    const cur = Math.round((parseFloat(root.style.zoom || "1") || 1) * 100);
+    const next = delta === 0 ? 100 : Math.max(60, Math.min(200, cur + delta * 8));
+    root.style.zoom = next === 100 ? "" : (next / 100).toFixed(2);
+  };
+
+  // IDE shortcuts (Save, Close, Find Action…) pressed while the page has focus:
+  // the ones the page left alone go to the workbench. Editing keys stay here.
+  const EDITING_KEYS = new Set(["a", "c", "v", "x", "z", "y"]);
+  window.addEventListener("keydown", (e) => {
+    const fn = /^F\d{1,2}$/.test(e.key);
+    const mod = (e.metaKey || e.ctrlKey || e.altKey) && !EDITING_KEYS.has(e.key.toLowerCase());
+    if (e.isComposing || (!fn && !mod)) return;
+    // After every handler of the page has seen it.
+    setTimeout(() => {
+      if (e.defaultPrevented) return;
+      const { key, code, metaKey, ctrlKey, altKey, shiftKey, repeat } = e;
+      window.parent.postMessage({ tag: TAG, key: { key, code, metaKey, ctrlKey, altKey, shiftKey, repeat } }, "*");
+    }, 0);
+  });
+  window.addEventListener("message", (e) => {
+    const m = e.data;
+    if (e.source !== window.parent || !m || m.tag !== TAG) return;
+    if (m.theme) applyTheme(m.theme);
+    else if (m.fontZoomDelta === -1 || m.fontZoomDelta === 0 || m.fontZoomDelta === 1)
+      stepFrameFontZoom(m.fontZoomDelta);
+    else if (typeof m.reply === "number") {
+      const p = pending.get(m.reply);
+      pending.delete(m.reply);
+      if (p) "error" in m ? p.reject(new Error(String(m.error))) : p.resolve(m.value);
+    } else if (m.document) {
+      for (const l of documentListeners) safely(l, m.document);
+    } else if (editorPanel && typeof m.editor === "string") {
+      // Only those lists: not `constructor` and the like.
+      const list = editorListeners[m.editor];
+      if (Array.isArray(list)) for (const l of list) safely(l, m.value);
+    } else if (typeof m.text === "string") {
+      for (const l of listeners) safely(l, m.text);
+    }
+  });
+
+  const documentApi = Object.freeze({
+    /** `{ version, text, readOnly, name }` of the document a custom editor shows (`name`: the file's, no directory). */
+    get: () => call("document.get"),
+    /** The bytes of the file the custom editor shows (read-only, so the disk is current). */
+    bytes: () => call("document.bytes"),
+    /** Called with `{ version, text }` when the document changes other than through this frame. */
+    onChange: (fn) => {
+      if (typeof fn === "function") documentListeners.push(fn);
+    },
+    /**
+     * Applies `edits` (`{ from, to, insert }`, offsets in UTF-16 code units of
+     * the text at `version`) as one change; rejects with "stale" when the
+     * document is no longer at `version`. Resolves with the new version.
+     */
+    edit: (version, edits) => call("document.edit", { version, edits }),
+    /** Replaces the whole text (sent as the smallest edit). */
+    replace: (version, text) => call("document.replace", { version, text: String(text) }),
+  });
+
+  const listen = (list) => (fn) => {
+    if (typeof fn === "function") list.push(fn);
+  };
+  /** The text editor of the editor group the panel is in. */
+  const editorApi = Object.freeze({
+    /** `{ path, language, version, lineCount, tabSize }` of the group's file, or null. */
+    get: () => call("editor.get"),
+    /** Called with the new `get()` value when the group shows another file, or none, or the file's tab size changes. */
+    onTarget: listen(editorListeners.target),
+    /** The group's document, read-only (`edit` / `replace` reject). */
+    document: documentApi,
+    /** `{ firstLine, lastLine, lineCount, scrollTop, scrollHeight, clientHeight }`; 0-based, fractional lines. */
+    viewport: () => call("editor.viewport"),
+    /** Called with `viewport()` after scrolling, resizing and folding, at most once a frame. */
+    onViewport: listen(editorListeners.viewport),
+    /** Scrolls so that (fractional) `line` is at the top of the visible area. */
+    scrollTo: (line) => call("editor.scrollTo", { line: Number(line) }),
+    /** Scrolls the editor by `pixels` (the page's wheel). */
+    scrollBy: (pixels) => call("editor.scrollBy", { pixels: Number(pixels) }),
+    /** Syntax colours of lines `fromLine` up to `toLine` (exclusive), at most 2000: per line `[{ from, to, color }]`. */
+    highlights: (fromLine, toLine) => call("editor.highlights", { fromLine: Number(fromLine), toLine: Number(toLine) }),
+    /** Called with `{ fromLine, toLine }` when those lines' colours may have changed. */
+    onHighlights: listen(editorListeners.highlights),
+    /** The marker bar's problems: `[{ line, lastLine, severity }]`, severity `error`, `warning` or `weakWarning`. */
+    problems: () => call("editor.problems"),
+    /** Called with `problems()` when a problem appears or goes away, or its lines move, at most once a frame. */
+    onProblems: listen(editorListeners.problems),
+    /** The folded ranges: `[{ fromLine, toLine }]`, the line that stays visible and the last one hidden. */
+    folded: () => call("editor.folded"),
+    /** Visual rows of lines `fromLine` up to `toLine` (exclusive), at most 2000; 0 for folded-away lines. Null without soft wrap. */
+    wrapped: (fromLine, toLine) => call("editor.wrapped", { fromLine: Number(fromLine), toLine: Number(toLine) }),
+    /** Called with `{ folded, softWrap }` when folds change, soft wrap turns on or off, or wrapped rows may have changed, at most once a frame. */
+    onLayout: listen(editorListeners.layout),
+    /** The caret and selections: `[{ anchor: { line, column }, head: { line, column } }]`, the main one first; a caret has `anchor` equal to `head`. */
+    selections: () => call("editor.selections"),
+    /** Called with `selections()` when the caret moves, a selection changes, or the group shows another file, at most once a frame. */
+    onSelections: listen(editorListeners.selections),
+    /** The VCS changes beside the line numbers: `[{ line, lastLine, kind }]`, kind `added`, `modified` or `deleted` (`lastLine` equals `line`, the line below the deleted text). */
+    changes: () => call("editor.changes"),
+    /** Called with `changes()` when the changes are recomputed or edits move them, or the group shows another file, at most once a frame. */
+    onChanges: listen(editorListeners.changes),
+  });
+
+  window.openidea = Object.freeze({
+    /** To the plugin's code (`ViewEvent::Message`). */
+    postMessage: (text) => window.parent.postMessage({ tag: TAG, text: String(text) }, "*"),
+    /** From the plugin's code (`host::post_view_message`). */
+    onMessage: (fn) => {
+      if (typeof fn === "function") listeners.push(fn);
+    },
+    get theme() {
+      return theme;
+    },
+    onThemeChange: (fn) => {
+      if (typeof fn === "function") themeListeners.push(fn);
+    },
+    document: documentApi,
+    /**
+     * Asks the user where to save `data` (a string, bytes or a Blob), starting
+     * with `name`; resolves with the chosen path, or null when cancelled.
+     */
+    saveFile: async ({ name, data, filters } = {}) => {
+      // A copy: its buffer is handed over, the caller's data stays usable.
+      const bytes = (await bytesOf(data)).slice();
+      return call("saveFile", { name: String(name || "untitled"), filters, bytes }, [bytes.buffer]);
+    },
+    /** Asks the user for a file; resolves with `{ name, data }` (bytes), or null when cancelled. */
+    openFile: ({ filters } = {}) => call("openFile", { filters }),
+    ...(editorPanel ? { editor: editorApi } : {}),
+  });
+};

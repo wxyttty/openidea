@@ -12,16 +12,10 @@ export function sshTestRemedy(kind: string | undefined, message: string, auth: S
   if (kind !== "permissionDenied") return null;
   if (/^SSH host key .* has changed/.test(message)) return null;
   if (/^SSH (password|key passphrase) required|^cannot decrypt SSH key/.test(message)) return "secret";
+  if (/^FTP (password required|authentication failed)/.test(message)) return "secret";
   // With OpenSSH config + agent there is nothing to type unless a key is encrypted.
   if (/^SSH authentication failed/.test(message)) return auth === "openSsh" ? null : "secret";
   return null;
-}
-
-/** "Password" or "Passphrase", from the configuration and the prompt. */
-export function secretKind(auth: SshAuthValid, message = ""): "password" | "passphrase" {
-  if (/passphrase|decrypt/.test(message)) return "passphrase";
-  if (/password/.test(message)) return "password";
-  return auth === "password" ? "password" : "passphrase";
 }
 
 /** A port typed in the Port field (empty or invalid: the default). */

@@ -16,6 +16,7 @@
   outline: none;
   transition: background var(--dur) var(--ease);
 }
+/* Dividers use col-/row-resize: WebKit on macOS 26.2 shows the arrow for ew-/ns-resize. */
 .handle[aria-orientation="vertical"] {
   width: 1px;
   cursor: col-resize;

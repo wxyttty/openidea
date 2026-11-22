@@ -33,8 +33,10 @@ fn open_workbench(cx: &mut TestAppContext, settings_toml: Option<&str>) -> Fixtu
     let temp = tempfile::tempdir().expect("temp dir");
     let config_dir = temp.path().join("config");
     let data_dir = temp.path().join("data");
+    let local_data_dir = temp.path().join("local-data");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&local_data_dir).unwrap();
     if let Some(settings) = settings_toml {
         std::fs::write(config_dir.join("settings.toml"), settings).unwrap();
     }
@@ -55,6 +57,7 @@ fn open_workbench(cx: &mut TestAppContext, settings_toml: Option<&str>) -> Fixtu
         Arc::new(Host::new(HostConfig {
             config_dir: config_dir.clone(),
             data_dir: data_dir.clone(),
+            local_data_dir: local_data_dir.clone(),
             languages,
             syntax: Arc::new(OnceLock::new()),
             sink_for,

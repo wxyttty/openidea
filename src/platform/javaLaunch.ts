@@ -4,8 +4,18 @@
  * `${classpath}` (or `${testClasspath}`) and the `java` launcher are resolved
  * through jdtls when the configuration starts.
  */
-import { call, commands, type JavaLaunchInfo, type RunConfig, type RequestId } from "@/platform/ipc";
+import {
+  call,
+  commands,
+  IpcError,
+  type BuildPolicy,
+  type JavaLaunchInfo,
+  type RunConfig,
+  type RequestId,
+} from "@/platform/ipc";
 import { tx } from "@/platform/i18n";
+import { useBuildPresentation } from "@/platform/projectPresentation";
+import { isRemoteWindow } from "@/platform/remote";
 
 export const CLASSPATH = "${classpath}";
 export const TEST_CLASSPATH = "${testClasspath}";
@@ -14,6 +24,25 @@ export const JVM_APPLICATION_KINDS = ["application", "spring-boot"];
 
 export function isJvmApplication(config: Pick<RunConfig, "kind">): boolean {
   return JVM_APPLICATION_KINDS.includes(config.kind);
+}
+
+/** Run configuration kinds whose JVM gets the plugins' Java agents (`[[contributes.javaAgents]]`). */
+const JAVA_AGENT_KINDS = ["application", "spring-boot", "jar-application"];
+
+/**
+ * The console line of a Java launch in a remote project, when plugins with a granted
+ * `java.agent` would have added their agent: the JVM runs on the server, and agents load
+ * only into JVMs on this machine. `null` otherwise. Plugins are the desktop's own.
+ */
+export async function remoteJavaAgentNote(config: Pick<RunConfig, "kind">): Promise<string | null> {
+  if (!JAVA_AGENT_KINDS.includes(config.kind) || !isRemoteWindow()) return null;
+  const snapshot = await call(commands.pluginList()).catch(() => null);
+  const names = (snapshot?.plugins ?? [])
+    .filter((p) => p.enabled && p.capabilities.some((c) => c.id === "java.agent" && c.granted))
+    .map((p) => p.name);
+  if (!names.length) return null;
+  const list = names.join(", ");
+  return tx`Java agents of ${list} were not added: they load only in local projects.` + "\n";
 }
 
 /** `java` options whose value is the next argument. */
@@ -37,6 +66,7 @@ export interface JavaCommandLine {
   /** VM options, without the classpath. */
   vmArgs: string[];
   mainClass: string | null;
+  jarPath?: string;
   programArgs: string[];
   /** Which classpath placeholder the configuration uses (`null`: an explicit classpath or none). */
   classpath: "runtime" | "test" | null;
@@ -51,6 +81,15 @@ export function parseJavaArgs(args: readonly string[]): JavaCommandLine {
   let explicitClasspath: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
+    if (a === "-jar")
+      return {
+        vmArgs,
+        mainClass: null,
+        jarPath: args[i + 1],
+        programArgs: args.slice(i + 2),
+        classpath,
+        explicitClasspath,
+      };
     if (a === "-cp" || a === "-classpath" || a === "--class-path") {
       const value = args[++i] ?? "";
       if (value === CLASSPATH) classpath = "runtime";
@@ -71,10 +110,21 @@ export function parseJavaArgs(args: readonly string[]): JavaCommandLine {
   return { vmArgs, mainClass: null, programArgs: [], classpath, explicitClasspath };
 }
 
+/**
+ * VM options a launch adds for the console, as IDEA's Spring Boot configurations do: the
+ * console renders ANSI colours, but Spring only detects a terminal, and the process runs on pipes.
+ * Kept out when the configuration sets the property itself.
+ */
+export function consoleVmArgs(config: Pick<RunConfig, "kind" | "args">): string[] {
+  if (config.kind !== "spring-boot") return [];
+  const own = parseJavaArgs(config.args).vmArgs.some((a) => a.startsWith("-Dspring.output.ansi.enabled="));
+  return own ? [] : ["-Dspring.output.ansi.enabled=always"];
+}
+
 /** The configuration with its placeholders and launcher resolved. */
 export function resolveJavaCommand(config: RunConfig, info: JavaLaunchInfo): RunConfig {
   const cp = info.classPaths.join(info.pathListSeparator);
-  const args: string[] = [];
+  const args: string[] = [...consoleVmArgs(config)];
   if (info.modulePaths.length && !config.args.some((a) => a === "-p" || a === "--module-path"))
     args.push("--module-path", info.modulePaths.join(info.pathListSeparator));
   args.push(...config.args.map((a) => (a === CLASSPATH || a === TEST_CLASSPATH ? cp : a)));
@@ -99,6 +149,14 @@ export function joinJavaArgs(args: readonly string[]): string {
 /** JDWP agent options: listen on a free local port and wait for the debugger. */
 export const JDWP_AGENT = "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0";
 
+/** Makes a HotSpot JVM open its attach socket at start-up; the memory view finds the debuggee through it. */
+export const ATTACH_LISTENER = "-XX:+StartAttachListener";
+
+/** True when VM options already decide about the attach mechanism, so the IDE must not override them. */
+export function optsOutOfAttach(text: string): boolean {
+  return /StartAttachListener|DisableAttachMechanism/.test(text);
+}
+
 /** The port of `Listening for transport dt_socket at address: 5005` (JDWP's start-up line). */
 export function jdwpListeningPort(line: string): number | null {
   const m = /Listening for transport dt_socket at address:\s*(?:[\w.[\]:-]*:)?(\d+)\s*$/.exec(line.trim());
@@ -106,11 +164,19 @@ export function jdwpListeningPort(line: string): number | null {
 }
 
 /**
- * Module directory (relative to the project root, `""` for the root) of a JVM
- * source file: the part before `src/{main,test}/…`, else the working directory
- * of the closest Maven / Gradle configuration.
+ * Module directory (relative to the project root, `""` for the root; absolute for a
+ * module outside it) of a JVM source file. Like IDEA's `ProjectFileIndex.getModuleForFile`:
+ * the innermost Maven / Gradle module folder holding the file, as the build model knows
+ * them (`modules`). Before a model knows a deeper one: the part before
+ * `src/{main,test}/…`, else the working directory of the closest Maven / Gradle configuration.
  */
-export function jvmModuleDir(relPath: string, configs: readonly RunConfig[] = []): string {
+export function jvmModuleDir(
+  relPath: string,
+  configs: readonly RunConfig[] = [],
+  modules: Iterable<string> = useBuildPresentation.getState().modules.keys(),
+): string {
+  const owner = [...modules].filter((d) => d && relPath.startsWith(d + "/")).sort((a, b) => b.length - a.length)[0];
+  if (owner) return owner;
   const m = /^(?:(.*)\/)?src\/(?:main|test|[\w-]+)\/(?:java|kotlin|scala|groovy)\//.exec(relPath);
   if (m) return m[1] ?? "";
   const cwds = configs
@@ -126,7 +192,13 @@ export async function findJavaModule(config: RunConfig): Promise<string | null> 
   if (config.module != null) return config.module;
   const main = parseJavaArgs(config.args).mainClass;
   if (!main) return null;
-  const outer = main.split("$")[0]!;
+  const modules = await classModules(main);
+  return modules.length === 1 ? modules[0]! : null;
+}
+
+/** Module directories (as {@link jvmModuleDir}) of the project's sources declaring the class `binaryName`. */
+export async function classModules(binaryName: string): Promise<string[]> {
+  const outer = binaryName.split("$")[0]!;
   const simple = outer.slice(outer.lastIndexOf(".") + 1);
   const pkg = outer.slice(0, Math.max(0, outer.lastIndexOf(".")));
   const names = [`${simple}.java`, `${simple}.kt`, ...(simple.endsWith("Kt") ? [`${simple.slice(0, -2)}.kt`] : [])];
@@ -140,7 +212,7 @@ export async function findJavaModule(config: RunConfig): Promise<string | null> 
     const sourcePackage = /^\s*package\s+([\w.]+)\s*[;\r\n]/m.exec(text)?.[1] ?? "";
     if (sourcePackage === pkg) modules.add(jvmModuleDir(file.relPath, configs));
   }
-  return modules.size === 1 ? [...modules][0]! : null;
+  return [...modules];
 }
 
 export async function resolveJavaModule(config: RunConfig): Promise<string> {
@@ -150,31 +222,73 @@ export async function resolveJavaModule(config: RunConfig): Promise<string> {
   return module;
 }
 
+/** Saves before resolving the module, for direct and delegated Run and Debug. */
+export async function prepareJavaModule(config: RunConfig, saveAll?: () => Promise<void>, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  await saveAll?.();
+  signal?.throwIfAborted();
+  const module = await resolveJavaModule(config);
+  signal?.throwIfAborted();
+  return module;
+}
+
 /** Shared, cancellable build and classpath preparation for Run and Debug. */
 export interface JavaPreparation {
   request: RequestId;
   signal: AbortSignal;
   report?: (text: string, kind?: "system" | "stderr") => void;
+  /** Before launch build; unset reads the run configuration (default: automatic/incremental). */
+  policy?: BuildPolicy;
+  /** Saves open documents first, as IDEA's Before launch does. */
+  saveAll?: () => Promise<void>;
 }
+
+/** The build the launch would do: the configuration's policy, else incremental. */
+export function buildPolicyOf(config: RunConfig): BuildPolicy {
+  return config.buildPolicy ?? "automatic";
+}
+
+/** A build stopped the launch: the message is ready for the console and the notification. */
+export class JavaBuildFailedError extends Error {}
 
 export async function prepareJavaLaunch(config: RunConfig, preparation: JavaPreparation) {
   const { signal, report } = preparation;
+  const policy = preparation.policy ?? buildPolicyOf(config);
   signal.throwIfAborted();
   const parsed = parseJavaArgs(config.args);
   if (!parsed.mainClass) throw new Error(`No main class in '${config.name}'`);
   report?.(tx`Building and resolving the classpath of ${parsed.mainClass}…` + "\n");
   const started = performance.now();
-  const module = await resolveJavaModule(config);
-  signal.throwIfAborted();
+  const module = await prepareJavaModule(config, preparation.saveAll, signal);
   const moduleMs = performance.now() - started;
-  const info = await call(commands.javaResolveLaunch(module, parsed.classpath === "test", true, preparation.request));
+  const info = await call(
+    commands.javaResolveLaunch(module, parsed.classpath === "test", policy, preparation.request),
+  ).catch((error: unknown) => {
+    if (
+      error instanceof IpcError &&
+      error.kind !== "cancelled" &&
+      /^jdtls:.*(?:does not belong to any java project|references non-existing project|not a java project)/i.test(
+        error.message,
+      )
+    )
+      throw new Error(
+        tx`Java module '${module || "."}' is not imported. Wait for Java project import to finish. If it still fails, check the run configuration's module and whether it is included in the parent Maven or Gradle build, or open its folder as a project.`,
+      );
+    throw error;
+  });
   signal.throwIfAborted();
   console.info("Java launch preparation", { module, moduleMs, resolveMs: performance.now() - started - moduleMs });
-  if (info.build === "withErrors")
-    report?.(tx("Build completed with errors; launching with the last compiled classes.") + "\n", "stderr");
-  if (info.build === "failed") report?.(tx("Build failed; launching with the last compiled classes.") + "\n", "stderr");
   const errors = formatCompileErrors(info);
   if (errors) report?.(errors, "stderr");
+  // IDEA's default: a failed build (or one with compile errors) does not start the program;
+  // only "Build, no error check" continues with the last compiled classes.
+  if ((info.build === "failed" || info.build === "withErrors") && policy !== "makeAndContinueOnErrors") {
+    const reason =
+      info.build === "failed"
+        ? tx`Build failed; '${config.name}' was not started.`
+        : tx`Build has compile errors; '${config.name}' was not started.`;
+    throw new JavaBuildFailedError(reason);
+  }
   if (parsed.classpath && !info.classPaths.length)
     throw new Error(tx("The classpath is empty: is the module imported by the Java language server?"));
   return { module, info, resolved: resolveJavaCommand(config, info) };

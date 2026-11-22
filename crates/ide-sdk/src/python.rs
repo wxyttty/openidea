@@ -1,7 +1,7 @@
 //! Python environments: creating virtualenvs and managing packages with pip
 //! (or `uv pip` for environments created by uv, which ship without pip).
 
-use crate::exec::{query, stream, which};
+use crate::exec::{query_in, query_in_cancellable, stream, which};
 use crate::{Sdk, bin_dir, exe, venv_of};
 use ide_core::{CancellationToken, IdeError, IdeResult};
 use serde::{Deserialize, Serialize};
@@ -16,27 +16,201 @@ pub struct PythonPackage {
     pub version: String,
 }
 
-/// Creates a virtualenv at `location` with `base -m venv` and returns its interpreter.
+/// The tool that creates a new Python environment in "Add Python Interpreter".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum VenvTool {
+    /// `base -m venv <location>`.
+    Venv,
+    /// `uv venv <location> --python <base>` (uv must be on PATH).
+    Uv,
+    /// `poetry env use <base>` in the project, then `poetry env info --path`.
+    Poetry,
+    /// `conda create -n <name> -y` for a bare name, else `-p <location>` (conda must be on PATH).
+    Conda,
+}
+
+/// Creates a virtualenv at `location` with `tool` and returns its interpreter.
+/// `base` is the interpreter uv / venv build on, or the one poetry's env uses.
 pub fn create_venv(
+    tool: VenvTool,
     base: &Path,
     location: &Path,
     cancel: &CancellationToken,
     on_line: &dyn Fn(String),
 ) -> IdeResult<Sdk> {
-    if location.join("pyvenv.cfg").is_file() {
+    create_venv_with(tool, base, location, which, cancel, on_line)
+}
+
+/// [`create_venv`] with the tool lookup injectable (tests fake `uv` / `poetry`).
+pub(crate) fn create_venv_with(
+    tool: VenvTool,
+    base: &Path,
+    location: &Path,
+    which: impl Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    match tool {
+        VenvTool::Venv | VenvTool::Uv => {
+            if location.join("pyvenv.cfg").is_file() {
+                return Err(IdeError::new(
+                    ide_core::error::ErrorKind::AlreadyExists,
+                    format!("{} already contains a virtual environment", location.display()),
+                ));
+            }
+            if let Some(parent) = location.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let (program, args) = match tool {
+                VenvTool::Uv => {
+                    let uv = which("uv").ok_or_else(|| {
+                        IdeError::unavailable("uv is not installed (install it from https://docs.astral.sh/uv)")
+                    })?;
+                    (
+                        uv,
+                        vec![
+                            "venv".to_owned(),
+                            location.to_string_lossy().into_owned(),
+                            "--python".to_owned(),
+                            base.to_string_lossy().into_owned(),
+                        ],
+                    )
+                }
+                _ => (base.to_path_buf(), venv_args(location)),
+            };
+            stream(&program, &args, None, &[], cancel, on_line)?;
+            let python = location.join(bin_dir()).join(exe("python"));
+            crate::discover::python_sdk(&python, "venv", location.parent().and_then(Path::parent))
+                .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+        }
+        VenvTool::Poetry => create_poetry_env(base, location, &which, cancel, on_line),
+        VenvTool::Conda => create_conda_env(base, location, &which, cancel, on_line),
+    }
+}
+
+/// `poetry env use <base>` in the project directory (the parent of `location`, which the
+/// dialog fills with `<root>/.venv` only as a hint — poetry keeps its envs under its own
+/// cache), then `poetry env info --path` for the interpreter it made or reused.
+fn create_poetry_env(
+    base: &Path,
+    location: &Path,
+    which: &dyn Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    let poetry = which("poetry")
+        .ok_or_else(|| IdeError::unavailable("Poetry is not installed (install it from https://python-poetry.org)"))?;
+    let project = location
+        .parent()
+        .filter(|p| p.is_dir())
+        .ok_or_else(|| IdeError::invalid("Poetry environments need an open project directory"))?;
+    stream(
+        &poetry,
+        &["env".to_owned(), "use".to_owned(), base.to_string_lossy().into_owned()],
+        Some(project),
+        &[],
+        cancel,
+        on_line,
+    )?;
+    let home = query_in(&poetry, &["env", "info", "--path"], Some(project), &[], Duration::from_secs(30))
+        .map(PathBuf::from)
+        .ok_or_else(|| IdeError::internal("poetry created no environment".to_owned()))?;
+    let python = home.join(bin_dir()).join(exe("python"));
+    crate::discover::python_sdk(&python, "venv", Some(project))
+        .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+}
+
+/// `conda create -n <name> -y` builds a named environment in conda's envs directory when
+/// `location` is a bare name, `conda create -p <location> -y` one at that prefix otherwise.
+/// `base` pins the Python version (`python=<major.minor>`) when it reports one, so the
+/// created env matches the interpreter the user picked rather than conda's default.
+fn create_conda_env(
+    base: &Path,
+    location: &Path,
+    which: &dyn Fn(&str) -> Option<PathBuf>,
+    cancel: &CancellationToken,
+    on_line: &dyn Fn(String),
+) -> IdeResult<Sdk> {
+    // A bare name is a named environment in conda's own envs directory (`conda create -n`).
+    let name = conda_env_name(location);
+    if name.is_none() && location.join("conda-meta").is_dir() {
         return Err(IdeError::new(
             ide_core::error::ErrorKind::AlreadyExists,
-            format!("{} already contains a virtual environment", location.display()),
+            format!("{} already contains a conda environment", location.display()),
         ));
     }
-    if let Some(parent) = location.parent() {
+    let conda = which("conda")
+        .ok_or_else(|| IdeError::unavailable("conda is not installed (install it from https://docs.conda.io)"))?;
+    let prefixes = || {
+        query_in(&conda, &["env", "list"], None, &[], Duration::from_secs(15))
+            .map(|list| crate::discover::conda_env_list_prefixes(&list))
+            .unwrap_or_default()
+    };
+    if let Some(name) = name {
+        if prefixes().iter().any(|p| p.file_name().is_some_and(|n| n == name)) {
+            return Err(IdeError::new(
+                ide_core::error::ErrorKind::AlreadyExists,
+                format!("A conda environment named {name} already exists"),
+            ));
+        }
+    } else if let Some(parent) = location.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let args = vec!["-m".to_owned(), "venv".to_owned(), location.to_string_lossy().into_owned()];
-    stream(base, &args, None, &[], cancel, on_line)?;
-    let python = location.join(bin_dir()).join(exe("python"));
-    crate::discover::python_sdk(&python, "venv", location.parent().and_then(Path::parent))
+    let version = query_in(base, &["--version"], None, &[], Duration::from_secs(15))
+        .and_then(|v| v.strip_prefix("Python ").map(str::to_owned));
+    stream(&conda, &conda_create_args(location, version.as_deref()), None, &[], cancel, on_line)?;
+    let prefix = match name {
+        Some(name) => prefixes()
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == name))
+            .ok_or_else(|| IdeError::internal(format!("conda did not report the environment {name}")))?,
+        None => location.to_path_buf(),
+    };
+    // Conda keeps `python.exe` at the prefix root on Windows, not under Scripts/.
+    let python = [prefix.join(exe("python")), prefix.join(bin_dir()).join(exe("python"))]
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| prefix.join(bin_dir()).join(exe("python")));
+    crate::discover::python_sdk(&python, "conda", prefix.parent().and_then(Path::parent))
         .ok_or_else(|| IdeError::internal(format!("{} was not created", python.display())))
+}
+
+/// The environment name when `location` is a bare name rather than a path.
+fn conda_env_name(location: &Path) -> Option<&str> {
+    let text = location.to_str()?;
+    (!text.is_empty() && !text.contains(['/', '\\', ':']) && text != "." && text != "..").then_some(text)
+}
+
+/// `conda create -n <name>` for a bare name, `-p <prefix>` for a path, with the base's `major.minor` Python.
+pub(crate) fn conda_create_args(location: &Path, version: Option<&str>) -> Vec<String> {
+    let mut args = match conda_env_name(location) {
+        Some(name) => vec!["create".to_owned(), "-n".to_owned(), name.to_owned()],
+        None => vec!["create".to_owned(), "-p".to_owned(), location.to_string_lossy().into_owned()],
+    };
+    args.push("-y".to_owned());
+    let short = version.map(|v| v.split('.').take(2).collect::<Vec<_>>().join(".")).unwrap_or_default();
+    if !short.is_empty() {
+        args.push(format!("python={short}"));
+    }
+    args
+}
+
+/// Arguments of `base -m venv location`. `-I` (isolated mode) keeps the working
+/// directory off `sys.path`: a project's `logging.py` or `typing.py` there would
+/// otherwise shadow the standard library modules venv imports. (`-P` does just
+/// that but needs Python 3.11.)
+pub(crate) fn venv_args(location: &Path) -> Vec<String> {
+    vec!["-I".to_owned(), "-m".to_owned(), "venv".to_owned(), location.to_string_lossy().into_owned()]
+}
+
+/// A fresh, empty, private directory to run `python -m …` / `python -c …` in. Python
+/// puts the working directory first on `sys.path` for those, and the IDE's own (or a
+/// project's) could hold modules that shadow the standard library or pip. Not `-I`:
+/// that also drops the user site, hiding `pip install --user` packages. `None` (the
+/// inherited directory) if it cannot be created.
+pub(crate) fn neutral_dir() -> Option<tempfile::TempDir> {
+    tempfile::Builder::new().prefix("openidea-python-").tempdir().ok()
 }
 
 /// How packages of an interpreter are managed.
@@ -47,7 +221,9 @@ enum Installer {
 }
 
 fn has_pip(python: &Path) -> bool {
-    query(python, &["-m", "pip", "--version"], Duration::from_secs(10)).is_some()
+    let dir = neutral_dir();
+    query_in(python, &["-m", "pip", "--version"], dir.as_ref().map(|d| d.path()), &[], Duration::from_secs(10))
+        .is_some()
 }
 
 fn installer(python: &Path) -> IdeResult<Installer> {
@@ -95,7 +271,8 @@ pub fn list_packages(python: &Path, cancel: &CancellationToken) -> IdeResult<Vec
     }
     let installer = installer(python)?;
     let (program, args) = pip_command(python, &installer, &["list", "--format", "json"]);
-    let out = stream(&program, &args, None, &pip_env(python), cancel, &|_| {})?;
+    let dir = neutral_dir();
+    let out = stream(&program, &args, dir.as_ref().map(|d| d.path()), &pip_env(python), cancel, &|_| {})?;
     let mut packages = parse_pip_list(&out)?;
     packages.sort_by_key(|p| p.name.to_lowercase());
     Ok(packages)
@@ -107,11 +284,23 @@ pub(crate) fn parse_pip_list(out: &str) -> IdeResult<Vec<PythonPackage>> {
     serde_json::from_str(json).map_err(|e| IdeError::internal(format!("unexpected pip output: {e}")))
 }
 
-/// Installs (or upgrades, with `upgrade`) a requirement such as `requests` or `django==5.0`.
+/// A requirement naming a local path (`.`, `./pkg`, `../lib[dev]`) made absolute
+/// against `base` (the project root): pip runs in [`neutral_dir`], not the project.
+pub(crate) fn resolve_requirement(requirement: &str, base: Option<&Path>) -> IdeResult<String> {
+    if !requirement.starts_with('.') {
+        return Ok(requirement.to_owned());
+    }
+    let base = base.ok_or_else(|| IdeError::invalid("a relative path needs an open project"))?;
+    Ok(base.join(requirement).to_string_lossy().into_owned())
+}
+
+/// Installs (or upgrades, with `upgrade`) a requirement such as `requests` or `django==5.0`;
+/// relative paths (`./pkg`) are resolved against `project_root`.
 pub fn install_package(
     python: &Path,
     requirement: &str,
     upgrade: bool,
+    project_root: Option<&Path>,
     cancel: &CancellationToken,
     on_line: &dyn Fn(String),
 ) -> IdeResult<()> {
@@ -119,14 +308,92 @@ pub fn install_package(
     if requirement.is_empty() || requirement.starts_with('-') {
         return Err(IdeError::invalid("enter a package name or requirement"));
     }
+    let requirement = resolve_requirement(requirement, project_root)?;
     let installer = installer(python)?;
     let mut sub = vec!["install"];
     if upgrade {
         sub.push("--upgrade");
     }
-    sub.push(requirement);
+    sub.push(&requirement);
     let (program, args) = pip_command(python, &installer, &sub);
-    stream(&program, &args, None, &pip_env(python), cancel, on_line).map(|_| ())
+    let dir = neutral_dir();
+    stream(&program, &args, dir.as_ref().map(|d| d.path()), &pip_env(python), cancel, on_line).map(|_| ())
+}
+
+/// Run by the interpreter itself, so markers and PEP 440 specifiers are judged as pip would:
+/// prints, per requirement of `argv[1]` (a JSON list), `null` when satisfied or not applicable
+/// there, else `{"installed": <version or null>}`.
+const CHECK_REQUIREMENTS: &str = r#"
+import json, re, sys
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    try:
+        from pip._vendor.packaging.requirements import Requirement
+    except Exception:
+        Requirement = None
+from importlib import metadata
+norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
+installed = {}
+for d in metadata.distributions():
+    name = d.metadata["Name"]
+    if name:
+        installed.setdefault(norm(name), d.version)
+out = []
+for line in json.loads(sys.argv[1]):
+    try:
+        if Requirement:
+            r = Requirement(line)
+            name, spec, applies = r.name, r.specifier, r.marker is None or r.marker.evaluate({"extra": ""})
+        else:
+            # Without packaging only names are compared; a marker can't be judged.
+            name, spec, applies = re.match(r"[A-Za-z0-9._-]+", line).group(0), None, ";" not in line
+        version = installed.get(norm(name))
+        if not applies or (version is not None and (spec is None or spec.contains(version, prereleases=True))):
+            out.append(None)
+        else:
+            out.append({"installed": version})
+    except Exception:
+        out.append(None)
+print(json.dumps(out))
+"#;
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct Unsatisfied {
+    /// The version installed that misses the specifier; `None` when not installed.
+    pub installed: Option<String>,
+}
+
+/// Which of `requirements` (PEP 508 strings) `python` doesn't satisfy, in order;
+/// `None` for satisfied ones, for ones whose marker excludes this interpreter, and
+/// for ones it can't parse.
+pub fn unsatisfied_requirements(
+    python: &Path,
+    requirements: &[&str],
+    cancel: &CancellationToken,
+) -> IdeResult<Vec<Option<Unsatisfied>>> {
+    let list = serde_json::to_string(requirements).map_err(|e| IdeError::internal(e.to_string()))?;
+    let dir = neutral_dir().ok_or_else(|| IdeError::internal("no temporary directory"))?;
+    let out = query_in_cancellable(
+        python,
+        &["-c", CHECK_REQUIREMENTS, &list],
+        dir.path(),
+        &[],
+        Duration::from_secs(20),
+        cancel,
+    );
+    if cancel.is_cancelled() {
+        return Err(IdeError::cancelled());
+    }
+    let out =
+        out.ok_or_else(|| IdeError::unavailable(format!("cannot check requirements with {}", python.display())))?;
+    let json = out.lines().rev().find(|l| l.starts_with('[')).unwrap_or("");
+    let result: Vec<Option<Unsatisfied>> =
+        serde_json::from_str(json).map_err(|e| IdeError::internal(format!("unexpected output: {e}")))?;
+    if result.len() != requirements.len() {
+        return Err(IdeError::internal("unexpected output: wrong number of results"));
+    }
+    Ok(result)
 }
 
 pub fn uninstall_package(
@@ -141,5 +408,6 @@ pub fn uninstall_package(
     }
     let installer = installer(python)?;
     let (program, args) = pip_command(python, &installer, &["uninstall", "-y", name]);
-    stream(&program, &args, None, &pip_env(python), cancel, on_line).map(|_| ())
+    let dir = neutral_dir();
+    stream(&program, &args, dir.as_ref().map(|d| d.path()), &pip_env(python), cancel, on_line).map(|_| ())
 }

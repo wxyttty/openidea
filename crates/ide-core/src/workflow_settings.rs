@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub struct VcsSettings {
     /// Colour folders that contain changed files (project tree, tabs).
     pub show_dirty_directories: bool,
+    /// Diffs the user opens show in an editor tab; off, in a separate window.
+    pub diff_as_editor_tab: bool,
     /// Stop file history (Show History) after `history_limit` commits.
     pub limit_history: bool,
     pub history_limit: u32,
@@ -20,6 +22,34 @@ pub struct VcsSettings {
     pub shelf: ShelfSettings,
     /// Issue Navigation: commit-message patterns turned into links.
     pub issue_navigation: Vec<IssueLink>,
+    /// Directory Mappings: repository roots added to or excluded from the detected ones.
+    pub mappings: VcsMappings,
+}
+
+/// Directory Mappings on top of repository detection. Paths are relative to the project
+/// root (`.` for the root itself) or absolute outside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VcsMappings {
+    /// Detected repositories the IDE leaves alone: no Git or Commit integration, files stay.
+    pub excluded: Vec<String>,
+    /// Repository roots detection does not reach (outside the project, or deeper).
+    pub added: Vec<String>,
+}
+
+impl VcsMappings {
+    pub fn is_empty(&self) -> bool {
+        self.excluded.is_empty() && self.added.is_empty()
+    }
+
+    /// `path` resolved against `project_root`.
+    pub fn resolve(project_root: &std::path::Path, path: &str) -> std::path::PathBuf {
+        match path {
+            "" | "." => project_root.to_path_buf(),
+            p if std::path::Path::new(p).is_absolute() => p.into(),
+            p => project_root.join(p),
+        }
+    }
 }
 
 impl Default for VcsSettings {
@@ -27,6 +57,7 @@ impl Default for VcsSettings {
         Self {
             // IDEA's VcsConfiguration.SHOW_DIRTY_RECURSIVELY is off by default.
             show_dirty_directories: false,
+            diff_as_editor_tab: true,
             limit_history: true,
             history_limit: 1000,
             git: GitSettings::default(),
@@ -34,6 +65,7 @@ impl Default for VcsSettings {
             confirmation: VcsConfirmationSettings::default(),
             shelf: ShelfSettings::default(),
             issue_navigation: Vec::new(),
+            mappings: VcsMappings::default(),
         }
     }
 }
@@ -41,6 +73,14 @@ impl Default for VcsSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GitSettings {
+    /// Show blame after the current editor line.
+    pub inline_blame: bool,
+    /// A click (or Enter / Space) on the inline blame label opens its commit; off, the
+    /// label is plain text and a click on it places the caret as past the line end.
+    pub inline_blame_clickable: bool,
+    pub show_branch_in_project_view: bool,
+    /// Branch operations from the branches popup act on every repository of the project.
+    pub sync_branch_operations: bool,
     /// Path to the git executable; empty = auto-detect.
     pub executable: String,
     /// Default of Update Project: `merge` | `rebase`.
@@ -51,6 +91,8 @@ pub struct GitSettings {
     pub warn_detached_head: bool,
     /// Background check for incoming commits: `auto` | `always` | `never`.
     pub incoming_check: String,
+    /// Minutes between background checks for incoming commits.
+    pub incoming_check_interval: u32,
     /// Branch name globs, `;`/`,`-separated; force push to them is prohibited.
     pub protected_branches: String,
     /// Initial state of Commit Options › Sign-off Commit.
@@ -66,17 +108,28 @@ pub struct GitSettings {
     pub push_dialog_only_protected: bool,
     /// Stashes and shelves share one tab.
     pub combine_stash_and_shelf: bool,
+    /// The non-modal Commit tool window works on the index: Staged / Unstaged groups,
+    /// stage and unstage instead of inclusion checkboxes, and no change lists.
+    pub staging_area: bool,
+    /// Scan the working tree with `git status` (for file systems whose metadata only
+    /// the system git reads correctly) instead of in process.
+    pub cli_status: bool,
 }
 
 impl Default for GitSettings {
     fn default() -> Self {
         Self {
+            inline_blame: false,
+            inline_blame_clickable: true,
+            show_branch_in_project_view: false,
+            sync_branch_operations: true,
             executable: String::new(),
             update_method: "merge".into(),
             auto_update_on_push_rejected: false,
             warn_crlf: true,
             warn_detached_head: true,
             incoming_check: "auto".into(),
+            incoming_check_interval: 15,
             protected_branches: "master; main".into(),
             sign_off: false,
             warn_large_files: true,
@@ -85,6 +138,8 @@ impl Default for GitSettings {
             show_push_dialog: true,
             push_dialog_only_protected: false,
             combine_stash_and_shelf: false,
+            staging_area: false,
+            cli_status: false,
         }
     }
 }
@@ -96,6 +151,7 @@ pub struct CommitSettings {
     /// Commit from the Commit tool window; off = Local Changes in the Git tool
     /// window and a Commit dialog.
     pub non_modal: bool,
+    pub include_changes_by_default: bool,
     /// Start with an empty message instead of the last one / the changelist's.
     pub clear_initial_message: bool,
     pub analyze_code: bool,
@@ -110,12 +166,32 @@ pub struct CommitSettings {
     pub body_limit: u32,
     pub show_right_margin: bool,
     pub wrap_at_margin: bool,
+    /// Plugin before-commit checks turned off (`<plugin id>/<check id>`); the rest run.
+    pub disabled_plugin_checks: Vec<String>,
+    /// Double-click / Enter in the changes view: `None` follows the interface (the
+    /// Commit tool window opens the diff, Local Changes the source file).
+    ///
+    /// No `skip_serializing_if`: an unset value must still appear in
+    /// `Settings::default()`, or `SettingsStore::set` rejects the key as unknown.
+    #[specta(optional)]
+    pub double_click_opens_diff: Option<bool>,
+    /// Team conventions for Generate Commit Message with Agent, added to its prompt.
+    pub agent_instructions: String,
+    /// The coding agent Generate Commit Message with Agent uses; empty follows the latest task's agent.
+    pub agent: String,
+    /// That agent's model for commit messages; empty keeps the model the agent would use.
+    pub agent_model: String,
+    /// That model's thinking level for commit messages; empty keeps the agent's.
+    pub agent_effort: String,
+    /// Show the Generate Commit Message with Agent button above the commit message.
+    pub agent_button: bool,
 }
 
 impl Default for CommitSettings {
     fn default() -> Self {
         Self {
             non_modal: true,
+            include_changes_by_default: true,
             clear_initial_message: false,
             analyze_code: true,
             check_todo: true,
@@ -129,6 +205,13 @@ impl Default for CommitSettings {
             body_limit: 72,
             show_right_margin: true,
             wrap_at_margin: false,
+            disabled_plugin_checks: Vec::new(),
+            double_click_opens_diff: None,
+            agent_instructions: String::new(),
+            agent: String::new(),
+            agent_model: String::new(),
+            agent_effort: String::new(),
+            agent_button: true,
         }
     }
 }
@@ -159,6 +242,24 @@ impl Default for VcsConfirmationSettings {
     }
 }
 
+/// Tools › Diff & Merge › External Diff Tools: a program that shows two files' differences.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExternalDiffSettings {
+    /// Offer Show Diff in External Tool in diff viewers.
+    pub enabled: bool,
+    /// The program to start.
+    pub path: String,
+    /// Its arguments: `%1` the left file, `%2` the right file, `%3` the diff's title.
+    pub parameters: String,
+}
+
+impl Default for ExternalDiffSettings {
+    fn default() -> Self {
+        Self { enabled: false, path: String::new(), parameters: "%1 %2 %3".into() }
+    }
+}
+
 /// Version Control › Shelf.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
@@ -176,6 +277,74 @@ pub struct IssueLink {
     pub link: String,
 }
 
+/// Per-level colours for console log lines: a line whose level is detected
+/// (`ERROR`, `WARN`, …) takes the level's colour; ANSI colours the program
+/// prints itself win over it. Values are CSS colours, usually scheme tokens.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LogLevelColors {
+    pub enabled: bool,
+    pub error: String,
+    pub warn: String,
+    pub info: String,
+    pub debug: String,
+    pub trace: String,
+}
+
+impl Default for LogLevelColors {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            error: "var(--ansi-red)".into(),
+            warn: "var(--ansi-yellow)".into(),
+            info: "var(--ansi-green)".into(),
+            debug: "var(--ansi-cyan)".into(),
+            trace: "var(--ansi-magenta)".into(),
+        }
+    }
+}
+
+/// Database settings: Query Execution and SQL Resolution Scopes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DatabaseSettings {
+    /// A console's result sets show under the statements that produced them, in the editor,
+    /// instead of in the Services view's result tabs.
+    pub in_editor_results: bool,
+    /// Languages & Frameworks › SQL Resolution Scopes: the data source SQL in a file or folder
+    /// resolves against (completion, inspections, navigation), most specific path first.
+    pub resolution_scopes: Vec<SqlResolutionScope>,
+}
+
+/// One row of SQL Resolution Scopes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SqlResolutionScope {
+    /// Project-relative file or folder, `/`-separated; empty for the whole project.
+    pub path: String,
+    /// Data source id.
+    pub data_source: String,
+    /// Schema unqualified names resolve in; empty for the data source's default.
+    pub schema: String,
+}
+
+/// Build, Execution, Deployment › Compiler (Build tool window behaviour).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BuildSettings {
+    /// When to open the Build tool window: `always` | `onError` | `never`.
+    pub open_tool_window: String,
+    /// When to focus the Build tool window: `always` | `onError` | `never`.
+    pub focus_tool_window: String,
+}
+
+impl Default for BuildSettings {
+    fn default() -> Self {
+        // Builds open the tool window without taking focus.
+        Self { open_tool_window: "always".into(), focus_tool_window: "never".into() }
+    }
+}
+
 /// Build, Execution, Deployment › Console.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
@@ -187,6 +356,8 @@ pub struct ConsoleSettings {
     pub encoding: String,
     /// Consecutive lines containing any of these are folded.
     pub fold_patterns: Vec<String>,
+    /// Log lines take the colour of their level (Run/Debug consoles).
+    pub log_colors: LogLevelColors,
 }
 
 impl Default for ConsoleSettings {
@@ -203,6 +374,7 @@ impl Default for ConsoleSettings {
                 "at node:internal/".into(),
                 "<frozen importlib._bootstrap".into(),
             ],
+            log_colors: LogLevelColors::default(),
         }
     }
 }
@@ -214,18 +386,26 @@ pub struct DebuggerSettings {
     pub show_on_breakpoint: bool,
     pub focus_app_on_breakpoint: bool,
     pub hide_on_termination: bool,
+    /// A breakpoint or exception hit brings the Debug tool window's Threads & Variables tab to the front.
+    pub variables_on_breakpoint: bool,
     pub breakpoints_any_file: bool,
     /// While suspended, hovering the start of a line shows a Run to Cursor button.
     pub run_to_cursor_inlay: bool,
     pub inline_values: bool,
     /// Data Views: list variables by name instead of the adapter's order.
     pub sort_values: bool,
+    /// Data Views: evaluate watches while the program runs, where the debugger can (JavaScript).
+    pub live_watches: bool,
     pub value_tooltip: bool,
     /// While suspended, selecting an expression shows its value.
     pub value_tooltip_on_selection: bool,
     pub value_tooltip_delay: u32,
     /// Stepping: do not step into library code (debugpy `justMyCode`, js-debug `skipFiles`).
     pub skip_library_code: bool,
+    /// JavaScript: debugging a dev server (`vite`, `next dev`) also opens its page in a browser session.
+    pub debug_server_page: bool,
+    /// Flutter: saving a Dart file of a running debug session hot reloads the app.
+    pub flutter_hot_reload_on_save: bool,
     pub python: PythonDebuggerSettings,
 }
 
@@ -235,14 +415,18 @@ impl Default for DebuggerSettings {
             show_on_breakpoint: true,
             focus_app_on_breakpoint: false,
             hide_on_termination: false,
+            variables_on_breakpoint: true,
             breakpoints_any_file: false,
             run_to_cursor_inlay: true,
             inline_values: true,
             sort_values: false,
+            live_watches: false,
             value_tooltip: true,
             value_tooltip_on_selection: true,
             value_tooltip_delay: 700,
             skip_library_code: true,
+            debug_server_page: false,
+            flutter_hot_reload_on_save: true,
             python: PythonDebuggerSettings::default(),
         }
     }
@@ -266,17 +450,28 @@ impl Default for PythonDebuggerSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RunSettings {
+    /// Target for configurations without an explicit target. Empty = local.
+    pub default_target: String,
     pub confirm_rerun: bool,
     /// Ask before closing a Run tab whose process is still running.
     pub confirm_terminate: bool,
     pub show_on_start: bool,
+    /// New Run/Debug tabs start pinned: a later run doesn't take their place once finished.
+    pub pin_tabs: bool,
     /// Grace period between interrupt and kill when stopping a process.
     pub termination_timeout_ms: u32,
 }
 
 impl Default for RunSettings {
     fn default() -> Self {
-        Self { confirm_rerun: true, confirm_terminate: true, show_on_start: true, termination_timeout_ms: 3000 }
+        Self {
+            default_target: String::new(),
+            confirm_rerun: true,
+            confirm_terminate: true,
+            show_on_start: true,
+            pin_tabs: false,
+            termination_timeout_ms: 3000,
+        }
     }
 }
 
@@ -290,6 +485,9 @@ pub struct TerminalSettings {
     /// Shell command line; empty = the login shell.
     pub shell_path: String,
     pub tab_name: String,
+    /// Title a program sets (OSC 0/2) as the tab's name: `running` (while a command runs),
+    /// `always`, or `off`.
+    pub app_title_as_tab_name: String,
     pub audible_bell: bool,
     pub close_on_exit: bool,
     pub mouse_reporting: bool,
@@ -298,12 +496,15 @@ pub struct TerminalSettings {
     pub override_ide_shortcuts: bool,
     pub shell_integration: bool,
     pub highlight_hyperlinks: bool,
+    pub highlight_selection: bool,
     pub option_as_meta: bool,
     /// Escape moves focus to the editor instead of reaching the shell.
     pub escape_to_editor: bool,
     /// `block` | `underline` | `bar`.
     pub cursor_shape: String,
     pub cursor_blink: bool,
+    /// Cap PTY→xterm paint rate: `unlimited` | `60` | `30` | `15` | `10`.
+    pub max_fps: String,
     pub use_editor_font: bool,
     pub font_family: String,
     pub font_size: f32,
@@ -322,6 +523,7 @@ impl Default for TerminalSettings {
             env: BTreeMap::new(),
             shell_path: String::new(),
             tab_name: "Local".into(),
+            app_title_as_tab_name: "running".into(),
             audible_bell: true,
             close_on_exit: true,
             mouse_reporting: true,
@@ -330,10 +532,12 @@ impl Default for TerminalSettings {
             override_ide_shortcuts: true,
             shell_integration: true,
             highlight_hyperlinks: true,
+            highlight_selection: true,
             option_as_meta: false,
             escape_to_editor: false,
             cursor_shape: "block".into(),
             cursor_blink: true,
+            max_fps: "unlimited".into(),
             use_editor_font: true,
             font_family: "JetBrains Mono".into(),
             font_size: 13.0,
@@ -384,5 +588,45 @@ impl Default for ExternalTool {
             synchronize_after: true,
             open_console: true,
         }
+    }
+}
+
+/// Tools › Agents: Command Execution Policy (whitelist and blacklist patterns).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentSecuritySettings {
+    /// Commands or patterns (`git status*`, `pwd`) automatically approved without prompting.
+    pub allowed_commands: Vec<String>,
+    /// Commands or patterns (`rm -rf *`, `mkfs*`) automatically rejected.
+    pub blocked_commands: Vec<String>,
+}
+
+impl Default for AgentSecuritySettings {
+    fn default() -> Self {
+        Self {
+            allowed_commands: Vec::new(),
+            blocked_commands: vec![
+                "rm -rf *".into(),
+                "rm -rf /".into(),
+                "mkfs*".into(),
+                "dd *".into(),
+                ":(){ :|:& };:".into(),
+                "shutdown*".into(),
+                "reboot*".into(),
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_settings_without_sync_key_execute_on_all_repositories() {
+        let missing: GitSettings = serde_json::from_str("{}").unwrap();
+        assert!(missing.sync_branch_operations);
+        let off: GitSettings = serde_json::from_str(r#"{"syncBranchOperations":false}"#).unwrap();
+        assert!(!off.sync_branch_operations);
     }
 }

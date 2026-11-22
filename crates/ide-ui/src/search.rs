@@ -64,6 +64,7 @@ impl SearchOptions {
             scope: SearchScope::Project,
             max_matches: 10_000,
             context: self.context,
+            include_excluded: false,
         }
     }
 }
@@ -282,7 +283,8 @@ impl SearchPanel {
         replacement: String,
         cx: &mut Context<Self>,
     ) {
-        let target = ReplaceTarget { path: ide_core::IpcPath(path.clone()), only: Some(vec![Pos { line, col }]) };
+        let target =
+            ReplaceTarget { path: ide_core::IpcPath(path.clone()), only: Some(vec![Pos { line, col }]), skip: None };
         let query = self.options.query(self.query.read(cx).value().trim().to_owned());
         let host = self.host.clone();
         let summary = Arc::new(std::sync::Mutex::new(None));
@@ -304,6 +306,7 @@ impl SearchPanel {
                 replacement,
                 false,
                 vec![target],
+                false,
                 channel,
             )
             .await
@@ -369,7 +372,7 @@ impl SearchPanel {
                         line.ranges.iter().map(move |(start, _)| Pos { line: line.line, col: line.text_offset + start })
                     })
                     .collect();
-                ReplaceTarget { path: file.path.clone(), only: Some(only) }
+                ReplaceTarget { path: file.path.clone(), only: Some(only), skip: None }
             })
             .collect();
         self.message = Some("Replacing…".into());
@@ -394,6 +397,7 @@ impl SearchPanel {
                 replacement,
                 false,
                 targets,
+                false,
                 channel,
             )
             .await;

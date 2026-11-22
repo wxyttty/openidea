@@ -19,10 +19,34 @@ import type {
   PruneTarget,
   RequestId,
 } from "@/platform/ipc";
+import { tx } from "@/platform/i18n";
 import { call, commands, isCancelled, isTauri, nextRequestId } from "@/platform/ipc";
 import { notifications } from "@/workbench/contributions";
+import { DEFAULT_DOCKER_FILTERS, type DockerFilters } from "./model";
 
-export type DetailTab = "log" | "inspect";
+export type DetailTab = "dashboard" | "log" | "processes" | "layers" | "inspect";
+
+const FILTERS_STORAGE_KEY = "openidea.docker.filters";
+
+function loadStoredFilters(): DockerFilters {
+  try {
+    const raw = typeof localStorage !== "undefined" ? localStorage.getItem(FILTERS_STORAGE_KEY) : null;
+    if (!raw) return DEFAULT_DOCKER_FILTERS;
+    const parsed = JSON.parse(raw) as Partial<DockerFilters>;
+    return {
+      showStoppedContainers:
+        typeof parsed.showStoppedContainers === "boolean"
+          ? parsed.showStoppedContainers
+          : DEFAULT_DOCKER_FILTERS.showStoppedContainers,
+      showUntaggedImages:
+        typeof parsed.showUntaggedImages === "boolean"
+          ? parsed.showUntaggedImages
+          : DEFAULT_DOCKER_FILTERS.showUntaggedImages,
+    };
+  } catch {
+    return DEFAULT_DOCKER_FILTERS;
+  }
+}
 
 /** `DockerSettings` with its defaults filled in. */
 export interface Settings {
@@ -34,6 +58,10 @@ export interface ConnectionState {
   snapshot: DockerSnapshot | null;
   loading: boolean;
   error: string | null;
+  /** Disconnected for this session: no snapshots, events or polling until Connect. */
+  disconnected?: boolean;
+  /** Containers with a start / stop / … / remove in progress, by id: the operation. */
+  busy?: Record<string, ContainerOp | "remove">;
 }
 
 interface DockerState {
@@ -42,6 +70,7 @@ interface DockerState {
   /** By connection id. */
   conns: Record<string, ConnectionState>;
   detailTab: DetailTab;
+  filters: DockerFilters;
   /** Long operation in progress (pull, prune, compose…): its title and last output line. */
   task: { title: string; line: string; request: RequestId } | null;
 }
@@ -49,9 +78,24 @@ interface DockerState {
 export const useServices = create<DockerState>(() => ({
   settings: null,
   conns: {},
-  detailTab: "log",
+  detailTab: "dashboard",
+  filters: loadStoredFilters(),
   task: null,
 }));
+
+export function setDockerFilters(patch: Partial<DockerFilters>): void {
+  useServices.setState((s) => {
+    const filters = { ...s.filters, ...patch };
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(filters));
+      }
+    } catch {
+      // ignore storage quota errors
+    }
+    return { filters };
+  });
+}
 
 export const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -121,14 +165,15 @@ export const newId = (prefix: string) => `${prefix}${Date.now().toString(36)}${M
 export async function saveConnection(c: DockerConnection): Promise<boolean> {
   await loadSettings();
   const s = useServices.getState().settings ?? { connections: [], registries: [] };
-  const exists = s.connections.some((x) => x.id === c.id);
+  const old = s.connections.find((x) => x.id === c.id)?.endpoint;
   const ok = await saveSettings({
     ...s,
-    connections: exists ? s.connections.map((x) => (x.id === c.id ? c : x)) : [...s.connections, c],
+    connections: old ? s.connections.map((x) => (x.id === c.id ? c : x)) : [...s.connections, c],
   });
   if (ok) {
     stopEvents(c.id);
     if (watchers > 0) void refresh(c.id);
+    if (old) closeEndpoint(c.id, old);
   }
   return ok;
 }
@@ -137,12 +182,14 @@ export async function removeConnection(id: string): Promise<void> {
   const s = useServices.getState().settings;
   if (!s) return;
   stopEvents(id);
+  const endpoint = endpointOf(id);
   if (await saveSettings({ ...s, connections: s.connections.filter((c) => c.id !== id) })) {
     useServices.setState((st) => {
       const conns = { ...st.conns };
       delete conns[id];
       return { conns };
     });
+    closeEndpoint(id, endpoint);
   }
 }
 
@@ -191,6 +238,7 @@ const again = new Set<string>();
 export function refresh(id?: string): Promise<void> {
   if (!isTauri()) return Promise.resolve();
   if (id === undefined) return Promise.all(connections().map((c) => refresh(c.id))).then(() => undefined);
+  if (connectionState(id).disconnected) return Promise.resolve();
   const running = inflight.get(id);
   if (running) {
     again.add(id);
@@ -199,12 +247,14 @@ export function refresh(id?: string): Promise<void> {
   patchConn(id, { loading: true });
   const p = call(commands.dockerSnapshot(endpointOf(id)))
     .then((snapshot) => {
-      if (!connections().some((c) => c.id === id)) return;
+      if (!connections().some((c) => c.id === id) || connectionState(id).disconnected) return;
       const wasReady = connectionState(id).snapshot?.availability.kind === "ready";
       patchConn(id, { snapshot, error: null });
       if (snapshot.availability.kind === "ready" && !wasReady) startEvents(id);
     })
-    .catch((e) => patchConn(id, { error: errorMessage(e) }))
+    .catch((e) => {
+      if (!connectionState(id).disconnected) patchConn(id, { error: errorMessage(e) });
+    })
     .finally(() => {
       inflight.delete(id);
       if (connections().some((c) => c.id === id)) patchConn(id, { loading: false });
@@ -228,7 +278,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined;
 let watchers = 0;
 
 function startEvents(id: string) {
-  if (events.has(id) || watchers === 0) return;
+  if (events.has(id) || watchers === 0 || connectionState(id).disconnected) return;
   const request = nextRequestId();
   events.set(id, request);
   const channel = new Channel<DockerEvent>();
@@ -275,6 +325,48 @@ export function watch(): () => void {
   };
 }
 
+/**
+ * Disconnect: stops talking to the connection's daemon (its event stream and polling; for an
+ * SSH connection, its tunnel and SSH connection) until Connect. Not saved: a new session connects.
+ */
+export function disconnectConnection(id: string): void {
+  stopEvents(id);
+  clearTimeout(debounces.get(id));
+  again.delete(id);
+  patchConn(id, { snapshot: null, error: null, loading: false, disconnected: true });
+  closeEndpoint(id, endpointOf(id));
+}
+
+export async function connectConnection(id: string): Promise<void> {
+  patchConn(id, { disconnected: false });
+  // A tunnel being closed would take this connection's next snapshot down with it.
+  await closing.get(id);
+  return refresh(id);
+}
+
+/** The SSH configuration an endpoint tunnels through (as the backend keys its tunnels). */
+const sshConfig = (e: DockerEndpoint) => (e.kind === "ssh" ? e.config.trim() : null);
+
+const closing = new Map<string, Promise<void>>();
+
+/**
+ * Closes the SSH tunnel connection `id` used through `endpoint` (and its SSH connection, unless
+ * something else holds it) once no connected Docker connection goes through that configuration.
+ * Other endpoints keep nothing open.
+ */
+function closeEndpoint(id: string, endpoint: DockerEndpoint) {
+  const config = sshConfig(endpoint);
+  if (config === null || !isTauri()) return;
+  const done = (async () => {
+    // A snapshot in flight would open the tunnel again after it was closed.
+    await inflight.get(id);
+    if (connections().some((c) => !connectionState(c.id).disconnected && sshConfig(c.endpoint) === config)) return;
+    await call(commands.dockerDisconnect(endpoint)).catch(() => undefined);
+  })();
+  closing.set(id, done);
+  void done.finally(() => closing.get(id) === done && closing.delete(id));
+}
+
 // ---------------------------------------------------------------------------
 // Operations
 
@@ -291,25 +383,68 @@ async function guarded(connId: string, title: string, run: () => Promise<unknown
   }
 }
 
+/** The operation in progress on any of `ids`, if one is. */
+export function busyOp(connId: string, ids: readonly string[], s = useServices.getState()) {
+  const busy = connectionState(connId, s).busy;
+  for (const id of ids) if (busy?.[id]) return busy[id];
+  return null;
+}
+
+/**
+ * Runs `op` on containers no other operation holds, marking them busy until the
+ * snapshot after it has loaded, so their actions stay disabled meanwhile.
+ */
+async function holding(connId: string, ids: string[], op: ContainerOp | "remove", run: () => Promise<boolean>) {
+  if (busyOp(connId, ids)) return false;
+  const mark = (on: boolean) =>
+    useServices.setState((s) => {
+      const busy = { ...connectionState(connId, s).busy };
+      for (const id of ids) {
+        if (on) busy[id] = op;
+        else delete busy[id];
+      }
+      return { conns: { ...s.conns, [connId]: { ...connectionState(connId, s), busy } } };
+    });
+  mark(true);
+  try {
+    const ok = await run();
+    await refresh(connId).catch(() => undefined);
+    return ok;
+  } finally {
+    mark(false);
+  }
+}
+
 export function containerOp(connId: string, ids: string[], op: ContainerOp): Promise<boolean> {
-  const verb = { start: "start", stop: "stop", restart: "restart", pause: "pause", unpause: "unpause", kill: "kill" }[
-    op
-  ];
-  return guarded(connId, `Could not ${verb} container`, () =>
-    call(commands.dockerContainerOp(endpointOf(connId), ids, op)),
+  const failure = {
+    start: tx("Could not start container"),
+    stop: tx("Could not stop container"),
+    restart: tx("Could not restart container"),
+    pause: tx("Could not pause container"),
+    unpause: tx("Could not unpause container"),
+    kill: tx("Could not kill container"),
+  }[op];
+  return holding(connId, ids, op, () =>
+    guarded(connId, failure, () => call(commands.dockerContainerOp(endpointOf(connId), ids, op))),
   );
 }
 
 export function removeObjects(connId: string, object: DockerObject, ids: string[], force: boolean): Promise<boolean> {
-  return guarded(connId, `Could not remove ${object}`, () =>
-    call(commands.dockerRemove(endpointOf(connId), object, ids, force)),
-  );
+  const failure = {
+    container: tx("Could not remove container"),
+    image: tx("Could not remove image"),
+    volume: tx("Could not remove volume"),
+    network: tx("Could not remove network"),
+  }[object];
+  const run = () => guarded(connId, failure, () => call(commands.dockerRemove(endpointOf(connId), object, ids, force)));
+  return object === "container" ? holding(connId, ids, "remove", run) : run();
 }
 
 /** Runs a streaming operation, showing its latest output line in the view's banner. */
 async function task(
   connId: string,
   title: string,
+  failure: string,
   run: (request: RequestId, out: Channel<string>) => Promise<unknown>,
 ): Promise<boolean> {
   if (useServices.getState().task) {
@@ -330,7 +465,7 @@ async function task(
   };
   useServices.setState({ task: { title, line: "", request } });
   try {
-    return await guarded(connId, title.replace(/…$/, "") + " failed", () => run(request, out));
+    return await guarded(connId, failure, () => run(request, out));
   } finally {
     useServices.setState({ task: null });
     if (last)
@@ -350,15 +485,38 @@ export function cancelTask() {
 }
 
 export const pullImage = (connId: string, reference: string) =>
-  task(connId, `Pulling ${reference}…`, (r, out) => call(commands.dockerPull(r, endpointOf(connId), reference, out)));
-
-export const prune = (connId: string, target: PruneTarget) =>
-  task(connId, `Pruning ${target === "allImages" ? "unused images" : target}…`, (r, out) =>
-    call(commands.dockerPrune(r, endpointOf(connId), target, out)),
+  task(connId, `Pulling ${reference}…`, tx`Could not pull ${reference}`, (r, out) =>
+    call(commands.dockerPull(r, endpointOf(connId), reference, out)),
   );
 
+export function prune(connId: string, target: PruneTarget) {
+  const title = {
+    containers: tx("Pruning stopped containers…"),
+    images: tx("Pruning dangling images…"),
+    allImages: tx("Pruning unused images…"),
+    volumes: tx("Pruning unused volumes…"),
+    networks: tx("Pruning unused networks…"),
+    system: tx("Pruning the system…"),
+  }[target];
+  return task(connId, title, tx("Could not prune"), (r, out) =>
+    call(commands.dockerPrune(r, endpointOf(connId), target, out)),
+  );
+}
+
 export function composeOp(connId: string, project: string, files: string[], workingDir: string | null, op: ComposeOp) {
-  return task(connId, `Compose ${op} ${project}…`, (r, out) =>
+  const { title, failure } = {
+    start: { title: tx`Starting Compose project ${project}…`, failure: tx`Could not start Compose project ${project}` },
+    stop: { title: tx`Stopping Compose project ${project}…`, failure: tx`Could not stop Compose project ${project}` },
+    restart: {
+      title: tx`Restarting Compose project ${project}…`,
+      failure: tx`Could not restart Compose project ${project}`,
+    },
+    down: {
+      title: tx`Taking down Compose project ${project}…`,
+      failure: tx`Could not take down Compose project ${project}`,
+    },
+  }[op];
+  return task(connId, title, failure, (r, out) =>
     call(commands.dockerComposeOp(r, endpointOf(connId), project, files, workingDir, op, out)),
   );
 }

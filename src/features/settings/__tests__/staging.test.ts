@@ -1,29 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Settings } from "@/platform/ipc";
+import { DEFAULT_SSH_CONFIG } from "@/platform/remoteSettings";
+import { SUPPORTED_LOCALES } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
 import { DEFAULT_SETTINGS, getAt, setAt, validateSettings } from "../model/schema";
+import { DEFAULT_PAGE } from "../model/staging";
+import { lastSettingsPage, rememberSettingsPage } from "../model/lastPage";
 import {
   applySettings,
   closeSettings,
   openSettings,
+  selectPage,
   pendingChanges,
   persistChanges,
   resetPage,
   stage,
+  stageSshSecret,
+  stageMapEntry,
+  SSH_SETTINGS_PAGE,
   stagedValue,
   useSettingsDialog,
   type PersistDeps,
 } from "../model/staging";
 
 function fakeBackend(fail?: string) {
-  let current: Settings = structuredClone(DEFAULT_SETTINGS) as Settings;
+  let current: Settings = structuredClone(useProject.getState().settings) as Settings;
   const set = vi.fn(async (_scope: string, key: string, json: string) => {
     if (key === fail) throw new Error("invalid value");
     current = setAt(current, key, JSON.parse(json));
     return current;
   });
   const reload = vi.fn(async () => useProject.setState({ settings: current }));
-  return { deps: { set, reload, backend: true } satisfies PersistDeps, set, reload };
+  const setSecret = vi.fn(async (_id: string, _secret: string, _save: boolean) => {});
+  return { deps: { set, setSecret, reload, backend: true } satisfies PersistDeps, set, setSecret, reload };
 }
 
 describe("settings staging", () => {
@@ -138,11 +147,118 @@ describe("settings staging", () => {
   it("applies to the session when there is no backend", async () => {
     const r = await persistChanges([{ scope: "global", key: "appearance.uiFontSize", value: 14, page: "appearance" }], {
       set: vi.fn(),
+      setSecret: vi.fn(),
       reload: vi.fn(),
       backend: false,
     });
     expect(r).toEqual({ written: ["global|appearance.uiFontSize"], error: null });
     expect(useProject.getState().settings?.appearance?.uiFontSize).toBe(14);
+  });
+});
+
+describe("SSH secret staging", () => {
+  const id = "ssh-staging";
+  let secret: string;
+  beforeEach(() => {
+    secret = crypto.randomUUID();
+    useProject.setState({
+      settings: validateSettings({ ssh: { configs: [{ ...DEFAULT_SSH_CONFIG, id, auth: "password" }] } }),
+      project: null,
+    });
+    openSettings(SSH_SETTINGS_PAGE);
+  });
+
+  it.each([false, true])("writes only the final value once, after settings, with Save=%s", async (saveSecret) => {
+    const { deps, set, setSecret } = fakeBackend();
+    stageSshSecret(id, crypto.randomUUID());
+    stageSshSecret(id, secret);
+    const configs = useSettingsDialog.getState().globalBase.ssh.configs.map((c) => ({ ...c, saveSecret }));
+    stage(SSH_SETTINGS_PAGE, "global", "ssh.configs", configs);
+    expect(setSecret).not.toHaveBeenCalled();
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).toHaveBeenCalledOnce();
+    const args = setSecret.mock.calls[0]!;
+    expect(args[0]).toBe(id);
+    expect(args[1] === secret).toBe(true);
+    expect(args[2]).toBe(saveSecret);
+    if (set.mock.calls.length) {
+      expect(set.mock.invocationCallOrder[0]! < setSecret.mock.invocationCallOrder[0]!).toBe(true);
+    }
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
+    expect(JSON.stringify(useProject.getState().settings).includes(secret)).toBe(false);
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).toHaveBeenCalledOnce();
+  });
+
+  it("saves a new configuration before its credential", async () => {
+    const config = useSettingsDialog.getState().globalBase.ssh.configs[0]!;
+    useProject.setState({ settings: validateSettings(undefined) });
+    openSettings(SSH_SETTINGS_PAGE);
+    const { deps, setSecret } = fakeBackend();
+    stage(SSH_SETTINGS_PAGE, "global", "ssh.configs", [config]);
+    stageSshSecret(id, secret);
+    setSecret.mockImplementation(async () => {
+      expect(useProject.getState().settings?.ssh?.configs?.some((c) => c.id === id)).toBe(true);
+    });
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).toHaveBeenCalledOnce();
+  });
+
+  it("Cancel discards the credential without writing it", async () => {
+    const { deps, setSecret } = fakeBackend();
+    stageSshSecret(id, secret);
+    closeSettings();
+    openSettings(SSH_SETTINGS_PAGE);
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).not.toHaveBeenCalled();
+  });
+
+  it("Reset clears only this page's credentials, and an empty field leaves storage untouched", async () => {
+    const { deps, setSecret } = fakeBackend();
+    stageSshSecret(id, secret);
+    resetPage("appearance");
+    expect(useSettingsDialog.getState().stagedSecrets[id] === secret).toBe(true);
+    resetPage(SSH_SETTINGS_PAGE);
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
+    stageSshSecret(id, secret);
+    stageSshSecret(id, "");
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).not.toHaveBeenCalled();
+  });
+
+  it("retains a failed write for retry without reapplying successful settings", async () => {
+    const { deps, set, setSecret } = fakeBackend();
+    setSecret.mockRejectedValueOnce(new Error("Unavailable"));
+    stageSshSecret(id, secret);
+    stage("editor.general", "global", "editor.tabSize", 2);
+    expect(await applySettings(deps)).toBe(false);
+    expect(useSettingsDialog.getState().stagedSecrets[id] === secret).toBe(true);
+    expect(useSettingsDialog.getState()).toMatchObject({ error: "SSH secret: Unavailable", saving: false, staged: {} });
+    expect(await applySettings(deps)).toBe(true);
+    expect(set).toHaveBeenCalledOnce();
+    expect(setSecret).toHaveBeenCalledTimes(2);
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
+    expect(useSettingsDialog.getState().error).toBeNull();
+  });
+
+  it("does not write credentials when settings fail", async () => {
+    const { deps, setSecret } = fakeBackend("ssh.configs");
+    stageSshSecret(id, secret);
+    stage(SSH_SETTINGS_PAGE, "global", "ssh.configs", []);
+    expect(await applySettings(deps)).toBe(false);
+    expect(setSecret).not.toHaveBeenCalled();
+    expect(useSettingsDialog.getState().stagedSecrets[id] === secret).toBe(true);
+  });
+
+  it("does not write a credential for a configuration removed before Apply", async () => {
+    const { deps, setSecret } = fakeBackend();
+    stageSshSecret(id, secret);
+    stage(SSH_SETTINGS_PAGE, "global", "ssh.configs", []);
+    expect(await applySettings(deps)).toBe(true);
+    expect(setSecret).not.toHaveBeenCalled();
+    expect(useSettingsDialog.getState().stagedSecrets).toEqual({});
   });
 });
 
@@ -156,7 +272,7 @@ describe("validateSettings", () => {
     expect(validateSettings(undefined)).toEqual(DEFAULT_SETTINGS);
     expect(validateSettings("garbage")).toEqual(DEFAULT_SETTINGS);
     const v = validateSettings({
-      appearance: { theme: "neon", accent: "red", uiFontSize: 400, locale: "fr" },
+      appearance: { theme: "neon", accent: "red", uiFontSize: 400, locale: "xx" },
       editor: { fontSize: "big", tabSize: 2.6, lineHeight: -1, softWrap: "yes", fontFamily: "  " },
       files: { exclude: ["**/a", 3, "", null] },
       keymap: 12,
@@ -180,6 +296,8 @@ describe("validateSettings", () => {
   it("keeps valid values, including dark-hc", () => {
     const v = validateSettings({ appearance: { theme: "dark-hc", accent: "#C9A080", locale: "zh" } });
     expect(v.appearance).toMatchObject({ theme: "dark-hc", accent: "#c9a080", locale: "zh" });
+    for (const locale of SUPPORTED_LOCALES)
+      expect(validateSettings({ appearance: { locale } }).appearance.locale).toBe(locale);
   });
 
   it("reads and writes dotted keys immutably", () => {
@@ -188,5 +306,85 @@ describe("validateSettings", () => {
     expect(src.editor.fontSize).toBe(13);
     expect(getAt(out, "editor.fontSize")).toBe(14);
     expect(getAt(out, "editor.nope.deeper")).toBeUndefined();
+  });
+});
+
+describe("literal map entry staging", () => {
+  beforeEach(() => {
+    useProject.setState({ settings: structuredClone(DEFAULT_SETTINGS) as Settings, project: null });
+    openSettings();
+  });
+  it("preserves literal dots, per-page ownership, and merges one write per scope", async () => {
+    stageMapEntry("templates", "global", "plugins", ["example.helper", "prompt.with.dots"], ["one"]);
+    stageMapEntry("llm", "global", "plugins", ["example.helper", "profiles"], [{ name: "Local" }]);
+    stageMapEntry("other", "project", "plugins", ["other.plugin", "enabled"], true);
+    expect(pendingChanges(useSettingsDialog.getState())).toHaveLength(2);
+    resetPage("llm");
+    expect(stagedValue(useSettingsDialog.getState(), "global", "plugins")).toEqual({
+      "example.helper": { "prompt.with.dots": ["one"] },
+    });
+    const backend = fakeBackend();
+    expect(await applySettings(backend.deps)).toBe(true);
+    expect(backend.set.mock.calls.map((c) => [c[0], c[1], JSON.parse(c[2])])).toEqual([
+      ["global", "plugins", { "example.helper": { "prompt.with.dots": ["one"] } }],
+      ["project", "plugins", { "other.plugin": { enabled: true } }],
+    ]);
+    expect(useSettingsDialog.getState().staged).toEqual({});
+  });
+  it("removes only its own override and clears a reverted edit", () => {
+    const base = validateSettings({ plugins: { "example.helper": { "a.b": 1, keep: true } } });
+    useSettingsDialog.setState({ base, globalBase: base });
+    stageMapEntry("a", "global", "plugins", ["example.helper", "a.b"], null);
+    expect(stagedValue(useSettingsDialog.getState(), "global", "plugins")).toEqual({
+      "example.helper": { keep: true },
+    });
+    stageMapEntry("a", "global", "plugins", ["example.helper", "a.b"], 1);
+    expect(useSettingsDialog.getState().staged).toEqual({});
+  });
+});
+
+describe("reopening Settings", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useProject.setState({ settings: structuredClone(DEFAULT_SETTINGS) as Settings, project: null });
+    useSettingsDialog.setState({ pageId: DEFAULT_PAGE, newProjects: false });
+  });
+
+  it("reopens on the page the last session left", () => {
+    openSettings();
+    selectPage("editor.general");
+    closeSettings();
+    // A new session starts from the default page; the remembered one has to win.
+    useSettingsDialog.setState({ pageId: DEFAULT_PAGE });
+    openSettings();
+    expect(useSettingsDialog.getState().pageId).toBe("editor.general");
+  });
+
+  it("remembers the page of a deep link that opens Settings directly", () => {
+    openSettings("tools.sshConfigurations#add");
+    expect(lastSettingsPage()).toBe("tools.sshConfigurations");
+    expect(useSettingsDialog.getState().focus).toBe("add");
+  });
+
+  it("keeps Settings for New Projects out of the remembered page", () => {
+    selectPage("keymap");
+    openSettings("languages.java", { newProjects: true });
+    selectPage("languages.python");
+    expect(lastSettingsPage()).toBe("keymap");
+    openSettings();
+    expect(useSettingsDialog.getState().pageId).toBe("keymap");
+  });
+
+  it("falls back to the first page when nothing was recorded", () => {
+    openSettings();
+    expect(useSettingsDialog.getState().pageId).toBe(DEFAULT_PAGE);
+  });
+
+  it("ignores a recorded value that is not a page id", () => {
+    rememberSettingsPage("editor.general");
+    localStorage.setItem("openidea.settings.lastPage.v1", "not a page!");
+    expect(lastSettingsPage()).toBeNull();
+    openSettings();
+    expect(useSettingsDialog.getState().pageId).toBe(DEFAULT_PAGE);
   });
 });

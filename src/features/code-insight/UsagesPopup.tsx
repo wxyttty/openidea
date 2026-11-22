@@ -11,14 +11,26 @@ import { Decoration, EditorView } from "@codemirror/view";
 import { codePreviewExtensions } from "@/editor/api";
 import { basename } from "@/platform/project";
 import { shortcutLabel } from "@/platform/keymap";
-import { Icon, IconButton, List, Popup, fileIconName, listNavigate } from "@/ui";
+import { Icon, IconButton, List, Popup, Select, Spinner, fileIconName, listNavigate } from "@/ui";
+import { useRowHeight } from "@/ui/density";
 import { openLocation, readFileLines } from "./ipc";
-import { showUsageResults, usageCount, useUsagesPopup, type Usage, type UsageGroup } from "./usages";
+import {
+  dismissUsagesPopup,
+  setUsagesPopupScope,
+  showUsageResults,
+  usageCount,
+  useUsagesPopup,
+  type Usage,
+  type UsageGroup,
+  type UsageScope,
+} from "./usages";
 import { UsagePreview } from "./UsagesView";
 import styles from "./UsagesPopup.module.css";
 import { tx } from "@/platform/i18n";
 
-const close = () => useUsagesPopup.setState({ open: false });
+import { UsageAccessFilter, filterUsageAccess, useUsageAccessOptions } from "./UsageAccessFilter";
+
+const close = dismissUsagesPopup;
 
 const PREVIEW_KEY = "openidea.usages.popupPreview.v1";
 
@@ -52,10 +64,13 @@ export function filterUsages(items: readonly Usage[], filter: string): Usage[] {
 /** The popup's groups as locations for the Find Usages tool window. */
 export function usageLocations(groups: readonly UsageGroup[]) {
   return groups.flatMap((g) =>
-    g.usages.map((u) => ({
-      path: u.path,
-      range: { start: { line: u.line, col: u.col }, end: { line: u.line, col: u.endCol } },
-    })),
+    g.usages.map(
+      (u) =>
+        u.sourceLocation ?? {
+          path: u.path,
+          range: { start: { line: u.line, col: u.col }, end: { line: u.line, col: u.endCol } },
+        },
+    ),
   );
 }
 
@@ -67,14 +82,20 @@ export function UsagesPopup() {
 const ROW = 24;
 
 function UsagesPopupInner() {
-  const { anchor, symbol, groups, note } = useUsagesPopup();
+  const { anchor, symbol, groups, note, loading, scope } = useUsagesPopup();
   const preview = useUsagesPopupPreview((s) => s.preview);
+  const rowHeight = useRowHeight(ROW);
   const all = useMemo<Usage[]>(() => groups.flatMap((g) => g.usages), [groups]);
   const [filter, setFilter] = useState("");
-  const items = useMemo(() => filterUsages(all, filter), [all, filter]);
+  const accessOptions = useUsageAccessOptions();
+  const items = useMemo(
+    () => filterUsages(filterUsageAccess(all, accessOptions), filter),
+    [all, filter, accessOptions],
+  );
   const [active, setActive] = useState(0);
   const current = Math.min(active, items.length - 1);
   const total = usageCount(groups);
+  const rowCount = Math.max(1, Math.min(14, items.length));
   const pick = (u: Usage | undefined) => {
     if (!u) return;
     close();
@@ -82,10 +103,22 @@ function UsagesPopupInner() {
   };
   const openInFindWindow = () => {
     close();
-    void showUsageResults({ symbol, locations: usageLocations(groups) });
+    void showUsageResults({
+      symbol,
+      note,
+      locations: usageLocations(groups),
+      classified: groups.flatMap((g) =>
+        g.usages.map((u) => ({
+          location: usageLocations([{ path: g.path, usages: [u] }])[0]!,
+          kind: u.kind ?? "unknown",
+          access: u.access,
+        })),
+      ),
+    });
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key !== "Escape" && e.target instanceof Element && e.target.closest("button")) return;
     const next = listNavigate(e.key, { items, active: current, wrap: true, pageSize: 10 });
     if (next !== null) {
       e.preventDefault();
@@ -116,51 +149,98 @@ function UsagesPopupInner() {
   const keys = shortcutLabel("find.usages");
   return (
     <Popup open anchor={anchor} onClose={close} aria-label="Usages" className={styles.popup}>
-      <div className={styles.focus} tabIndex={0} data-autofocus onKeyDown={onKeyDown}>
+      <div
+        className={styles.focus}
+        tabIndex={0}
+        data-autofocus
+        data-testid="usages-popup"
+        data-loading={loading}
+        data-total={total}
+        data-scope={scope ?? undefined}
+        onKeyDown={onKeyDown}
+      >
         <div className={styles.header}>
           <span className={styles.title}>
-            {symbol ? tx`Usages of ${symbol}` : tx("Usages")}{" "}
-            <span className={styles.count}>{filter ? tx`${items.length} of ${total} found` : tx`${total} found`}</span>
-          </span>
-          {filter && (
-            <span className={clsx(styles.filter, !items.length && styles.noMatch)} role="status">
-              {filter}
+            <span className={styles.titleLabel}>{symbol ? tx`Usages of ${symbol}` : tx("Usages")}</span>{" "}
+            <span className={styles.count}>
+              {filter || items.length !== total ? tx`${items.length} of ${total} found` : tx`${total} found`}
             </span>
-          )}
-          <IconButton
-            icon="list"
-            size="small"
-            title="Show Preview"
-            pressed={preview}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => setUsagesPopupPreview(!preview)}
-          />
-          <button type="button" className={styles.link} onClick={openInFindWindow}>
-            {tx("Open in Find Window")}
-            {keys ? ` ${keys}` : ""}
-          </button>
+          </span>
+          <div className={styles.actions}>
+            {scope && (
+              <Select<UsageScope>
+                variant="ghost"
+                aria-label={tx("Scope")}
+                className={styles.scope}
+                value={scope}
+                options={[
+                  { value: "project", label: tx("Project Files") },
+                  { value: "libraries", label: tx("Project and Libraries") },
+                ]}
+                onChange={setUsagesPopupScope}
+              />
+            )}
+            {loading && (
+              <span className={styles.searching} role="status" aria-label={tx("Searching for more usages")}>
+                <Spinner size={16} variant="spokes" />
+              </span>
+            )}
+            {filter && (
+              <span className={clsx(styles.filter, !items.length && styles.noMatch)} role="status">
+                {filter}
+              </span>
+            )}
+            <IconButton
+              icon="preview-details"
+              size="small"
+              title="Show Preview"
+              pressed={preview}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => setUsagesPopupPreview(!preview)}
+            />
+            <button type="button" className={styles.link} onClick={openInFindWindow}>
+              {tx("Open in Find Window")}
+              {keys ? ` ${keys}` : ""}
+            </button>
+          </div>
         </div>
-        {note && <div className={styles.note}>{note}</div>}
-        <div className={styles.body} style={{ height: Math.max(1, Math.min(14, items.length)) * ROW }}>
+        <UsageAccessFilter items={all} />
+        {note && (
+          <div className={styles.note} data-testid="usages-note">
+            {note}
+          </div>
+        )}
+        <div
+          className={styles.body}
+          style={{ height: rowCount * rowHeight, minHeight: `min(${Math.min(rowCount, 3) * rowHeight}px, 18vh)` }}
+        >
           <List
             items={items}
-            getKey={(u) => `${u.path}:${u.line}:${u.col}`}
+            getKey={(u) =>
+              `${u.path}:${u.line}:${u.col}:${u.sourceLocation?.range.end.line ?? u.line}:${u.sourceLocation?.range.end.col ?? u.endCol}`
+            }
             activeIndex={current}
             onActiveChange={setActive}
             focusable={false}
             hoverSelects
-            rowHeight={ROW}
+            rowHeight={rowHeight}
             aria-label="Usages"
             onActivate={pick}
-            empty={<div className={styles.empty}>{tx`Nothing matches '${filter}'`}</div>}
+            empty={
+              <div className={styles.empty}>
+                {filter ? tx`Nothing matches '${filter}'` : tx("No usages match the access filters")}
+              </div>
+            }
             renderItem={(u) => (
-              <div className={styles.row}>
-                <Icon name={fileIconName(basename(u.path))} size={14} className={styles.icon} />
-                <UsagePreview usage={u} />
-                <span className={styles.spacer} />
-                <span className={styles.where}>
-                  {basename(u.path)}:{u.line + 1}
+              <div className={styles.row} data-testid="usage-row" data-path={u.path} data-line={u.line}>
+                <span className={styles.file}>
+                  <Icon name={fileIconName(basename(u.path), u.path)} size={16} className={styles.icon} />
+                  <span className={styles.fileName} title={u.path}>
+                    {basename(u.path)}
+                  </span>
                 </span>
+                <span className={styles.line}>{u.line + 1}</span>
+                <UsagePreview usage={u} />
               </div>
             )}
           />

@@ -1,20 +1,35 @@
 /** "Resolve Conflicts" dialog and in-editor conflict resolution actions. */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FileStatus } from "@/bindings";
 import { activeEditor } from "@/editor/api";
 import { call, commands } from "@/platform/ipc";
-import { Dialog, Icon, List, fileIconName, T } from "@/ui";
+import { Button, Dialog, Icon, List, fileIconName, T } from "@/ui";
 import { editorService, notifications } from "@/workbench/contributions";
 import { blockAt, parseConflicts, resolutionText, type Resolution } from "./conflicts";
 import { openDialog } from "./dialogs";
 import { mergeInput } from "./mergeKind";
 import { baseName, dirName, relTo, stripSlash } from "./model";
-import { controlLabel, controlOperation, inProgress, operationTitle } from "./operations";
+import { controlLabel, controlOperation, inProgress, operationTitle, type InProgress } from "./operations";
 import { runOp, writeFileText } from "./ops";
 import { executeAction } from "@/platform/actions";
 import { conflictedFiles, useVcs } from "./store";
-import styles from "./common.module.css";
+import styles from "./ConflictsDialog.module.css";
 import { tx } from "@/platform/i18n";
+
+/**
+ * The stopped rebase / cherry-pick / revert whose conflicts are being resolved from the
+ * Conflicts dialog (there or in the merge editor it opened): once the last one is
+ * resolved the operation continues by itself, as IDEA does. Closing the dialog
+ * without resolving them leaves it stopped.
+ */
+let continueWhenResolved: InProgress | null = null;
+
+/** The operation to continue now that its conflicts are resolved, if any (only once). */
+export function takeContinueWhenResolved(): InProgress | null {
+  const op = continueWhenResolved;
+  continueWhenResolved = null;
+  return op;
+}
 
 export function showConflictsDialog() {
   if (!conflictedFiles().length) {
@@ -28,10 +43,11 @@ export function openMergeEditor(path: string) {
   void editorService().openInput(mergeInput(stripSlash(path)), { focus: true });
 }
 
-async function acceptSide(f: FileStatus, side: "ours" | "theirs") {
+/** Accept Yours / Accept Theirs for a whole conflicted file. */
+export async function acceptSide(f: FileStatus, side: "ours" | "theirs") {
   const path = stripSlash(f.path);
   await runOp(
-    `Accept ${side === "ours" ? "yours" : "theirs"} for ${baseName(path)}`,
+    side === "ours" ? tx`Accept yours for ${baseName(path)}` : tx`Accept theirs for ${baseName(path)}`,
     async () => {
       const v = await call(commands.vcsConflictVersions(path));
       const text = side === "ours" ? v.ours : v.theirs;
@@ -43,7 +59,7 @@ async function acceptSide(f: FileStatus, side: "ours" | "theirs") {
       }
       await call(commands.vcsStage([path]));
     },
-    { success: `${baseName(path)} resolved` },
+    { success: tx`${baseName(path)} resolved` },
   );
 }
 
@@ -51,9 +67,27 @@ function ConflictsDialog({ onClose }: { onClose: () => void }) {
   const files = useVcs((s) => s.status).filter((f) => f.unstaged === "conflicted");
   const root = useVcs((s) => s.root) ?? "";
   const op = useVcs((s) => inProgress(s.branch?.operation));
+  useEffect(() => {
+    continueWhenResolved = op && op !== "merge" ? op : null;
+  }, [op]);
+  // The last conflict resolved here: the operation continues (see onConflictsCleared), the dialog goes.
+  const hadConflicts = useRef(files.length > 0);
+  useEffect(() => {
+    if (hadConflicts.current && !files.length && op && op !== "merge") onClose();
+    hadConflicts.current = files.length > 0;
+  }, [files.length, op, onClose]);
+  // Closed without going on to resolve them: the operation stays stopped.
+  const dismiss = () => {
+    continueWhenResolved = null;
+    onClose();
+  };
   const head = useVcs((s) => s.branch?.head ?? null);
   const [active, setActive] = useState(0);
   const current = files[Math.min(active, files.length - 1)];
+  const edit = (file: FileStatus) => {
+    onClose();
+    openMergeEditor(file.path);
+  };
   // Once everything is resolved the dialog concludes the stopped operation, as IDEA does.
   const conclude =
     op && !files.length
@@ -65,9 +99,12 @@ function ConflictsDialog({ onClose }: { onClose: () => void }) {
     <Dialog
       open
       title="Conflicts"
-      onClose={onClose}
-      width={600}
-      footerStart={<span className={styles.hint}>{op ? operationTitle(op, head) : ""}</span>}
+      onClose={dismiss}
+      className={styles.dialog}
+      width={680}
+      resizable="both"
+      minWidth={360}
+      minHeight={320}
       buttons={[
         ...(conclude
           ? [
@@ -76,64 +113,74 @@ function ConflictsDialog({ onClose }: { onClose: () => void }) {
                 role: "default" as const,
                 autoFocus: true,
                 onClick: () => {
-                  onClose();
+                  dismiss();
                   conclude.run();
                 },
               },
             ]
           : []),
-        { label: "Accept Yours", disabled: !current, onClick: () => current && void acceptSide(current, "ours") },
-        { label: "Accept Theirs", disabled: !current, onClick: () => current && void acceptSide(current, "theirs") },
-        {
-          label: "Merge…",
-          role: conclude ? "extra" : "default",
-          autoFocus: !conclude,
-          disabled: !current,
-          onClick: () => {
-            if (!current) return;
-            onClose();
-            openMergeEditor(current.path);
-          },
-        },
         { label: "Close", role: "cancel" },
       ]}
     >
-      <div className={styles.section}>
-        {files.length
-          ? files.length === 1
-            ? tx`${files.length} file with conflicts`
-            : tx`${files.length} files with conflicts`
-          : tx("All conflicts resolved")}
-      </div>
-      <div style={{ height: 240, display: "flex", flexDirection: "column", padding: "0 14px 14px" }}>
-        <List
-          items={files}
-          getKey={(f) => f.path}
-          activeIndex={Math.min(active, files.length - 1)}
-          onActiveChange={setActive}
-          rowHeight={22}
-          aria-label="Conflicted files"
-          className={styles.boxList}
-          empty={
-            <span>
-              <T>No conflicts</T>
-            </span>
-          }
-          onActivate={(f, _i, e) => {
-            if (e.type === "click" && (e as unknown as MouseEvent).detail < 2) return;
-            onClose();
-            openMergeEditor(f.path);
-          }}
-          renderItem={(f) => (
-            <span className={styles.fileRow} style={{ flex: 1, padding: 0 }}>
-              <Icon name={fileIconName(baseName(f.path))} size={14} />
-              <span className={styles.fileName} style={{ color: "var(--vcs-conflict)" }}>
-                {baseName(f.path)}
-              </span>
-              <span className={styles.fileDir}>{dirName(relTo(root, stripSlash(f.path)))}</span>
-            </span>
-          )}
-        />
+      <div className={styles.content}>
+        <div className={styles.summary}>
+          {op && <span>{operationTitle(op, head)}</span>}
+          <span className={styles.count} role="status">
+            {files.length
+              ? files.length === 1
+                ? tx`${files.length} file with conflicts`
+                : tx`${files.length} files with conflicts`
+              : tx("All conflicts resolved")}
+          </span>
+        </div>
+        <div className={styles.workspace}>
+          <div className={styles.listFrame}>
+            <div className={styles.listHeader} aria-hidden>
+              <T>Name</T>
+            </div>
+            <List
+              autoFocus={!!current}
+              items={files}
+              getKey={(f) => f.path}
+              activeIndex={Math.min(active, files.length - 1)}
+              onActiveChange={setActive}
+              aria-label={tx("Conflicted files")}
+              className={styles.list}
+              empty={<T>No conflicts</T>}
+              onActivate={(f, _i, e) => {
+                if (e.type === "click" && (e as unknown as MouseEvent).detail < 2) return;
+                edit(f);
+              }}
+              renderItem={(f) => {
+                const path = relTo(root, stripSlash(f.path));
+                const name = baseName(f.path);
+                const dir = dirName(path);
+                return (
+                  <span className={styles.row} title={path}>
+                    <Icon name={fileIconName(name, f.path)} size={16} />
+                    <span className={styles.fileName}>{name}</span>
+                    {dir && <span className={styles.fileDir}>{dir}</span>}
+                  </span>
+                );
+              }}
+            />
+          </div>
+          <div className={styles.actions} role="group" aria-label={tx("Conflict resolution")}>
+            <Button disabled={!current} onClick={() => current && void acceptSide(current, "ours")}>
+              Accept Yours
+            </Button>
+            <Button disabled={!current} onClick={() => current && void acceptSide(current, "theirs")}>
+              Accept Theirs
+            </Button>
+            <Button
+              variant={conclude ? "secondary" : "primary"}
+              disabled={!current}
+              onClick={() => current && edit(current)}
+            >
+              Merge…
+            </Button>
+          </div>
+        </div>
       </div>
     </Dialog>
   );

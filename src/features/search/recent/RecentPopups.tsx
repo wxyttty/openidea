@@ -1,21 +1,46 @@
-import { useFilePresentation } from "@/platform/filePresentation";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { useFilePresentation } from "@/ui/filePresentation";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import { flushSync } from "react-dom";
 import clsx from "clsx";
 import { editorsFor, getNavigationHistory } from "@/editor/api";
 import { call, commands, type OutlineItem } from "@/platform/ipc";
+import { monoFontFamily } from "@/platform/fonts";
 import { shortcutLabel } from "@/platform/keymap";
 import { useProject } from "@/platform/project";
-import { Checkbox, Dialog, HighlightedText, Icon, List, fileIconName, listNavigate, T } from "@/ui";
+import {
+  Checkbox,
+  Dialog,
+  HighlightedText,
+  Icon,
+  List,
+  fileIconName,
+  listNavigate,
+  selectRow,
+  selectedRows,
+  rowSelectionMode,
+  SINGLE_FIRST,
+  type RowSelection,
+  T,
+} from "@/ui";
 import {
   maybeEditorService,
   toolWindowService,
   useContributions,
+  useProjectViewRoots,
   useFileDecoration,
   type OpenEditorTab,
   type ToolWindowContribution,
 } from "@/workbench/contributions";
 import { highlightTokens, languageForPath, type CodeToken } from "@/editor/lsp/markdown";
-import { basename, openLocation } from "../common/open";
+import { basename, openInListOrder, openLocation } from "../common/open";
 import { outlinePathAt } from "../structure/outline";
 import { fromNavigationHistory, isDismissed, mergeLocations, type RecentLocation } from "../common/locations";
 import { dismissLocation, useTracking } from "../common/tracking";
@@ -37,6 +62,13 @@ import { cycleSwitcher, hideRecentPopup, showRecentPopup, useRecentPopup } from 
 import styles from "./RecentPopups.module.css";
 import { tx } from "@/platform/i18n";
 
+/** Whether Delete in `target` (a filter field) has text to delete: a selection or text after the caret. */
+function textAfterCaret(target: EventTarget): boolean {
+  if (!(target instanceof HTMLInputElement)) return false;
+  const { selectionStart, selectionEnd, value } = target;
+  return selectionStart !== selectionEnd || (selectionEnd ?? value.length) < value.length;
+}
+
 export function RecentPopupsOverlay() {
   const open = useRecentPopup((s) => s.open);
   const session = useRecentPopup((s) => s.session);
@@ -47,10 +79,24 @@ export function RecentPopupsOverlay() {
 
 const NAV_KEYS = ["ArrowDown", "ArrowUp", "PageDown", "PageUp"];
 
-/** Defers work until the dialog unmounted and restored focus. */
-const afterClose = (fn: () => void) => {
-  hideRecentPopup();
-  setTimeout(fn, 0);
+let handingFocus = false;
+// Asked when the dialog's effects are cleaned up, which may come after `fn` already ran.
+const keepFocus = () => {
+  const keep = !handingFocus;
+  handingFocus = false;
+  return keep;
+};
+
+/**
+ * Runs `fn` once the dialog has unmounted and given focus back, in the same frame: the
+ * popup closing and what it opens paint together, without a frame of the old editor between.
+ * `takesFocus`: what `fn` opens focuses itself, so focus isn't given back first (focusing the
+ * editor left behind would lay out the window once more).
+ */
+const afterClose = (fn: () => void, takesFocus = false) => {
+  handingFocus = takesFocus;
+  flushSync(hideRecentPopup);
+  fn();
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +108,14 @@ function RecentFilesDialog() {
   const step = useRecentPopup((s) => s.step);
   const edited = useTracking((s) => s.edited);
   const root = useProject((s) => s.project?.root ?? null);
+  const viewRoots = useProjectViewRoots((s) => s.roots);
+  const labelled = useMemo(
+    () =>
+      [...viewRoots.values()].flatMap((r) =>
+        r.scope === "scratches" && r.path ? [{ path: r.path, label: r.label }] : [],
+      ),
+    [viewRoots],
+  );
   const toolWindows = useContributions((s) => s.toolWindows);
   const [paths, setPaths] = useState<string[] | null>(null);
   // Switcher: the open editor tabs (files and others), when the editor service lists them.
@@ -73,6 +127,14 @@ function RecentFilesDialog() {
   const [column, setColumn] = useState<"files" | "tools">("files");
   const [fileIndex, setFileIndex] = useState<number | null>(null);
   const [toolIndex, setToolIndex] = useState(0);
+  const opening = useRef(false);
+  const [previousEditedOnly, setPreviousEditedOnly] = useState(editedOnly);
+  const [fileSelection, setFileSelection] = useState<RowSelection>(SINGLE_FIRST);
+  if (previousEditedOnly !== editedOnly) {
+    setPreviousEditedOnly(editedOnly);
+    setFileSelection(SINGLE_FIRST);
+    setFileIndex(null);
+  }
   const inputRef = useRef<HTMLInputElement>(null);
   // The current editor: a file path, or the key of a non-file editor (Switcher lists those too).
   const activePath = useMemo(() => {
@@ -98,14 +160,15 @@ function RecentFilesDialog() {
   const files = useMemo(
     () =>
       tabs
-        ? switcherItems(paths ?? [], tabs, query, root).filter((f) => !removed.has(f.path))
+        ? switcherItems(paths ?? [], tabs, query, root, labelled).filter((f) => !removed.has(f.path))
         : filterRecentFiles(
             (paths ?? []).filter((p) => !removed.has(p)),
             query,
-            { root, edited, editedOnly },
+            { root, labelled, edited, editedOnly },
           ),
-    [paths, tabs, removed, query, root, edited, editedOnly],
+    [paths, tabs, removed, query, root, labelled, edited, editedOnly],
   );
+  const fileRows = useMemo(() => files.map((f) => ({ ...f, key: f.path })), [files]);
   const tools = useMemo(() => switcherToolWindows(toolWindows.values(), !!root, query), [toolWindows, root, query]);
   const fIndex = files.length
     ? Math.min(fileIndex ?? initialFileIndex(files, activePath, query), files.length - 1)
@@ -116,10 +179,37 @@ function RecentFilesDialog() {
   const openFile = (item: RecentFileItem | undefined, side = false) => {
     if (!item) return;
     const editor = item.editor;
-    afterClose(() =>
-      editor
-        ? void maybeEditorService()?.openInput(editor.input, { side, focus: true })
-        : void openLocation(item.path, null, { side }),
+    afterClose(
+      () =>
+        editor
+          ? void maybeEditorService()?.openInput(editor.input, { side, focus: true })
+          : void openLocation(item.path, null, { side }),
+      !!editor,
+    );
+  };
+
+  const selectFile = (index: number, e?: KeyboardEvent | ReactMouseEvent) => {
+    const next = selectRow(
+      fileRows,
+      { ...fileSelection, lead: fIndex, anchor: fileSelection.keys ? fileSelection.anchor : fIndex },
+      index,
+      switcher ? "single" : rowSelectionMode(e),
+    );
+    setFileSelection(next);
+    setFileIndex(next.lead);
+    setColumn("files");
+  };
+  const openFiles = (side = false) => {
+    if (opening.current) return;
+    const chosen = selectedRows(fileRows, { ...fileSelection, lead: fIndex });
+    if (chosen.length <= 1) return openFile(chosen[0], side);
+    opening.current = true;
+    void openInListOrder(
+      chosen,
+      fileRows[fIndex],
+      (f, options) => openLocation(f.path, null, options),
+      side,
+      () => new Promise((resolve) => afterClose(resolve)),
     );
   };
 
@@ -143,6 +233,7 @@ function RecentFilesDialog() {
     if (!switcher) void call(commands.removeRecent(item.path)).catch(() => {});
     setRemoved((r) => new Set(r).add(item.path));
     setFileIndex(fIndex);
+    setFileSelection({ lead: fIndex, anchor: fIndex, keys: null });
   };
 
   // Switcher: each ⌃⇥ moves one row, past the end into the other column; releasing Ctrl opens the selection.
@@ -182,7 +273,7 @@ function RecentFilesDialog() {
         // Nothing recent matches: carry the text over to Go to File.
         const text = query.trim();
         afterClose(() => showSearchEverywhere("files", { query: text }));
-      } else if (effectiveColumn === "files") openFile(files[fIndex], e.shiftKey);
+      } else if (effectiveColumn === "files") openFiles(e.shiftKey);
       else openTool(tools[tIndex]?.tw);
       return;
     }
@@ -192,8 +283,9 @@ function RecentFilesDialog() {
       cycleSwitcher(e.shiftKey ? -1 : 1);
       return;
     }
-    // In Recent Files Backspace edits the speed search text first.
-    if (e.key === "Delete" || (e.key === "Backspace" && !query)) {
+    // In Recent Files Backspace edits the speed search text first, and so does Delete while
+    // the filter has text after the caret.
+    if ((e.key === "Delete" && !textAfterCaret(e.target)) || (e.key === "Backspace" && !query)) {
       e.preventDefault();
       void removeSelected();
       return;
@@ -201,6 +293,7 @@ function RecentFilesDialog() {
     if (e.key === "Tab" || ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !query)) {
       e.preventDefault();
       e.stopPropagation();
+      setFileSelection(SINGLE_FIRST);
       setColumn(
         e.key === "ArrowLeft"
           ? "tools"
@@ -215,8 +308,8 @@ function RecentFilesDialog() {
     if (!NAV_KEYS.includes(e.key)) return;
     e.preventDefault();
     if (effectiveColumn === "files") {
-      const next = listNavigate(e.key, { items: files, active: fIndex, wrap: true });
-      if (next !== null) setFileIndex(next);
+      const next = listNavigate(e.key, { items: files, active: fIndex, wrap: switcher || !e.shiftKey });
+      if (next !== null) selectFile(next, e);
     } else {
       const next = listNavigate(e.key, { items: tools, active: tIndex, wrap: true });
       if (next !== null) setToolIndex(next);
@@ -228,7 +321,14 @@ function RecentFilesDialog() {
   const title = switcher ? "Switcher" : editedOnly ? "Recently Edited Files" : "Recent Files";
   const footerPath = (selected?.editor ? selected.rel : selected?.path) ?? (selectedTool ? "" : (root ?? ""));
   return (
-    <Dialog open onClose={hideRecentPopup} width={720} aria-label={title} className={styles.dialog}>
+    <Dialog
+      open
+      onClose={hideRecentPopup}
+      restoreFocus={keepFocus}
+      width={switcher ? 560 : 720}
+      aria-label={title}
+      className={clsx(styles.dialog, switcher && styles.switcher)}
+    >
       <header className={styles.header}>
         <span className={styles.title}>
           <T>{title}</T>
@@ -248,6 +348,7 @@ function RecentFilesDialog() {
                 onChange={(e) => {
                   setQuery(e.target.value);
                   setFileIndex(null);
+                  setFileSelection(SINGLE_FIRST);
                   setToolIndex(0);
                 }}
                 onKeyDown={onKeyDown}
@@ -280,14 +381,14 @@ function RecentFilesDialog() {
             getKey={(t) => t.tw.id}
             activeIndex={effectiveColumn === "tools" ? tIndex : -1}
             onActiveChange={(i) => {
+              setFileSelection(SINGLE_FIRST);
               setToolIndex(i);
               setColumn("tools");
             }}
             onActivate={(t) => openTool(t.tw)}
             focusable={false}
-            rowHeight={24}
             aria-label="Tool windows"
-            renderItem={(t) => <ToolRow tw={t.tw} indices={t.indices} />}
+            renderItem={(t) => <ToolRow tw={t.tw} title={t.title} indices={t.indices} />}
           />
           {!switcher && (
             <button
@@ -307,13 +408,11 @@ function RecentFilesDialog() {
             items={files}
             getKey={(f) => f.path}
             activeIndex={effectiveColumn === "files" ? fIndex : -1}
-            onActiveChange={(i) => {
-              setFileIndex(i);
-              setColumn("files");
-            }}
+            onActiveChange={switcher ? (i) => selectFile(i) : undefined}
+            onSelect={switcher ? undefined : selectFile}
+            isSelected={(f) => effectiveColumn === "files" && !!fileSelection.keys?.has(f.path)}
             onActivate={(f, _i, e) => openFile(f, e.shiftKey)}
             focusable={false}
-            rowHeight={24}
             aria-label={switcher ? "Open files" : "Recent files"}
             empty={
               paths && (
@@ -341,12 +440,12 @@ function RecentFilesDialog() {
   );
 }
 
-function ToolRow({ tw, indices }: { tw: ToolWindowContribution; indices: number[] }) {
+function ToolRow({ tw, title, indices }: { tw: ToolWindowContribution; title: string; indices: number[] }) {
   const shortcut = shortcutLabel(`toolwindow.${tw.id}`);
   return (
     <>
       <Icon name={tw.icon} size={16} className={styles.icon} />
-      <HighlightedText className={styles.name} text={tw.title} indices={indices} tone="strong" />
+      <HighlightedText className={styles.name} text={title} indices={indices} tone="strong" />
       {shortcut && <span className={styles.shortcut}>{shortcut}</span>}
     </>
   );
@@ -359,12 +458,12 @@ function RecentFileRow({ item, current }: { item: RecentFileItem; current: boole
     <>
       <Icon name={item.editor?.icon ?? icon} size={16} className={styles.icon} />
       <span
-        className={clsx(styles.name, current && styles.current)}
+        className={clsx(styles.name, styles.fileName, current && styles.current)}
         style={deco.color ? { color: deco.color } : undefined}
       >
         <HighlightedText text={item.name} indices={item.indices} tone="strong" />
       </span>
-      <span className={styles.dir}>{item.dir}</span>
+      {item.dir && <span className={styles.dir}>{item.dir}</span>}
     </>
   );
 }
@@ -396,8 +495,6 @@ function withSnippets(list: RecentLocation[], recorded: readonly RecentLocation[
     return near ? { ...l, snippet: near.snippet, snippetStart: near.snippetStart } : l;
   });
 }
-
-const LOCATION_ROW = 78;
 
 function breadcrumbOf(outline: readonly OutlineItem[] | undefined, l: RecentLocation): string {
   return outline ? locationBreadcrumb(outlinePathAt(outline, { line: l.line, col: l.col })) : "";
@@ -436,11 +533,13 @@ function SnippetCode({
   lines,
   first,
   caret,
+  style,
 }: {
   path: string;
   lines: readonly string[];
   first: number;
   caret: number;
+  style: CSSProperties;
 }) {
   const language = useMemo(() => languageForPath(path), [path]);
   const text = lines.join("\n");
@@ -461,7 +560,7 @@ function SnippetCode({
   }, [key, language, text, tokens]);
   const segments = useMemo(() => lineSegments(lines, tokens ?? []), [lines, tokens]);
   return (
-    <pre className={styles.snippet}>
+    <pre className={styles.snippet} style={style}>
       {segments.map((segs, i) => (
         <div key={i} className={clsx(styles.snippetLine, first + i === caret && styles.caretLine)}>
           <span className={styles.lineNo}>{first + i + 1}</span>
@@ -489,6 +588,14 @@ function RecentLocationsDialog() {
   const recorded = useTracking((s) => s.locations);
   const dismissed = useTracking((s) => s.dismissed);
   const root = useProject((s) => s.project?.root ?? null);
+  const editor = useProject((s) => s.settings?.editor);
+  const lineHeight = Math.max(editor?.fontSize ?? 13, editor?.lineHeight ?? 22);
+  const rowHeight = 30 + 3 * lineHeight;
+  const snippetStyle: CSSProperties = {
+    fontFamily: monoFontFamily(editor?.fontFamily ?? undefined, editor?.fallbackFont, "var(--font-mono)"),
+    fontSize: editor?.fontSize ?? undefined,
+    lineHeight: `${lineHeight}px`,
+  };
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -517,8 +624,9 @@ function RecentLocationsDialog() {
       open(items[active], e.shiftKey);
       return;
     }
-    // IDEA: Delete removes the selected place (Backspace too while there is no filter text).
-    if ((e.key === "Delete" || (e.key === "Backspace" && !query)) && items[active]) {
+    // IDEA: Delete removes the selected place (Backspace too while there is no filter text), unless
+    // the filter has text after the caret to delete.
+    if (((e.key === "Delete" && !textAfterCaret(e.target)) || (e.key === "Backspace" && !query)) && items[active]) {
       e.preventDefault();
       dismissLocation(items[active]!);
       return;
@@ -566,6 +674,7 @@ function RecentLocationsDialog() {
       </header>
       <div className={styles.locations}>
         <List
+          key={rowHeight}
           items={items}
           getKey={(l) => `${l.path}:${l.line}:${l.time}`}
           activeIndex={active}
@@ -576,15 +685,15 @@ function RecentLocationsDialog() {
             open(l, e.shiftKey);
           }}
           focusable={false}
-          rowHeight={LOCATION_ROW}
+          rowHeight={rowHeight}
           aria-label="Recent locations"
           empty={<span>{changedOnly ? tx("No changed locations") : tx("No recent locations")}</span>}
           renderItem={(l) => (
             <div className={styles.location}>
               <div className={styles.locationHeader}>
-                <Icon name={fileIconName(basename(l.rel))} size={14} className={styles.icon} />
+                <Icon name={fileIconName(basename(l.rel), l.rel)} size={14} className={styles.icon} />
                 <HighlightedText
-                  className={styles.locationName}
+                  className={clsx(styles.name, styles.locationName)}
                   text={basename(l.rel)}
                   indices={l.nameIndices}
                   tone="strong"
@@ -597,7 +706,13 @@ function RecentLocationsDialog() {
                 )}
                 <span className={styles.time}>{locationTime(l.time, now)}</span>
               </div>
-              <SnippetCode path={l.path} lines={dedent(l.snippet)} first={l.snippetStart} caret={l.line} />
+              <SnippetCode
+                path={l.path}
+                lines={dedent(l.snippet)}
+                first={l.snippetStart}
+                caret={l.line}
+                style={snippetStyle}
+              />
             </div>
           )}
         />

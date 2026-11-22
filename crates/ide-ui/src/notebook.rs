@@ -128,7 +128,7 @@ impl NotebookPanel {
         let host = self.host.clone();
         let open_path = path.clone();
         self.host.runtime.spawn(async move {
-            let result = ide_host::ops::notebook::open(&host, "main", open_path.to_string_lossy().into_owned())
+            let result = ide_host::ops::notebook::notebook_open(&host, "main", open_path.to_string_lossy().into_owned())
                 .await
                 .map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
@@ -175,8 +175,8 @@ impl NotebookPanel {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
             let result = async {
-                ide_host::ops::notebook::edit(&host, "main", id, version, edit).await.map_err(|err| err.to_string())?;
-                ide_host::ops::notebook::save(&host, "main", save_id).await.map_err(|err| err.to_string())
+                ide_host::ops::notebook::notebook_edit(&host, "main", id, version, edit).await.map_err(|err| err.to_string())?;
+                ide_host::ops::notebook::notebook_save(&host, "main", save_id).await.map_err(|err| err.to_string())
             }
             .await;
             let _ = tx.unbounded_send(result);
@@ -203,7 +203,7 @@ impl NotebookPanel {
         let host = self.host.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
-            let result = ide_host::ops::notebook::save(&host, "main", snapshot.id).await.map_err(|err| err.to_string());
+            let result = ide_host::ops::notebook::notebook_save(&host, "main", snapshot.id).await.map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.cell_task = Some(cx.spawn(async move |this, cx| {
@@ -303,7 +303,7 @@ impl NotebookPanel {
                     let _ = tx.unbounded_send(ExecuteEvent::Output(event));
                 }
             });
-            let result = ide_host::ops::notebook::execute(&host, "main", id, cells, python, request, channel)
+            let result = ide_host::ops::notebook::notebook_execute(&host, "main", id, cells, python, request, channel)
                 .await
                 .map_err(|err| err.to_string());
             let _ = tx.unbounded_send(ExecuteEvent::Done(result));
@@ -369,7 +369,7 @@ impl NotebookPanel {
         let id = snapshot.id.clone();
         self.host.runtime.spawn(async move {
             let result =
-                ide_host::ops::notebook::restart(&host, "main", id).await.map_err(|err| err.to_string());
+                ide_host::ops::notebook::notebook_restart(&host, "main", id).await.map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.cell_task = Some(cx.spawn(async move |this, cx| {
@@ -392,7 +392,7 @@ impl NotebookPanel {
 
     /// Re-reads the document after a streamed output (in-memory, no I/O).
     fn refresh_snapshot(&mut self, id: &str, cx: &mut Context<Self>) {
-        match ide_host::ops::notebook::get(&self.host, "main", id.to_owned()) {
+        match ide_host::ops::notebook::notebook_get(&self.host, "main", id.to_owned()) {
             Ok(snapshot) => self.snapshot = Some(snapshot),
             Err(err) => self.notice = Some(format!("Notebook refresh failed: {err}").into()),
         }
@@ -411,10 +411,10 @@ impl NotebookPanel {
         self.host.runtime.spawn(async move {
             let result = async {
                 let edit = NotebookEdit::SetOutputs { cell, outputs: Vec::new(), execution_count: None };
-                ide_host::ops::notebook::edit(&host, "main", id, version, edit)
+                ide_host::ops::notebook::notebook_edit(&host, "main", id, version, edit)
                     .await
                     .map_err(|err| err.to_string())?;
-                ide_host::ops::notebook::save(&host, "main", save_id).await.map_err(|err| err.to_string())
+                ide_host::ops::notebook::notebook_save(&host, "main", save_id).await.map_err(|err| err.to_string())
             }
             .await;
             let _ = tx.unbounded_send(result);

@@ -24,6 +24,8 @@ pub struct JvmPresentation {
     pub kind: Option<JvmTypeKind>,
     pub spring_boot: bool,
     pub runnable: bool,
+    /// `@Deprecated`, or a Java `@deprecated` Javadoc tag.
+    pub deprecated: bool,
 }
 
 fn text<'a>(node: Node, source: &'a str) -> &'a str {
@@ -101,6 +103,57 @@ fn members(node: Node<'_>) -> Vec<Node<'_>> {
     out
 }
 
+/// The source up to and including the opening brace of the first type's body, skipping
+/// comments, string and character literals and parenthesised arguments (annotations, Kotlin
+/// constructors). A file cut off somewhere in its body does not parse as a declaration; this
+/// header, closed with `}`, still tells what it declares.
+pub fn jvm_type_header(source: &str) -> Option<&str> {
+    let b = source.as_bytes();
+    let find = |from: usize, needle: &str| source.get(from..)?.find(needle).map(|i| from + i);
+    let (mut i, mut parens, mut seen_type) = (0, 0usize, false);
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => i = find(i, "\n")?,
+            b'/' if b.get(i + 1) == Some(&b'*') => i = find(i + 2, "*/")? + 1,
+            b'"' if source[i..].starts_with("\"\"\"") => i = find(i + 3, "\"\"\"")? + 2,
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q && b[i] != b'\n' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b'{' if parens == 0 && seen_type => return Some(&source[..=i]),
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || matches!(b[i + 1], b'_' | b'$')) {
+                    i += 1;
+                }
+                let word = &source[start..=i];
+                let declares = matches!(word, "class" | "interface" | "enum" | "record" | "object");
+                seen_type |= parens == 0 && declares && (start == 0 || b[start - 1] != b'.');
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The Javadoc right before `node` has a `@deprecated` block tag.
+fn javadoc_deprecated(node: Node, source: &str) -> bool {
+    let Some(doc) = node.prev_named_sibling().filter(|n| n.kind() == "block_comment") else {
+        return false;
+    };
+    let doc = text(doc, source);
+    doc.starts_with("/**")
+        && doc.lines().any(|line| {
+            let line = line.trim_start().trim_start_matches("/**").trim_start_matches('*').trim_start();
+            line.strip_prefix("@deprecated").is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+        })
+}
+
 fn is_type(node: Node) -> bool {
     matches!(
         node.kind(),
@@ -159,7 +212,7 @@ impl StructureService {
             let runnable = body.is_some_and(|b| {
                 members(*b).into_iter().any(|n| {
                     if !matches!(n.kind(), "method_declaration" | "function_declaration")
-                        || !n.child_by_field_name("name").is_some_and(|id| text(id, snap.text) == "main")
+                        || n.child_by_field_name("name").is_none_or(|id| text(id, snap.text) != "main")
                     {
                         return false;
                     }
@@ -183,7 +236,9 @@ impl StructureService {
                         })
                 })
             });
-            Ok(JvmPresentation { kind: Some(kind), spring_boot, runnable })
+            let deprecated = modifiers.is_some_and(|m| annotation(m, snap.text, "Deprecated"))
+                || cx.grammar == "java" && javadoc_deprecated(node, snap.text);
+            Ok(JvmPresentation { kind: Some(kind), spring_boot, runnable, deprecated })
         })
     }
 }

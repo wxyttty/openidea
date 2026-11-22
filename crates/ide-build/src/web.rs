@@ -26,12 +26,12 @@ pub fn artifacts(root: &Path, model: &BuildModel) -> Vec<WebArtifact> {
             });
         }
     }
-    if let Some(gradle) = &model.gradle {
+    for gradle in &model.gradle {
         for p in &gradle.projects {
             let script = p.build_file.as_ref().and_then(|f| fs::read_to_string(root.join(f)).ok()).unwrap_or_default();
             if p.tasks.iter().any(|t| t.name == "war") || crate::gradle::has_war_plugin(&script) {
                 out.push(WebArtifact {
-                    id: format!("gradle:{}", p.path),
+                    id: gradle_artifact_id(gradle, &p.path),
                     name: p.name.clone(),
                     module: p.dir.clone(),
                     tool: "gradle".into(),
@@ -40,6 +40,14 @@ pub fn artifacts(root: &Path, model: &BuildModel) -> Vec<WebArtifact> {
         }
     }
     out
+}
+
+fn gradle_artifact_id(build: &crate::GradleModel, path: &str) -> String {
+    if build.dir.is_empty() {
+        format!("gradle:{path}")
+    } else {
+        format!("gradle:{}", serde_json::to_string(&(&build.dir, path)).unwrap())
+    }
 }
 
 pub struct WebBuild {
@@ -150,22 +158,39 @@ pub fn build(root: &Path, model: &BuildModel, id: &str, cache: &Path) -> IdeResu
             maven_project: Some((probe, output)),
         });
     }
-    if let Some(path) = id.strip_prefix("gradle:") {
-        let g = model.gradle.as_ref().ok_or_else(|| IdeError::invalid("Choose a Gradle WAR module"))?;
-        if !artifacts(root, model).iter().any(|a| a.id == id) {
+    if let Some(legacy_path) = id.strip_prefix("gradle:") {
+        let identity = serde_json::from_str::<(String, String)>(legacy_path).ok();
+        let (g, path) = match &identity {
+            Some((dir, path)) => (model.gradle.iter().find(|g| g.dir == *dir), path.as_str()),
+            None => (model.gradle.first(), legacy_path),
+        };
+        let g = g.ok_or_else(|| IdeError::invalid("Choose a Gradle WAR module"))?;
+        if !artifacts(root, model).iter().any(|a| a.id == gradle_artifact_id(g, path)) {
             return Err(IdeError::invalid("Choose a Gradle WAR module"));
         }
         let script = cache.join("war.init.gradle");
         fs::write(
             &script,
             format!(
-                r#"gradle.projectsEvaluated {{
+                r#"import org.gradle.util.GradleVersion
+
+gradle.projectsEvaluated {{
     def p = gradle.rootProject.project({})
-    def warTask = p.tasks.named('war')
-    p.tasks.register('openideaTomcatArtifact') {{
-        dependsOn warTask
-        doLast {{ new File({}).setText(warTask.get().archiveFile.get().asFile.absolutePath, 'UTF-8') }}
+    def artifact = {{ t ->
+        t.dependsOn 'war'
+        // Resolved here so the action holds no task or project (configuration cache).
+        def war = p.tasks.getByName('war')
+        // `archiveFile` is Gradle 5.1+, `archivePath` is gone in 8.0.
+        def archive = war.hasProperty('archiveFile') ? war.archiveFile : war.archivePath
+        def manifest = new File({})
+        t.doLast {{
+            def file = archive instanceof File ? archive : archive.get().asFile
+            manifest.setText(file.absolutePath, 'UTF-8')
+        }}
     }}
+    // `register` is Gradle 4.9+.
+    if (GradleVersion.current() >= GradleVersion.version('4.9')) p.tasks.register('openideaTomcatArtifact', artifact)
+    else p.tasks.create('openideaTomcatArtifact', artifact)
 }}
 "#,
                 groovy_literal(path),
@@ -186,6 +211,28 @@ pub fn build(root: &Path, model: &BuildModel, id: &str, cache: &Path) -> IdeResu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn independent_war_modules_have_distinct_ids_and_build_in_their_own_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for dir in ["a", "b"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("build.gradle"), "plugins { id 'war' }").unwrap();
+        }
+        let settings = ide_core::settings::GradleSettings {
+            linked_projects: Some(vec!["a".into(), "b".into()]),
+            ..Default::default()
+        };
+        let model = crate::load_linked(root, &root.join("cache"), None, &Default::default(), &settings);
+        let artifacts = super::artifacts(root, &model);
+        assert_eq!(artifacts.len(), 2);
+        assert_ne!(artifacts[0].id, artifacts[1].id);
+        for (artifact, dir) in artifacts.iter().zip(["a", "b"]) {
+            let plan = super::build(root, &model, &artifact.id, &root.join(format!("cache/{dir}"))).unwrap();
+            assert_eq!(plan.cwd, dir);
+        }
+        assert_eq!(super::build(root, &model, "gradle::", &root.join("legacy")).unwrap().cwd, "a");
+    }
     use super::*;
     #[test]
     fn maven_war_modules_use_resolved_artifact_file() {
@@ -235,7 +282,7 @@ mod tests {
         assert_eq!(a.len(), 1);
         let plan = build(tmp.path(), &model, &a[0].id, &tmp.path().join("base")).unwrap();
         assert!(plan.args.contains(&":openideaTomcatArtifact".into()));
-        assert!(fs::read_to_string(tmp.path().join("base/war.init.gradle")).unwrap().contains("archiveFile.get()"));
+        assert!(fs::read_to_string(tmp.path().join("base/war.init.gradle")).unwrap().contains("? war.archiveFile :"));
         assert!(!crate::gradle::has_war_plugin("// plugins { war }"));
     }
 
@@ -262,7 +309,14 @@ mod tests {
             assert!(plan.args.contains(&format!("{}:openideaTomcatArtifact", module.trim_end_matches(':'))));
             let script = fs::read_to_string(cache.join("war.init.gradle")).unwrap();
             assert!(script.contains(&format!("rootProject.project('{}')", module)));
-            assert!(script.contains("archiveFile.get().asFile.absolutePath, 'UTF-8'"));
+            assert!(script.contains("manifest.setText(file.absolutePath, 'UTF-8')"));
+            // `archiveFile` is Gradle 5.1+, `register` 4.9+ (#3864).
+            assert!(
+                script.contains(": war.archivePath") && script.contains("else p.tasks.create('openideaTomcatArtifact'")
+            );
+            // The configuration cache can't serialize a task or project the action refers to.
+            let action = &script[script.find("doLast").unwrap()..script.find("// `register`").unwrap()];
+            assert!(!action.contains("p.") && !action.contains("war."), "{action}");
         }
     }
 }

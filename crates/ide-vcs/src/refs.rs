@@ -4,6 +4,9 @@ use crate::repo::{gx, to_string};
 use crate::{Branch, BranchInfo, Repo, Stash};
 use ide_core::IdeResult;
 
+// Filter symbolic refs before shortening; `refname:short` also strips remote `/HEAD` suffixes.
+pub(crate) const DIRECT_BRANCH_FORMAT: &str = "--format=%(if)%(symref)%(then)%(else)%(refname:lstrip=2)%(end)";
+
 pub(crate) fn branch_info(r: &Repo) -> IdeResult<BranchInfo> {
     let repo = r.gix()?;
     let head_ref = repo.head_name().map_err(gx)?;
@@ -21,8 +24,8 @@ pub(crate) fn branch_info(r: &Repo) -> IdeResult<BranchInfo> {
         && let Some((upstream_name, upstream_id)) = upstream_of(&repo, name.as_ref())
     {
         info.upstream = Some(upstream_name);
-        if let (Some(local), Some(up)) = (head_commit, upstream_id) {
-            let (a, b) = ahead_behind(&repo, local, up)?;
+        if let Some(local) = head_commit {
+            let (a, b) = ahead_behind(&repo, local, upstream_id)?;
             info.ahead = a;
             info.behind = b;
         }
@@ -48,16 +51,12 @@ pub(crate) fn operation(repo: &gix::Repository) -> Option<String> {
     Some(op.to_string())
 }
 
-/// Short upstream name (`origin/main`) and, if the tracking ref exists, its commit.
-fn upstream_of(repo: &gix::Repository, branch: &gix::refs::FullNameRef) -> Option<(String, Option<gix::ObjectId>)> {
+/// Short upstream name (`origin/main`) and its commit. A branch whose tracking ref is gone (the
+/// remote branch was deleted and pruned) tracks nothing, as in IDEA.
+fn upstream_of(repo: &gix::Repository, branch: &gix::refs::FullNameRef) -> Option<(String, gix::ObjectId)> {
     let tracking = repo.branch_remote_tracking_ref_name(branch, gix::remote::Direction::Fetch)?.ok()?;
-    let short = to_string(tracking.as_ref().shorten());
-    let id = repo
-        .try_find_reference(tracking.as_ref())
-        .ok()
-        .flatten()
-        .and_then(|mut r| r.peel_to_id().ok().map(|id| id.detach()));
-    Some((short, id))
+    let id = repo.try_find_reference(tracking.as_ref()).ok()??.peel_to_id().ok()?.detach();
+    Some((to_string(tracking.as_ref().shorten()), id))
 }
 
 /// Commits in `local` not in `upstream`, and vice versa.
@@ -93,6 +92,9 @@ pub(crate) fn branches(r: &Repo) -> IdeResult<Vec<Branch>> {
 
     for reference in platform.local_branches().map_err(gx)? {
         let mut reference = reference.map_err(gx)?;
+        if reference.target().try_name().is_some() {
+            continue;
+        }
         let full = reference.name().to_owned();
         let Ok(id) = reference.peel_to_id().map(|id| id.detach()) else { continue };
         let current = head_name.as_ref().is_some_and(|h| h == &full);
@@ -108,21 +110,19 @@ pub(crate) fn branches(r: &Repo) -> IdeResult<Vec<Branch>> {
         };
         if let Some((up, up_id)) = upstream_of(&repo, full.as_ref()) {
             branch.upstream = Some(up);
-            if let Some(up_id) = up_id {
-                let (a, b) = ahead_behind(&repo, id, up_id)?;
-                branch.ahead = a;
-                branch.behind = b;
-            }
+            let (a, b) = ahead_behind(&repo, id, up_id)?;
+            branch.ahead = a;
+            branch.behind = b;
         }
         out.push(branch);
     }
     for reference in platform.remote_branches().map_err(gx)? {
         let mut reference = reference.map_err(gx)?;
-        let full = reference.name().to_owned();
-        // Skip `refs/remotes/<remote>/HEAD` symbolic pointers.
-        if full.as_bstr().ends_with(b"/HEAD") {
+        // Skip symbolic aliases such as `refs/remotes/<remote>/HEAD`.
+        if reference.target().try_name().is_some() {
             continue;
         }
+        let full = reference.name().to_owned();
         let Ok(id) = reference.peel_to_id().map(|id| id.detach()) else { continue };
         out.push(Branch {
             name: to_string(full.as_ref().shorten()),
@@ -158,7 +158,15 @@ pub(crate) fn stashes(r: &Repo) -> IdeResult<Vec<Stash>> {
     for (index, line) in lines.enumerate() {
         let line = line.map_err(gx)?;
         let time_ms = line.signature.time.seconds as f64 * 1000.0;
-        out.push(Stash { index: index as u32, message: to_string(line.message.as_ref()), time_ms });
+        let id = line.new_oid.to_owned();
+        let base = repo.find_commit(id).ok().and_then(|c| c.parent_ids().next().map(|p| p.to_string()));
+        out.push(Stash {
+            index: index as u32,
+            message: to_string(line.message.as_ref()),
+            time_ms,
+            id: id.to_string(),
+            base,
+        });
     }
     Ok(out)
 }

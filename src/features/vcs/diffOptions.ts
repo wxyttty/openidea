@@ -7,6 +7,8 @@ import { Change, Chunk, type DiffConfig } from "@codemirror/merge";
 import type { ChangeDesc, Text } from "@codemirror/state";
 import { compareTexts, type ComparisonPolicy, type LineFragment } from "./comparison";
 import { DiffTooBigError } from "./comparison/lcs";
+import { findMovedBlocks, type MovedBlock } from "./comparison/moves";
+import { stripSpaces } from "./comparison/text";
 
 export type DiffMode = "split" | "unified";
 export type IgnorePolicy = "none" | "trim" | "whitespace" | "whitespaceAndLines";
@@ -24,6 +26,8 @@ export interface DiffViewOptions {
    * keeps its own height and a curved divider joins the changes (IDEA's default).
    */
   alignChanges: boolean;
+  /** Long lines wrap; null follows Settings › Editor › General › Soft-wrap files for the file. */
+  softWrap: boolean | null;
 }
 
 export const IGNORE_OPTIONS: ReadonlyArray<{ value: IgnorePolicy; label: string }> = [
@@ -46,6 +50,7 @@ export const DEFAULT_DIFF_OPTIONS: DiffViewOptions = {
   collapse: true,
   syncScroll: true,
   alignChanges: false,
+  softWrap: null,
 };
 
 const KEY = "openidea.vcs.diffOptions";
@@ -64,6 +69,7 @@ export function parseDiffOptions(raw: unknown): DiffViewOptions {
     collapse: typeof o.collapse === "boolean" ? o.collapse : d.collapse,
     syncScroll: typeof o.syncScroll === "boolean" ? o.syncScroll : d.syncScroll,
     alignChanges: typeof o.alignChanges === "boolean" ? o.alignChanges : d.alignChanges,
+    softWrap: typeof o.softWrap === "boolean" ? o.softWrap : d.softWrap,
   };
 }
 
@@ -118,6 +124,15 @@ export function ideaDiffConfig(ignore: IgnorePolicy, highlight: HighlightPolicy)
 /** The line fragment a chunk was built from. */
 const fragments = new WeakMap<Chunk, LineFragment>();
 
+interface DiffInsights {
+  readonly moves: readonly MovedBlock[];
+  readonly whitespaceOnly: boolean;
+}
+
+const insights = new WeakMap<readonly Chunk[], DiffInsights>();
+const NO_INSIGHTS: DiffInsights = { moves: [], whitespaceOnly: false };
+export const getDiffInsights = (chunks: readonly Chunk[]): DiffInsights => insights.get(chunks) ?? NO_INSIGHTS;
+
 /**
  * Whether the chunk has IDEA's inner fragments (its words were compared):
  * such a chunk gets the lighter line background (TextDiffType "ignored"
@@ -125,31 +140,43 @@ const fragments = new WeakMap<Chunk, LineFragment>();
  */
 export const hasInnerFragments = (chunk: Chunk) => !!fragments.get(chunk)?.inner;
 
-/** IDEA's line fragments as chunks; `changes` hold the inner fragments, or the whole block. */
+/** IDEA's line fragments as chunks; `changes` hold the inner fragments, if any. */
 export function ideaChunks(a: Text, b: Text, ignore: IgnorePolicy, highlight: HighlightPolicy): readonly Chunk[] {
   return toChunks(a, b, ideaOf(ideaDiffConfig(ignore, highlight))!);
 }
 
 function toChunks(a: Text, b: Text, idea: IdeaDiff): readonly Chunk[] {
+  const textA = a.toString();
+  const textB = b.toString();
+  const remember = (chunks: readonly Chunk[]) => {
+    insights.set(chunks, {
+      moves: findMovedBlocks(a, b, chunks),
+      whitespaceOnly: textA !== textB && stripSpaces(textA) === stripSpaces(textB),
+    });
+    return chunks;
+  };
   let compared: LineFragment[];
   try {
-    compared = compareTexts(a.toString(), b.toString(), idea);
+    compared = compareTexts(textA, textB, idea);
   } catch (error) {
     if (!(error instanceof DiffTooBigError)) throw error;
-    // Repeated lines can exhaust IDEA's search. Keep the viewer usable with a bounded, coarser diff.
-    return build.call(Chunk, a, b, { scanLimit: 500 });
+    // Repeated lines can exhaust IDEA's search. Keep the viewer usable with a bounded, coarser diff,
+    // its blocks without words as IDEA's own.
+    const coarse = build.call(Chunk, a, b, { scanLimit: 500 });
+    return remember(coarse.map((c) => new Chunk([], c.fromA, c.toA, c.fromB, c.toB, c.precise)));
   }
-  return compared.map((f) => {
+  const chunks = compared.map((f) => {
     // `to` is one past the last line's end, past the document for its last line.
     const toA = f.startLine1 === f.endLine1 ? f.startOffset1 : f.endLine1 === a.lines ? a.length + 1 : f.endOffset1;
     const toB = f.startLine2 === f.endLine2 ? f.startOffset2 : f.endLine2 === b.lines ? b.length + 1 : f.endOffset2;
-    const changes = f.inner
-      ? f.inner.map((r) => new Change(r.start1, r.end1, r.start2, r.end2))
-      : [new Change(0, f.endOffset1 - f.startOffset1, 0, f.endOffset2 - f.startOffset2)];
+    // A block without inner fragments has no words to mark (the unified viewer marks `changes`).
+    // A fresh array each: @codemirror/merge caches deleted-line widgets by it.
+    const changes = f.inner ? f.inner.map((r) => new Change(r.start1, r.end1, r.start2, r.end2)) : [];
     const chunk = new Chunk(changes, f.startOffset1, toA, f.startOffset2, toB);
     fragments.set(chunk, f);
     return chunk;
   });
+  return remember(chunks);
 }
 
 // Every chunk computation of MergeView and unifiedMergeView goes through these.

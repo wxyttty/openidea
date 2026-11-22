@@ -1,7 +1,7 @@
 //! Proofreading › Typo: spell checking of open documents.
 use crate::Host;
 use crate::Project;
-use crate::rpc::Dispatcher;
+use ide_command::command;
 
 use super::doc::blocking;
 use ide_core::settings::SpellingSettings;
@@ -36,6 +36,7 @@ fn speller(project: &Project) -> Speller {
 /// Misspelt words in the comments, string literals and declared names of
 /// `doc` that `scope` includes (all of its text for prose). Cancel with
 /// `cancel_request(request)`.
+#[command(trust = always)]
 pub async fn spell_check(
     host: &Host,
     window: &str,
@@ -47,14 +48,17 @@ pub async fn spell_check(
     let syntax = host.syntax();
     let cancel = host.begin_request(request);
     let result = blocking(move || {
+        let path = project.documents.snapshot(doc)?.path.0.clone();
         let snap = project.documents.text_snapshot(doc)?;
         if snap.large {
-            return Ok(Vec::new());
+            return Ok((path, Vec::new()));
         }
         let regions = if PROSE.contains(&snap.language.as_str()) {
             ide_spell::prose_regions(&snap.text)
         } else {
-            let Some(found) = syntax.spelling_regions(&snap.language, &snap.text) else { return Ok(Vec::new()) };
+            let Some(found) = syntax.spelling_regions(&snap.language, &snap.text) else {
+                return Ok((path, Vec::new()));
+            };
             found
                 .into_iter()
                 .map(|r| Region {
@@ -62,6 +66,7 @@ pub async fn spell_check(
                     end: r.end,
                     kind: match r.kind {
                         SpellingKind::Comment => RegionKind::Comment,
+                        SpellingKind::String if r.raw => RegionKind::RawString,
                         SpellingKind::String => RegionKind::String,
                         SpellingKind::Name => RegionKind::Name,
                     },
@@ -72,14 +77,36 @@ pub async fn spell_check(
         if cancel.is_cancelled() {
             return Err(IdeError::cancelled());
         }
-        speller(&project).check(&snap.text, &regions, &|| cancel.is_cancelled()).ok_or_else(IdeError::cancelled)
+        let typos =
+            speller(&project).check(&snap.text, &regions, &|| cancel.is_cancelled()).ok_or_else(IdeError::cancelled)?;
+        Ok((path, typos))
     })
     .await;
     host.end_request(request);
-    result
+    // Record the typos in the host's diagnostics snapshot so line-end annotations
+    // see them without waiting for a UI report; the editor still draws from its
+    // own call above, unchanged.
+    if let Ok((path, typos)) = &result {
+        let items: Vec<ide_core::Diagnostic> = typos
+            .iter()
+            .map(|t| ide_core::Diagnostic {
+                range: t.range,
+                severity: ide_core::Severity::Info,
+                message: format!("Typo: In word '{}'", t.word),
+                source: Some("Spelling".into()),
+                code: None,
+                unnecessary: false,
+                deprecated: false,
+                server: None,
+            })
+            .collect();
+        host.diagnostics.replace(path, "Spelling", items);
+    }
+    result.map(|(_, typos)| typos)
 }
 
 /// Replacements for a misspelt `word`, best first (Typo › Change to…).
+#[command(trust = always)]
 pub async fn spell_suggest(host: &Host, window: &str, word: String) -> IdeResult<Vec<String>> {
     let project = host.project(window).ok();
     blocking(move || {
@@ -89,10 +116,4 @@ pub async fn spell_suggest(host: &Host, window: &str, word: String) -> IdeResult
     .await
 }
 
-/// Commands of this module the remote server answers.
-pub(crate) fn register(d: &mut Dispatcher) {
-    d.add("spell_check", |c| async move {
-        spell_check(&c.host, &c.window, c.arg("doc")?, c.arg("scope")?, c.arg("request")?).await
-    });
-    d.add("spell_suggest", |c| async move { spell_suggest(&c.host, &c.window, c.arg("word")?).await });
-}
+ide_command::domain!(spell: spell_check, spell_suggest);

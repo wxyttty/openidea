@@ -6,6 +6,7 @@
 import { create } from "zustand";
 import { call, commands, isTauri, type Settings } from "@/platform/ipc";
 import { loadSettings, useProject } from "@/platform/project";
+import { lastSettingsPage, rememberSettingsPage } from "./lastPage";
 import { deepEqual, getAt, putAt, setAt, validateSettings, type ValidSettings } from "./schema";
 
 export type Scope = "global" | "project";
@@ -13,13 +14,48 @@ export type Scope = "global" | "project";
 export interface StagedChange {
   scope: Scope;
   key: string;
+  /** Literal map segments; dots inside plugin IDs and keys are data. */
+  path?: string[];
   value: unknown;
   /** Page that made the change (Reset discards per page). */
   page: string;
 }
 
+interface ExternalChange {
+  page: string;
+  value: unknown;
+  apply(): Promise<unknown>;
+}
+
+export type ProjectStructureSection =
+  | "project"
+  | "modules"
+  | "dependencies"
+  | "libraries"
+  | "facets"
+  | "artifacts"
+  | "sdks";
+
+const PROJECT_STRUCTURE_SECTIONS: readonly ProjectStructureSection[] = [
+  "project",
+  "modules",
+  "dependencies",
+  "libraries",
+  "facets",
+  "artifacts",
+  "sdks",
+];
+
+function parseProjectStructureSection(raw?: string): ProjectStructureSection {
+  if (!raw) return "project";
+  const clean = raw.replace(/^projectStructure\./, "").trim() as ProjectStructureSection;
+  return PROJECT_STRUCTURE_SECTIONS.includes(clean) ? clean : "project";
+}
+
 export interface SettingsDialogState {
   open: boolean;
+  projectStructureOpen: boolean;
+  projectStructureSection: ProjectStructureSection;
   pageId: string;
   /** What the page should select when opened as `page#focus` (an inspection id). */
   focus: string | null;
@@ -31,16 +67,25 @@ export interface SettingsDialogState {
   /** "Settings for New Projects": every page edits the global layer. */
   newProjects: boolean;
   staged: Record<string, StagedChange>;
+  /** SSH credentials stay outside settings JSON until Apply / OK. */
+  stagedSecrets: Record<string, string>;
+  stagedExternal: Record<string, ExternalChange>;
+  /** Values written outside settings JSON since opening the dialog. */
+  externalApplied: Record<string, unknown>;
   /** Scope chosen per page (Global / This project). */
   scopes: Record<string, Scope>;
   saving: boolean;
   error: string | null;
+  pagesLoading: boolean;
 }
 
 export const DEFAULT_PAGE = "appearance";
+export const SSH_SETTINGS_PAGE = "tools.sshConfigurations";
 
 export const useSettingsDialog = create<SettingsDialogState>(() => ({
   open: false,
+  projectStructureOpen: false,
+  projectStructureSection: "project",
   pageId: DEFAULT_PAGE,
   focus: null,
   query: "",
@@ -48,9 +93,13 @@ export const useSettingsDialog = create<SettingsDialogState>(() => ({
   globalBase: validateSettings(undefined),
   newProjects: false,
   staged: {},
+  stagedSecrets: {},
+  stagedExternal: {},
+  externalApplied: {},
   scopes: {},
   saving: false,
   error: null,
+  pagesLoading: false,
 }));
 
 const stageKey = (scope: Scope, key: string) => `${scope}|${key}`;
@@ -61,23 +110,69 @@ export function splitPageTarget(target: string): { pageId: string; focus: string
   return i < 0 ? { pageId: target, focus: null } : { pageId: target.slice(0, i), focus: target.slice(i + 1) || null };
 }
 
-export function openSettings(pageId?: string, opts: { newProjects?: boolean } = {}) {
+export function openSettings(pageId?: string, opts: { newProjects?: boolean; globalBase?: ValidSettings } = {}) {
   const s = useSettingsDialog.getState();
   const base = validateSettings(useProject.getState().settings);
-  const target = pageId ? splitPageTarget(pageId) : { pageId: s.pageId, focus: null };
+  const newProjects = opts.newProjects ?? false;
+  // IDEA reopens Settings on the page it was left on; Settings for New Projects has its own pages.
+  const target = splitPageTarget(pageId ?? (newProjects ? s.pageId : (lastSettingsPage() ?? s.pageId)));
   useSettingsDialog.setState({
     open: true,
+    projectStructureOpen: false,
     pageId: target.pageId,
     focus: target.focus,
     query: "",
     base,
-    globalBase: base,
-    newProjects: opts.newProjects ?? false,
+    globalBase: opts.globalBase ?? base,
+    newProjects,
     staged: {},
+    stagedSecrets: {},
+    stagedExternal: {},
+    externalApplied: {},
+    saving: false,
+    error: null,
+  });
+  if (!newProjects) rememberSettingsPage(target.pageId);
+  if (!opts.globalBase) void loadGlobalBase();
+}
+
+export function openProjectStructure(section?: string) {
+  if (useSettingsDialog.getState().projectStructureOpen) {
+    if (section) selectProjectStructureSection(parseProjectStructureSection(section));
+    return;
+  }
+  const base = validateSettings(useProject.getState().settings);
+  useSettingsDialog.setState({
+    open: false,
+    projectStructureOpen: true,
+    projectStructureSection: parseProjectStructureSection(section),
+    base,
+    globalBase: base,
+    newProjects: false,
+    staged: {},
+    stagedSecrets: {},
+    stagedExternal: {},
+    externalApplied: {},
     saving: false,
     error: null,
   });
   void loadGlobalBase();
+}
+
+export function closeProjectStructure() {
+  useSettingsDialog.setState({
+    projectStructureOpen: false,
+    staged: {},
+    stagedSecrets: {},
+    stagedExternal: {},
+    externalApplied: {},
+    error: null,
+    saving: false,
+  });
+}
+
+export function selectProjectStructureSection(section: ProjectStructureSection) {
+  useSettingsDialog.setState({ projectStructureSection: section });
 }
 
 /** With a project open the effective settings include its values; the Global scope shows the global layer. */
@@ -85,10 +180,16 @@ async function loadGlobalBase() {
   if (!isTauri() || !useProject.getState().project) return;
   try {
     const globalBase = validateSettings(await commands.settingsGetGlobal());
-    useSettingsDialog.setState((s) => (s.open ? { globalBase } : {}));
+    useSettingsDialog.setState((s) => (s.open || s.projectStructureOpen ? { globalBase } : {}));
   } catch (e) {
     console.warn("cannot load global settings", e);
   }
+}
+
+export function rebaseSettings(globalBase?: ValidSettings) {
+  const base = validateSettings(useProject.getState().settings);
+  useSettingsDialog.setState((s) => (s.open || s.projectStructureOpen ? { base, globalBase: globalBase ?? base } : {}));
+  if (!globalBase) void loadGlobalBase();
 }
 
 /** IDEA's File › New Projects Setup › Settings for New Projects. */
@@ -103,12 +204,23 @@ type Bases = Pick<SettingsDialogState, "base" | "globalBase">;
 const baseFor = (s: Bases, scope: Scope) => (scope === "global" ? s.globalBase : s.base);
 
 export function closeSettings() {
-  useSettingsDialog.setState({ open: false, staged: {}, error: null, saving: false });
+  useSettingsDialog.setState({
+    open: false,
+    staged: {},
+    stagedSecrets: {},
+    stagedExternal: {},
+    externalApplied: {},
+    error: null,
+    saving: false,
+    pagesLoading: false,
+  });
 }
 
 /** Shows `pageId` (`page#focus` also selects `focus` on it). */
 export function selectPage(pageId: string) {
-  useSettingsDialog.setState(splitPageTarget(pageId));
+  const target = splitPageTarget(pageId);
+  useSettingsDialog.setState(target);
+  if (!useSettingsDialog.getState().newProjects) rememberSettingsPage(target.pageId);
 }
 
 export function setQuery(query: string) {
@@ -121,17 +233,67 @@ export function setPageScope(pageId: string, scope: Scope) {
 
 const isInside = (key: string, parent: string) => key.startsWith(`${parent}.`);
 
+function mapEntry(value: unknown, path: readonly string[]): unknown {
+  for (const key of path)
+    value =
+      value && typeof value === "object" && Object.hasOwn(value, key)
+        ? (value as Record<string, unknown>)[key]
+        : undefined;
+  return value;
+}
+
+function putEntry(value: unknown, path: readonly string[], next: unknown): unknown {
+  const [head, ...tail] = path;
+  if (head === undefined) return next;
+  const out = { ...(value as Record<string, unknown> | undefined) };
+  const child = tail.length ? putEntry(out[head], tail, next) : next;
+  if (child == null || (tail.length && typeof child === "object" && !Object.keys(child).length)) delete out[head];
+  else Object.defineProperty(out, head, { value: child, enumerable: true, configurable: true, writable: true });
+  return out;
+}
+
+/** Merge literal map entries only at the persistence boundary; their page ownership stays separate. */
+function mergedChanges(s: Bases & Pick<SettingsDialogState, "staged">): StagedChange[] {
+  const all = Object.values(s.staged);
+  const roots = new Map(all.filter((c) => !c.path).map((c) => [stageKey(c.scope, c.key), { ...c }]));
+  for (const c of all) {
+    if (!c.path) continue;
+    const id = stageKey(c.scope, c.key);
+    const root = roots.get(id) ?? {
+      scope: c.scope,
+      key: c.key,
+      page: c.page,
+      value: getAt(baseFor(s, c.scope), c.key),
+    };
+    root.value = putEntry(root.value, c.path, c.value);
+    roots.set(id, root);
+  }
+  return [...roots.values()];
+}
+
+/** Stage one literal map entry independently of every other page. */
+export function stageMapEntry(page: string, scope: Scope, key: string, path: string[], value: unknown) {
+  if (!path.length) return stage(page, scope, key, value);
+  useSettingsDialog.setState((s) => {
+    const staged = { ...s.staged };
+    const id = `${stageKey(scope, key)}|${JSON.stringify(path)}`;
+    const next = value ?? null;
+    if (deepEqual(next ?? undefined, mapEntry(getAt(baseFor(s, scope), key), path))) delete staged[id];
+    else staged[id] = { scope, key, path, value: next, page };
+    return { staged, error: null };
+  });
+}
+
 /**
  * Current value of `key` as the page shows it: staged edit, else the effective
  * value. Edits staged for a parent (a whole map entry) or inside `key` (one
  * field of it) show through too.
  */
 export function stagedValue(s: Bases & Pick<SettingsDialogState, "staged">, scope: Scope, key: string): unknown {
-  const hit = s.staged[stageKey(scope, key)];
+  const changes = mergedChanges(s);
+  const hit = changes.find((c) => c.scope === scope && c.key === key);
   if (hit) return hit.value;
-  const related = Object.values(s.staged).filter(
-    (c) => c.scope === scope && (isInside(key, c.key) || isInside(c.key, key)),
-  );
+  const related = changes.filter((c) => c.scope === scope && (isInside(key, c.key) || isInside(c.key, key)));
   let value = getAt(baseFor(s, scope), key);
   for (const c of related.sort((a, b) => a.key.length - b.key.length)) {
     value = isInside(key, c.key)
@@ -155,7 +317,8 @@ export function stage(page: string, scope: Scope, key: string, value: unknown) {
       staged[stageKey(scope, parent.key)] = { ...parent, value: merged };
       return { staged, error: null };
     }
-    for (const [id, c] of Object.entries(staged)) if (c.scope === scope && isInside(c.key, key)) delete staged[id];
+    for (const [id, c] of Object.entries(staged))
+      if (c.scope === scope && (isInside(c.key, key) || (c.key === key && c.path))) delete staged[id];
     const id = stageKey(scope, key);
     const next = value === undefined ? null : value;
     // Back to the scope's current value: nothing to write.
@@ -165,23 +328,49 @@ export function stage(page: string, scope: Scope, key: string, value: unknown) {
   });
 }
 
+/** An empty field leaves the stored credential unchanged. */
+export function stageSshSecret(id: string, value: string) {
+  useSettingsDialog.setState((s) => {
+    const stagedSecrets = { ...s.stagedSecrets };
+    if (value) stagedSecrets[id] = value;
+    else delete stagedSecrets[id];
+    return { stagedSecrets, error: null };
+  });
+}
+
+export const externalKey = (page: string, key: string) => `${page}|${key}`;
+
+export function stageExternal<T>(page: string, key: string, value: T, base: T, apply: (value: T) => Promise<T>) {
+  useSettingsDialog.setState((s) => {
+    if (s.saving) return {};
+    const stagedExternal = { ...s.stagedExternal };
+    const id = externalKey(page, key);
+    if (deepEqual(value, base)) delete stagedExternal[id];
+    else stagedExternal[id] = { page, value, apply: () => apply(value) };
+    return { stagedExternal, error: null };
+  });
+}
+
 /** Discards staged edits of one page (the dialog's Reset button). */
 export function resetPage(page: string) {
   useSettingsDialog.setState((s) => ({
     staged: Object.fromEntries(Object.entries(s.staged).filter(([, c]) => c.page !== page)),
+    stagedSecrets: page === SSH_SETTINGS_PAGE ? {} : s.stagedSecrets,
+    stagedExternal: Object.fromEntries(Object.entries(s.stagedExternal).filter(([, c]) => c.page !== page)),
     error: null,
   }));
 }
 
 /** Writes to perform, global layer first so a project value still wins afterwards. */
 export function pendingChanges(s: Bases & Pick<SettingsDialogState, "staged">): StagedChange[] {
-  return Object.values(s.staged)
+  return mergedChanges(s)
     .filter((c) => !deepEqual(c.value ?? undefined, getAt(baseFor(s, c.scope), c.key)))
     .sort((a, b) => (a.scope === b.scope ? a.key.localeCompare(b.key) : a.scope === "global" ? -1 : 1));
 }
 
 export interface PersistDeps {
   set(scope: Scope, key: string, json: string): Promise<Settings>;
+  setSecret(id: string, secret: string, save: boolean): Promise<void>;
   /** Re-reads effective settings into `useProject`. */
   reload(): Promise<void>;
   /** Without a backend (plain browser) changes apply to the session only. */
@@ -190,6 +379,7 @@ export interface PersistDeps {
 
 const defaultDeps = (): PersistDeps => ({
   set: (scope, key, json) => call(commands.settingsSet(scope, key, json)),
+  setSecret: (id, secret, save) => commands.sshSetSecret(id, secret, save),
   reload: loadSettings,
   backend: isTauri(),
 });
@@ -231,16 +421,20 @@ export async function persistChanges(
 }
 
 /** Apply: writes pending changes; returns whether everything was saved. */
-export async function applySettings(deps?: PersistDeps): Promise<boolean> {
-  const changes = pendingChanges(useSettingsDialog.getState());
-  if (!changes.length) return true;
+export async function applySettings(deps: PersistDeps = defaultDeps()): Promise<boolean> {
+  const initial = useSettingsDialog.getState();
+  if (initial.saving) return false;
+  const changes = pendingChanges(initial);
+  const secrets = Object.entries(initial.stagedSecrets);
+  const external = Object.entries(initial.stagedExternal);
+  if (!changes.length && !secrets.length && !external.length) return true;
   useSettingsDialog.setState({ saving: true, error: null });
-  const { written, error } = await persistChanges(changes, deps);
+  const result = await persistChanges(changes, deps);
+  const { written } = result;
+  let { error } = result;
   const done = new Set(written);
   const base = validateSettings(useProject.getState().settings);
   useSettingsDialog.setState((st) => ({
-    saving: false,
-    error,
     base,
     // Written global values right away; the backend's copy follows.
     globalBase: useProject.getState().project
@@ -248,8 +442,48 @@ export async function applySettings(deps?: PersistDeps): Promise<boolean> {
           .filter((c) => c.scope === "global" && done.has(stageKey(c.scope, c.key)))
           .reduce((g, c) => putAt(g, c.key, c.value), st.globalBase)
       : base,
-    staged: Object.fromEntries(Object.entries(st.staged).filter(([k]) => !done.has(k))),
+    staged: Object.fromEntries(
+      Object.entries(st.staged).filter(([id, c]) => !done.has(stageKey(c.scope, c.key)) || initial.staged[id] !== c),
+    ),
   }));
   await loadGlobalBase();
+  if (!error) {
+    for (const [id, secret] of secrets) {
+      const current = useSettingsDialog.getState();
+      const config = current.globalBase.ssh.configs.find((c) => c.id === id);
+      // A removed configuration or discarded credential must never be written.
+      if (current.stagedSecrets[id] !== secret) continue;
+      try {
+        if (config && config.auth !== "openSsh" && deps.backend) {
+          await deps.setSecret(id, secret, config.saveSecret);
+        }
+        useSettingsDialog.setState((s) => {
+          const stagedSecrets = { ...s.stagedSecrets };
+          if (stagedSecrets[id] === secret) delete stagedSecrets[id];
+          return { stagedSecrets };
+        });
+      } catch (e) {
+        error = `SSH secret: ${e instanceof Error ? e.message : String(e)}`;
+        break;
+      }
+    }
+  }
+  if (!error) {
+    for (const [id, change] of external) {
+      if (useSettingsDialog.getState().stagedExternal[id] !== change) continue;
+      try {
+        const value = await change.apply();
+        useSettingsDialog.setState((s) => {
+          const stagedExternal = { ...s.stagedExternal };
+          if (stagedExternal[id] === change) delete stagedExternal[id];
+          return { stagedExternal, externalApplied: { ...s.externalApplied, [id]: value } };
+        });
+      } catch (e) {
+        error = `${id}: ${e instanceof Error ? e.message : String(e)}`;
+        break;
+      }
+    }
+  }
+  useSettingsDialog.setState({ saving: false, error });
   return error === null;
 }

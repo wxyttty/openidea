@@ -8,6 +8,7 @@ import {
   closeCompletion,
   completionStatus,
   nextSnippetField,
+  pickedCompletion,
   prevSnippetField,
   snippet,
   snippetKeymap,
@@ -28,11 +29,10 @@ import {
   type Transaction,
 } from "@codemirror/state";
 import { EditorView, keymap, type Command } from "@codemirror/view";
-import { executeAction } from "@/platform/actions";
+import { executeAction, getAction } from "@/platform/actions";
 import { useProject } from "@/platform/project";
-import { whenSynced, type EditorDocContext } from "@/editor/api";
+import { offsetToPos, posToOffset, whenSynced, type EditorDocContext } from "@/editor/api";
 import { structure, type StructuralRanges } from "@/editor/structure";
-import { offsetToPos, posToOffset } from "@/editor/lsp/positions";
 import { calledFunctions, expandTemplate, applicableTemplates, usesSelection, type LiveTemplate } from "./live/model";
 import { surroundEntries, surroundersFor, type Surrounder } from "./live/surrounders";
 import { liveTemplates, useLiveTemplateOptions } from "./live/store";
@@ -48,6 +48,16 @@ import {
 import { usePostfixSettings } from "./postfix/store";
 import { showChooser, type ChooserItem } from "./popup/store";
 import { expandEmmetAtCaret } from "./emmet/editor";
+import { hasEmmet, loadEmmet } from "./emmet/model";
+import { readClipboardPlainText } from "@/platform/clipboard";
+import {
+  applyMulticaretSnippet,
+  clearMulticaretSnippet,
+  hasMulticaretSnippet,
+  moveMulticaretField,
+  multicaretFieldMoved,
+  multicaretSnippetExtension,
+} from "./multicaretSnippet";
 
 export interface TemplateDocInfo {
   path: string;
@@ -80,7 +90,7 @@ function userName(): string {
 
 async function readClipboard(): Promise<string> {
   try {
-    return (await navigator.clipboard?.readText()) ?? "";
+    return await readClipboardPlainText();
   } catch {
     return "";
   }
@@ -100,38 +110,76 @@ export interface ExpandOptions {
   expression?: string;
 }
 
+interface TemplateSite {
+  from: number;
+  to: number;
+}
+
+function expansionAt(
+  state: EditorState,
+  t: Pick<LiveTemplate, "body" | "variables">,
+  from: number,
+  clipboard: string,
+  opts: ExpandOptions,
+) {
+  const { path, language } = state.facet(templateDoc);
+  return expandTemplate(t, {
+    fns: templateFunctions({
+      state,
+      pos: from,
+      path,
+      language,
+      clipboard,
+      user: userName(),
+      expression: opts.expression,
+    }),
+    selection: opts.selection,
+    selectionIndent: opts.selectionIndent,
+    predefined: opts.predefined,
+  });
+}
+
+async function expandAtSites(
+  view: EditorView,
+  t: Pick<LiveTemplate, "body" | "variables">,
+  sites: readonly TemplateSite[],
+  opts: ExpandOptions = {},
+): Promise<void> {
+  const state = view.state;
+  const clipboard = needsClipboard(t) ? await readClipboard() : "";
+  if (view.state.doc !== state.doc || !view.state.selection.eq(state.selection) || view.state.readOnly) return;
+  let expansions = sites.map(({ from }) => expansionAt(state, t, from, clipboard, opts));
+  if (sites.length === 1) {
+    const { from, to } = sites[0]!;
+    clearMulticaretSnippet(view);
+    snippet(expansions[0]!.snippet)(view, null, from, to);
+  } else {
+    // A variable stays editable everywhere if any caret needs it as a tab stop.
+    const editable = new Set(expansions.flatMap((e) => e.fields));
+    if (expansions.some((e) => e.fields.length !== editable.size)) {
+      const variables = t.variables?.map((v) => (editable.has(v.name) ? { ...v, skipIfDefined: false } : v));
+      expansions = sites.map(({ from }) => expansionAt(state, { ...t, variables }, from, clipboard, opts));
+    }
+    applyMulticaretSnippet(
+      view,
+      sites.map((site, i) => ({ ...site, snippet: expansions[i]!.snippet })),
+    );
+  }
+  const exp = expansions[0]!;
+  if (view.state.field(fieldCompletion, false) !== undefined)
+    view.dispatch({ effects: setFieldCompletion.of(exp.completing) });
+  if (exp.completeFirst) setTimeout(() => startCompletion(view), 0);
+}
+
 /** Replaces `from..to` with the expanded template and activates its tab stops. */
 export async function expandInto(
   view: EditorView,
   t: Pick<LiveTemplate, "body" | "variables">,
   from: number,
   to: number,
-  opts: ExpandOptions = {},
+  opts?: ExpandOptions,
 ): Promise<void> {
-  const doc = view.state.facet(templateDoc);
-  const clipboard = needsClipboard(t) ? await readClipboard() : "";
-  const state = view.state;
-  const fns = templateFunctions({
-    state,
-    pos: from,
-    path: doc.path,
-    language: doc.language,
-    clipboard,
-    user: userName(),
-    expression: opts.expression,
-  });
-  const exp = expandTemplate(t, {
-    fns,
-    selection: opts.selection,
-    selectionIndent: opts.selectionIndent,
-    predefined: opts.predefined,
-  });
-  // The document may have changed while reading the clipboard.
-  if (view.state.doc !== state.doc) return;
-  snippet(exp.snippet)(view, null, from, to);
-  if (view.state.field(fieldCompletion, false) !== undefined)
-    view.dispatch({ effects: setFieldCompletion.of(exp.completing) });
-  if (exp.completeFirst) setTimeout(() => startCompletion(view), 0);
+  return expandAtSites(view, t, [{ from, to }], opts);
 }
 
 /** Per field of the last expanded template: whether it asks for completion (`complete()`, `dbObjectName()`…). */
@@ -157,7 +205,7 @@ function movedToField(tr: Transaction): number | null {
 const completeOnFieldMove = EditorView.updateListener.of((u) => {
   if (u.docChanged) return;
   const flags = u.state.field(fieldCompletion);
-  const field = u.transactions.map(movedToField).findLast((i) => i !== null);
+  const field = u.transactions.map((tr) => multicaretFieldMoved(tr) ?? movedToField(tr)).findLast((i) => i !== null);
   if (field == null || !flags[field]) return;
   setTimeout(() => {
     if (u.view.state.selection === u.state.selection) startCompletion(u.view);
@@ -181,7 +229,7 @@ export const escapeTemplate: Command = (view) => {
     return true;
   }
   if (completionStatus(view.state) === "active") return closeCompletion(view);
-  return clearSnippet(view);
+  return clearMulticaretSnippet(view) || clearSnippet(view);
 };
 
 const unlessLookup =
@@ -189,10 +237,24 @@ const unlessLookup =
   (view) =>
     completionStatus(view.state) === "active" ? false : cmd(view);
 
-/** Tab and Enter both move to the next field (Enter is the lookup's while it is open). */
+const nextMulticaretField = moveMulticaretField(1);
+
+/**
+ * Whether the active snippet came from a live template or Emmet, where Enter moves to the
+ * next field. A completion's snippet (an LSP `<tag>$1</tag>$0`) keeps Enter for new lines.
+ */
+const templateSnippet = StateField.define<boolean>({
+  create: () => false,
+  update: (value, tr) => (movedToField(tr) === 0 && tr.docChanged ? !tr.annotation(pickedCompletion) : value),
+});
+
+/** Tab moves to the next field; Enter too in templates (the lookup's while it is open). */
 const templateFieldKeys = snippetKeymap.of([
   { key: "Tab", run: unlessLookup(nextSnippetField), shift: prevSnippetField },
-  { key: "Enter", run: unlessLookup(nextSnippetField) },
+  {
+    key: "Enter",
+    run: unlessLookup((view) => view.state.field(templateSnippet, false) === true && nextSnippetField(view)),
+  },
   { key: "Escape", run: escapeTemplate },
 ]);
 
@@ -227,16 +289,27 @@ export function templatesAt(state: EditorState, pos: number): LiveTemplate[] {
   return applicableTemplates(liveTemplates(), language, { inCommentOrString: inCommentOrString(state, pos), contexts });
 }
 
-/** Templates whose abbreviation equals the word before the caret. */
-function exactMatches(state: EditorState): { word: { from: number; text: string }; list: LiveTemplate[] } | null {
-  const sel = state.selection.main;
-  if (!sel.empty) return null;
-  const word = wordBefore(state, sel.head);
-  if (!word) return null;
-  // `x.if` is a postfix key, not an abbreviation.
-  if (state.sliceDoc(word.from - 1, word.from) === ".") return null;
-  const list = templatesAt(state, sel.head).filter((t) => t.abbrev === word.text && !usesSelection(t.body));
-  return list.length ? { word, list } : null;
+/** Find corresponding replacement ranges for the primary caret's prefix. */
+function templateSites(state: EditorState, from: number, to: number): TemplateSite[] | null {
+  if (state.selection.ranges.length === 1) return [{ from, to }];
+  if (state.selection.main.head !== to) return null;
+  const prefix = state.sliceDoc(from, to);
+  const sites: TemplateSite[] = [];
+  for (const range of state.selection.ranges) {
+    if (!range.empty) return null;
+    const word = wordBefore(state, range.head);
+    if ((word?.text ?? "") !== prefix) return null;
+    const start = word?.from ?? range.head;
+    if (state.sliceDoc(start - 1, start) === ".") return null;
+    sites.push({ from: start, to: range.head });
+  }
+  return sites;
+}
+
+function templatesForSites(state: EditorState, sites: readonly TemplateSite[]): LiveTemplate[] {
+  const [first, ...rest] = sites;
+  const otherIds = rest.map(({ to }) => new Set(templatesAt(state, to).map(({ id }) => id)));
+  return templatesAt(state, first!.to).filter((t) => !usesSelection(t.body) && otherIds.every((ids) => ids.has(t.id)));
 }
 
 export function caretAnchor(view: EditorView): { x: number; y: number } {
@@ -275,19 +348,20 @@ function chooseTemplate(
 }
 
 export function expandLiveTemplateAtCaret(view: EditorView): boolean {
-  const found = exactMatches(view.state);
-  if (!found) return false;
-  const { word, list } = found;
-  const head = view.state.selection.main.head;
-  if (list.length === 1) void expandInto(view, list[0]!, word.from, head);
-  else
-    chooseTemplate(
-      view,
-      "Choose Template",
-      list,
-      "",
-      (t) => void expandInto(view, t, word.from, view.state.selection.main.head),
-    );
+  const { state } = view;
+  const { main } = state.selection;
+  if (!main.empty) return false;
+  const word = wordBefore(state, main.head);
+  if (!word || state.sliceDoc(word.from - 1, word.from) === ".") return false;
+  const sites = templateSites(state, word.from, main.head);
+  if (!sites) return false;
+  const list = templatesForSites(state, sites).filter((t) => t.abbrev === word.text);
+  if (!list.length) return false;
+  const apply = (t: LiveTemplate) => {
+    if (view.state.doc === state.doc && view.state.selection.eq(state.selection)) void expandAtSites(view, t, sites);
+  };
+  if (list.length === 1) apply(list[0]!);
+  else chooseTemplate(view, "Choose Template", list, "", apply);
   return true;
 }
 
@@ -313,7 +387,9 @@ function liveTemplateOptions(
   pos: number,
   word: { from: number; text: string } | null,
 ): CompletionResult | null {
-  const list = templatesAt(state, pos).filter((t) => !usesSelection(t.body));
+  const sites = templateSites(state, word?.from ?? pos, pos);
+  if (!sites) return null;
+  const list = templatesForSites(state, sites);
   if (!list.length) return null;
   return {
     from: word?.from ?? pos,
@@ -323,7 +399,11 @@ function liveTemplateOptions(
       typeText: t.description,
       type: "snippet",
       boost: word && t.abbrev === word.text ? 5 : -5,
-      apply: (view: EditorView, _c: Completion, from: number, to: number) => void expandInto(view, t, from, to),
+      apply: (view: EditorView, _c: Completion, from: number, to: number) => {
+        const current = templateSites(view.state, from, to);
+        if (current && templatesForSites(view.state, current).some(({ id }) => id === t.id))
+          void expandAtSites(view, t, current);
+      },
     })),
     validFor: /^[\w$!#@-]*$/,
   };
@@ -474,11 +554,18 @@ export function surroundWith(
 // Postfix
 
 export function applyPostfix(view: EditorView, t: PostfixTemplate, target: PostfixTarget) {
+  if (view.state.selection.ranges.length > 1) return;
   const candidates = candidatesFor(t, target);
   const run = (c: PostfixTarget["candidates"][number]) => {
     const expr = t.wrapCompound && isCompound(c.text) ? `(${c.text})` : c.text;
     // The key may have grown since the target was computed (completion).
     const end = Math.max(target.end, view.state.selection.main.head);
+    if (t.action && getAction(t.action)) {
+      void runPostfixAction(view, t.action, c.from, target.dot, end, !!t.statement).then(async (ran) => {
+        if (!ran) await expandInto(view, t, c.from, target.dot, { predefined: { EXPR: expr }, expression: c.text });
+      });
+      return;
+    }
     void expandInto(view, t, c.from, end, { predefined: { EXPR: expr }, expression: c.text });
   };
   if (candidates.length <= 1) {
@@ -497,9 +584,31 @@ export function applyPostfix(view: EditorView, t: PostfixTemplate, target: Postf
   });
 }
 
+/**
+ * Removes the `.key`, selects the expression and runs `action` on it. A statement is
+ * ended with `;` first, so the language server sees complete code. False when the
+ * action is unavailable here (the expression stays selected for the template).
+ */
+async function runPostfixAction(
+  view: EditorView,
+  action: string,
+  from: number,
+  dot: number,
+  end: number,
+  statement: boolean,
+): Promise<boolean> {
+  const after = view.state.doc.sliceString(end, Math.min(view.state.doc.length, end + 80));
+  const insert = statement && !/^[ \t]*;/.test(after) ? ";" : "";
+  view.dispatch({ changes: { from: dot, to: end, insert }, selection: EditorSelection.range(from, dot) });
+  if (await executeAction(action)) return true;
+  if (insert)
+    view.dispatch({ changes: { from: dot, to: dot + insert.length }, selection: EditorSelection.range(from, dot) });
+  return false;
+}
+
 function postfixAt(state: EditorState, pos: number): { target: PostfixTarget; templates: PostfixTemplate[] } | null {
   const settings = usePostfixSettings.getState();
-  if (!settings.enabled) return null;
+  if (!settings.enabled || state.selection.ranges.length > 1) return null;
   const { language } = state.facet(templateDoc);
   const templates = postfixTemplatesFor(language, new Set(settings.disabled));
   if (!templates.length || inCommentOrString(state, pos)) return null;
@@ -557,10 +666,13 @@ export const templateCompletionSource: CompletionSource = (ctx: CompletionContex
 // Extension
 
 export function templateEditorExtension(ctx: EditorDocContext): Extension {
+  if (hasEmmet(ctx.language)) void loadEmmet().catch(() => {});
   return [
     templateDoc.of({ path: ctx.path, language: ctx.language }),
     fieldCompletion,
+    templateSnippet,
     completeOnFieldMove,
+    multicaretSnippetExtension,
     templateFieldKeys,
     templateLookup,
     endTemplateLookup,
@@ -573,10 +685,14 @@ export function templateEditorExtension(ctx: EditorDocContext): Extension {
     ]),
     Prec.high(
       keymap.of([
+        { key: "Enter", run: unlessLookup(nextMulticaretField) },
+        { key: "Escape", run: (view) => hasMulticaretSnippet(view.state) && escapeTemplate(view) },
         {
           key: "Tab",
+          shift: moveMulticaretField(-1),
           run: (view) => {
             if (view.state.readOnly || completionStatus(view.state) === "active") return false;
+            if (nextMulticaretField(view)) return true;
             if (expandPostfixAtCaret(view)) return true;
             if (useLiveTemplateOptions.getState().expandWithTab && expandLiveTemplateAtCaret(view)) return true;
             return expandEmmetAtCaret(view, ctx.language);

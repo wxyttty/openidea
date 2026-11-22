@@ -139,7 +139,7 @@ impl TerminalPanel {
             rows,
             shell_integration: false,
         };
-        match self.host.terminals.spawn(options, sink, on_output) {
+        match self.host.terminals.spawn(options, "gpui".into(), sink, on_output) {
             Ok(info) => {
                 tracing::debug!(terminal = ?info.id, shell = %info.title, "terminal spawned");
                 let title: SharedString = format!("Terminal {}", self.sessions.len() + 1).into();

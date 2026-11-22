@@ -149,7 +149,7 @@ export function ImportDialog({ id, schema, table }: { id: string; schema: string
 
   const choose = async () => {
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { open } = await import("@/platform/dialog");
       const f = await open({
         multiple: false,
         directory: false,
@@ -210,7 +210,14 @@ export function ImportDialog({ id, schema, table }: { id: string; schema: string
           <T>File:</T>
         </span>
         <div className={styles.formRow}>
-          <Input readOnly aria-label="File" value={file ?? ""} placeholder="Choose a CSV or TSV file" />
+          <Input
+            className={styles.fill}
+            readOnly
+            aria-label="File"
+            value={file ?? ""}
+            placeholder="Choose a CSV or TSV file"
+            title={file ?? undefined}
+          />
           <IconButton icon="folder" title="Choose File…" onClick={() => void choose()} />
         </div>
         <span className={styles.formLabel}>

@@ -5,19 +5,25 @@
  * Editor / Editor and Preview / Preview layouts around the text editor.
  */
 import { registerActions, type Action } from "@/platform/actions";
-import { call, commands } from "@/platform/ipc";
-import { getContext } from "@/platform/context";
-import { basename } from "@/platform/project";
+import { call, commands, type FileProbe } from "@/platform/ipc";
+import { activeEditor } from "@/editor/api";
+import { openWithSystemApp } from "@/platform/fileManager";
+import { onFileTypesChange } from "@/platform/fileTypes";
+import { basename, useProject } from "@/platform/project";
 import { fileIconName, lazyComponent } from "@/ui";
 import {
   registerEditorKind,
+  registerExternalFileOpenHandler,
   registerFileEditorProvider,
   registerTextEditorWrapper,
+  textEditorWrapperFor,
+  useTextEditorWrappers,
   type EditorInput,
 } from "@/workbench/contributions";
 import {
   BINARY_KIND,
   IMAGE_KIND,
+  associatedApplication,
   binaryInput,
   imageInput,
   isImagePath,
@@ -27,7 +33,7 @@ import {
 import { ImageViewer, toggleChessboard, useImageViewers } from "./ImageViewer";
 import { HexViewer } from "./HexViewer";
 import { registerMarkdownLiveSource } from "./markdown/live";
-import { setMarkdownMode, type MarkdownMode } from "./markdown/modes";
+import { setMarkdownMode, useMarkdownSourceHidden, type MarkdownMode } from "./markdown/modes";
 import { MarkdownLayoutActions } from "./markdown/MarkdownLayoutActions";
 
 const titleOf = (input: EditorInput) => basename(input.path ?? input.key);
@@ -66,8 +72,10 @@ function markdownActions(): Action[] {
     keywords: ["markdown", "preview", "layout"],
     when: "textEditorActive && editorLangId == markdown",
     run: ({ arg }) => {
-      const path = typeof arg === "string" ? arg : getContext().editorPath;
-      if (typeof path === "string" && isMarkdownPath(path)) setMarkdownMode(path, m);
+      // The tab's layout buttons pass their tab; the keyboard acts on the focused editor's.
+      const editor = activeEditor();
+      const tabId = typeof arg === "string" ? arg : isMarkdownPath(editor?.ctx.path ?? "") ? editor?.tabId : undefined;
+      if (tabId) setMarkdownMode(tabId, m);
     },
   });
   return [
@@ -78,19 +86,39 @@ function markdownActions(): Action[] {
 }
 
 export function activate(): () => void {
+  const probes = new Map<string, Promise<FileProbe>>();
   const disposers = [
+    // Open tabs gain or lose the Markdown preview when File Types change.
+    onFileTypesChange(() => useTextEditorWrappers.setState((w) => ({ wrappers: new Map(w.wrappers) }))),
+    // Files associated with another application (Settings › Editor › File Types)
+    // win over the viewers below; a failed launch falls through to them.
+    registerExternalFileOpenHandler({
+      id: "viewers.associatedApps",
+      order: 1,
+      matches: (path) =>
+        associatedApplication(path, useProject.getState().settings?.files?.associatedApplications ?? []),
+      open: openWithSystemApp,
+    }),
     registerEditorKind({ kind: IMAGE_KIND, component: ImageViewer, title: titleOf, icon: iconOf }),
     registerEditorKind({ kind: BINARY_KIND, component: HexViewer, title: titleOf, icon: iconOf }),
     registerFileEditorProvider({
       id: "viewers.image",
       order: 10,
-      resolve: (path) => (isImagePath(path) ? imageInput(path) : null),
+      resolve: (path) =>
+        isImagePath(path) && !textEditorWrapperFor(useTextEditorWrappers.getState().wrappers, path)
+          ? imageInput(path)
+          : null,
     }),
     registerFileEditorProvider({
       id: "viewers.hex",
       order: 50,
       resolve: async (path) => {
-        const probe = await call(commands.fsProbe(path));
+        let pending = probes.get(path);
+        if (!pending) {
+          pending = call(commands.fsProbe(path)).finally(() => probes.delete(path));
+          probes.set(path, pending);
+        }
+        const probe = await pending;
         return wantsHexView(probe) ? binaryInput(path, probe) : null;
       },
     }),
@@ -99,6 +127,7 @@ export function activate(): () => void {
       matches: isMarkdownPath,
       component: lazyComponent(() => import("./markdown/MarkdownEditor").then((m) => m.MarkdownEditor)),
       tabActions: MarkdownLayoutActions,
+      useSourceHidden: useMarkdownSourceHidden,
     }),
     registerMarkdownLiveSource(),
     registerActions([...imageActions(), ...markdownActions()]),

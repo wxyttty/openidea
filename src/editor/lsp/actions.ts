@@ -1,9 +1,13 @@
 /** Actions of the LSP editor layer (ids from keymaps/intellij-macos.ts). */
+import { generateActionIcon, isGenerateAction } from "./generate";
 import type { EditorView } from "@codemirror/view";
 import { executeAction, registerActions, type Action } from "@/platform/actions";
-import { activeEditor, editorsFor, registerSaveParticipant, type TextEditorHandle } from "@/editor/api";
+import { activeEditor, editorsFor, registerSaveParticipant, whenSynced, type TextEditorHandle } from "@/editor/api";
+import { call, commands } from "@/platform/ipc";
 import { maybeEditorService } from "@/workbench/contributions";
 import { useProject } from "@/platform/project";
+import { validateLanguages } from "@/platform/languageSettings";
+import type { Settings } from "@/bindings";
 import { explicitCompletion } from "./completion";
 import { triggerSignatureHelp } from "./signature";
 import { quickDefinition, quickDocumentation } from "./hover";
@@ -11,16 +15,24 @@ import { expressionTypeInfo } from "./typeInfo";
 import { gotoHighlightedUsage, gotoTargets, highlightUsages } from "./navigation";
 import { gotoDiagnostic, showErrorDescription } from "./diagnostics";
 import { applyKindSilently, applyQuickFix, runKindAction, showIntentions } from "./intentions";
-import { implementPythonAbstractMethods } from "./pythonMembers";
+import { docOf } from "./lsp";
+import { languageSemantics } from "./semantic";
 import { workflowSettings, type ActionsOnSaveValid } from "@/platform/workflowSettings";
 import { startRename } from "./rename";
-import { formatDocument, reformatDialog } from "./format";
+import { formatDocument, reformatDialog, type FormatResult } from "./format";
 import { showHint } from "./hint";
-import { refactorThis, runRefactoring, safeDelete, showNothingHere } from "@/editor/refactor";
+import {
+  refactorThis,
+  runRefactoring,
+  safeDelete,
+  showNothingHere,
+  startHierarchyRefactoring,
+} from "@/editor/refactor";
 import { evaluateWhen } from "@/platform/context";
+import { tx } from "@/platform/i18n";
 
 /** Editor actions apply to the active text editor unless a tool window or popup owns the keyboard. */
-export const EDITOR_WHEN = "textEditorActive && (editorFocus || popupOpen || !toolWindowFocus)";
+export const EDITOR_WHEN = "textEditorActive && (editorFocus || !toolWindowFocus)";
 
 /**
  * Languages whose servers offer Generate (constructors, accessors, overrides…).
@@ -66,38 +78,104 @@ async function mountedEditor(path: string, frames = 60): Promise<TextEditorHandl
   return null;
 }
 
+/** The editor of `path` (opened first), else the active editor. */
+async function editorAt(path: unknown): Promise<TextEditorHandle | null> {
+  let ed = activeEditor();
+  if (typeof path === "string" && ed?.ctx.path !== path) {
+    await maybeEditorService()?.openFile(path, { focus: true });
+    ed = await mountedEditor(path);
+  }
+  return ed ?? null;
+}
+
 /** Runs on the file `{ path }` (opened in the editor first, as from the project view), else on the active editor. */
 function inFile(run: (view: EditorView) => unknown): Action["run"] {
   return async ({ arg }) => {
-    const path = typeof arg === "string" ? arg : (arg as { path?: unknown } | undefined)?.path;
-    let ed = activeEditor();
-    if (typeof path === "string" && ed?.ctx.path !== path) {
-      await maybeEditorService()?.openFile(path, { focus: true });
-      ed = await mountedEditor(path);
-    }
+    const ed = await editorAt(typeof arg === "string" ? arg : (arg as { path?: unknown } | undefined)?.path);
     if (ed) await run(ed.view);
   };
 }
 
 const reformat = (v: EditorView) => formatDocument(v, { explicit: true });
-const optimizeImports = (v: EditorView) =>
-  runKindAction(v, "source.organizeImports", {
+/** WebStorm's Fix ESLint Problems: vscode-eslint's fix-all for the whole file. */
+const fixEslintProblems = (v: EditorView) =>
+  runKindAction(v, "source.fixAll.eslint", {
+    whole: true,
+    none: "No ESLint problems to fix",
+    label: "Fix ESLint Problems",
+  });
+/**
+ * typescript-language-server's organize imports only sorts and merges them; removing the unused
+ * ones is its own action, so Optimize Imports runs that first in these languages.
+ */
+const REMOVE_UNUSED_IMPORTS_FIRST = new Set(["javascript", "javascriptreact", "typescript", "typescriptreact"]);
+
+/** Removes unused imports where the server keeps that apart from organizing them; true when it did. */
+export async function removeUnusedImports(view: EditorView): Promise<boolean> {
+  const language = docOf(view)?.language;
+  if (!language || !REMOVE_UNUSED_IMPORTS_FIRST.has(language)) return false;
+  return applyKindSilently(view, "source.removeUnusedImports");
+}
+
+const optimizeImports = async (v: EditorView) => {
+  if (await removeUnusedImports(v)) {
+    // Then sort what is left; there may be nothing to sort.
+    await applyKindSilently(v, "source.organizeImports");
+    return;
+  }
+  return runKindAction(v, "source.organizeImports", {
     whole: true,
     none: "Optimize imports is not available",
     label: "Optimize Imports",
   });
+};
 
-interface CleanupOptions {
+export interface CleanupOptions {
   fixAll?: boolean;
   optimizeImports?: boolean;
   reformat?: boolean;
+  /** Reformats only the lines changed since the last commit (IDEA's "Only VCS changed text"). */
+  changedTextOnly?: boolean;
 }
 
-/** Code Cleanup of one document: the server's fix-all, organize imports, then reformat. */
-async function cleanup(view: EditorView, o: CleanupOptions) {
+/** The lines changed since the last commit, as document ranges; none outside version control. */
+async function vcsChangedRanges(view: EditorView): Promise<Array<{ from: number; to: number }>> {
+  const path = docOf(view)?.path;
+  if (!path) return [];
+  // The hunks are computed against the backend's copy of the text.
+  await whenSynced(view);
+  let hunks;
+  try {
+    hunks = await call(commands.vcsLineHunks(path));
+  } catch {
+    return [];
+  }
+  const doc = view.state.doc;
+  return hunks
+    .filter((h) => h.lines > 0 && h.start < doc.lines)
+    .map((h) => ({ from: doc.line(h.start + 1).from, to: doc.line(Math.min(h.start + h.lines, doc.lines)).to }));
+}
+
+/** Code Cleanup of one document: the server's fix-all, organize imports, then reformat (whose result it returns). */
+async function cleanup(view: EditorView, o: CleanupOptions): Promise<FormatResult | null> {
   if (o.fixAll !== false) await applyKindSilently(view, "source.fixAll");
-  if (o.optimizeImports !== false) await applyKindSilently(view, "source.organizeImports");
-  if (o.reformat !== false) await formatDocument(view, { explicit: false });
+  if (o.optimizeImports !== false) {
+    await removeUnusedImports(view);
+    await applyKindSilently(view, "source.organizeImports");
+  }
+  if (o.reformat === false) return null;
+  const ranges = o.changedTextOnly ? await vcsChangedRanges(view) : undefined;
+  return formatDocument(view, { explicit: false, selectionOnly: false, ranges });
+}
+
+/**
+ * Code Cleanup of the file at `path`, opened in the editor first: the batch step of
+ * Code Cleanup and of Reformat Code on a directory. The reformat's result, or `null`
+ * when the file has no text editor or reformatting was not asked for.
+ */
+export async function cleanupFile(path: string, o: CleanupOptions): Promise<FormatResult | null> {
+  const ed = await editorAt(path);
+  return ed && ed.ctx.path === path ? cleanup(ed.view, o) : null;
 }
 
 /** Code action titles of Implement Methods (⌃I) and Override Methods (⌃O). */
@@ -115,14 +193,23 @@ function editorAction(
   return { id, title, category, when: EDITOR_WHEN, run: withEditor(run), ...extra };
 }
 
+/** Whether saving a `language` file formats it: Format on save, or Run on save of an external formatter. */
+export function formatsOnSave(settings: Settings | null, language: string): boolean {
+  const { prettier, oxfmt, ruff } = validateLanguages(settings?.languages);
+  return (
+    !!settings?.editor?.formatOnSave ||
+    [prettier, oxfmt, ruff].some((formatter) => formatter.runOnSave && formatter.languages.includes(language))
+  );
+}
+
 /** Format on save (settings.editor.formatOnSave), run by editor/core before writing. */
 export function registerFormatOnSave(): () => void {
   return registerSaveParticipant({
     id: "lsp.formatOnSave",
     order: 50,
     beforeSave: async (ctx, handle) => {
-      if (!handle || ctx.readOnly || !useProject.getState().settings?.editor?.formatOnSave) return;
-      await formatDocument(handle.view, { explicit: false, selectionOnly: false });
+      if (!handle || ctx.readOnly || !formatsOnSave(useProject.getState().settings, ctx.language)) return;
+      await formatDocument(handle.view, { explicit: false, selectionOnly: false, onSave: true });
     },
   });
 }
@@ -174,9 +261,33 @@ export function registerLspActions(): () => void {
     editorAction("code.reformat", "Reformat Code", "Code", reformat, {
       keywords: ["format", "prettier"],
     }),
+    editorAction(
+      "code.reformatWithPrettier",
+      "Reformat with Prettier",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "prettier" }),
+      { keywords: ["format", "prettier"] },
+    ),
+    editorAction(
+      "code.reformatWithOxfmt",
+      "Reformat with oxfmt",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "oxfmt" }),
+      { keywords: ["format", "oxfmt", "oxc"] },
+    ),
+    editorAction(
+      "code.reformatWithRuff",
+      "Reformat with Ruff",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "ruff" }),
+      { keywords: ["format", "ruff", "python"] },
+    ),
     editorAction("code.reformatDialog", "Reformat File…", "Code", (v) =>
       reformatDialog(v, (view) => applyKindSilently(view, "source.organizeImports")),
     ),
+    editorAction("code.fixEslintProblems", "Fix ESLint Problems", "Code", fixEslintProblems, {
+      keywords: ["eslint", "lint", "fix all"],
+    }),
     editorAction("code.optimizeImports", "Optimize Imports", "Code", optimizeImports, {
       keywords: ["organize imports"],
     }),
@@ -270,6 +381,9 @@ export function registerLspActions(): () => void {
     editorAction("refactor.extractParameter", "Introduce Parameter…", "Refactor", (v) =>
       runRefactoring(v, "extractParameter"),
     ),
+    editorAction("refactor.extractInterface", "Extract Interface…", "Refactor", (v) =>
+      runRefactoring(v, "extractInterface"),
+    ),
     editorAction("refactor.move", "Move…", "Refactor", (v) => runRefactoring(v, "move")),
     editorAction("refactor.changeSignature", "Change Signature…", "Refactor", (v) =>
       runRefactoring(v, "changeSignature"),
@@ -281,14 +395,21 @@ export function registerLspActions(): () => void {
       "Code",
       (v) =>
         runKindAction(v, "", {
-          title:
-            /^(generate|implement|override|add (missing|derive|impl|getter|setter|constructor)|create (constructor|getter|setter))/i,
+          predicate: isGenerateAction,
           none: "Nothing to generate here",
-          label: "Generate",
+          label: tx("Generate"),
+          compact: true,
+          actionIcon: generateActionIcon,
         }),
       { keyWhen: GENERATE_KEY_WHEN },
     ),
     editorAction("refactor.inline", "Inline…", "Refactor", (v) => runRefactoring(v, "inline")),
+    editorAction("refactor.pullMembersUp", "Pull Members Up…", "Refactor", (v) =>
+      startHierarchyRefactoring(v, "pullUp"),
+    ),
+    editorAction("refactor.pushMembersDown", "Push Members Down…", "Refactor", (v) =>
+      startHierarchyRefactoring(v, "pushDown"),
+    ),
     // Implement / Override Methods: the server's code actions for them (jdtls "Override/Implement
     // Methods…", rust-analyzer "Implement missing members", TS "Implement interface"…).
     editorAction("code.implementMethods", "Implement Methods…", "Code", (v) =>
@@ -296,7 +417,7 @@ export function registerLspActions(): () => void {
         title: IMPLEMENT_TITLE,
         none: "Nothing to implement",
         label: "Implement Members",
-        fallback: () => implementPythonAbstractMethods(v),
+        fallback: () => languageSemantics(docOf(v)?.language)?.implementMethods?.(v) ?? Promise.resolve(false),
       }),
     ),
     editorAction("code.overrideMethods", "Override Methods…", "Code", (v) =>
@@ -312,8 +433,8 @@ export function registerLspActions(): () => void {
       description: "Shows `{ text, tone? }` as a transient hint at the caret of the active editor.",
       run: ({ arg }) => {
         const view = activeEditor()?.view;
-        const a = (arg ?? {}) as { text?: string; tone?: "info" | "warning" | "error" };
-        if (view && a.text) showHint(view, a.text, { tone: a.tone });
+        const a = (arg ?? {}) as { text?: string; tone?: "info" | "warning" | "error"; data?: Record<string, string> };
+        if (view && a.text) showHint(view, a.text, { tone: a.tone, data: a.data });
       },
     },
   ]);

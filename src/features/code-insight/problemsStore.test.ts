@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Diagnostic } from "@/bindings";
+import { useProject } from "@/platform/project";
 import {
   applyDiagnosticsEvent,
   clearProblems,
   countSeverities,
+  currentProblemsPath,
   fileDiagnostics,
+  filePaths,
+  installProblemsEvents,
   mergeDiagnostics,
+  problemsReport,
   profiledProblems,
   projectCounts,
   useProblems,
@@ -102,6 +107,99 @@ describe("local inspections (issue #42)", () => {
       expect(useProblems.getState().map.size).toBe(0);
     } finally {
       off();
+    }
+  });
+});
+
+describe("currentProblemsPath", () => {
+  it("follows a non-text tab such as a notebook, else the text editor", () => {
+    expect(currentProblemsPath(null, { kind: "notebook", path: "/p/a.ipynb" })).toBe("/p/a.ipynb");
+    expect(currentProblemsPath("/p/old.py", { kind: "notebook", path: "/p/a.ipynb" })).toBe("/p/a.ipynb");
+    expect(currentProblemsPath("/p/a.py", { kind: "file", path: "/p/a.py" })).toBe("/p/a.py");
+    expect(currentProblemsPath("/p/a.py", null)).toBe("/p/a.py");
+    expect(currentProblemsPath(null, { kind: "welcome" })).toBeNull();
+  });
+});
+
+describe("filePaths", () => {
+  it("includes a notebook's cell documents", () => {
+    const map = new Map([
+      ["/p/a.ipynb", new Map([["x", [d(0)]]])],
+      ["vscode-notebook-cell:/p/a.ipynb#c1", new Map([["x", [d(1)]]])],
+      ["vscode-notebook-cell:/p/my%20nb.ipynb#c2", new Map([["x", [d(2)]]])],
+      ["vscode-notebook-cell:/C:/w/b.ipynb#c3", new Map([["x", [d(3)]]])],
+      ["/p/a.py", new Map([["x", [d(4)]]])],
+    ]);
+    expect(filePaths(map, "/p/a.ipynb")).toEqual(["/p/a.ipynb", "vscode-notebook-cell:/p/a.ipynb#c1"]);
+    expect(filePaths(map, "/p/my nb.ipynb")).toEqual(["vscode-notebook-cell:/p/my%20nb.ipynb#c2"]);
+    expect(filePaths(map, "C:/w/b.ipynb")).toEqual(["vscode-notebook-cell:/C:/w/b.ipynb#c3"]);
+    expect(filePaths(map, "/p/a.py")).toEqual(["/p/a.py"]);
+    expect(filePaths(map, "/p/none.py")).toEqual([]);
+  });
+});
+
+describe("problemsReport", () => {
+  it("lists errors before warnings with their places, leaving out hints, up to a limit", () => {
+    let map = mergeDiagnostics(new Map(), "/p/src/a.ts", "tsc", [d(3, "warning", "ts"), d(0, "hint")]);
+    map = mergeDiagnostics(map, "/p/src/b.ts", "tsc", [d(9, "error"), d(1, "error")]);
+    expect(problemsReport(map, "/p")).toBe(
+      [
+        "src/b.ts:2:1: error: line 1 (tsc)",
+        "src/b.ts:10:1: error: line 9 (tsc)",
+        "src/a.ts:4:1: warning: line 3 (ts)",
+      ].join("\n"),
+    );
+    expect(problemsReport(map, "/p", 1)).toBe("src/b.ts:2:1: error: line 1 (tsc)\n… 2 more");
+    expect(problemsReport(mergeDiagnostics(new Map(), "/p/a", "x", [d(0, "info")]), "/p")).toBeNull();
+  });
+});
+
+describe("incremental bookkeeping", () => {
+  let seed = 7;
+  const random = (n: number) => (seed = (seed * 48271) % 2147483647) % n;
+  const SEVERITIES = ["error", "warning", "info", "hint"] as const;
+  const items = (): Diagnostic[] =>
+    Array.from({ length: random(5) }, () => ({
+      ...d(random(3), SEVERITIES[random(4)]),
+      range: { start: { line: random(3), col: random(2) }, end: { line: 3, col: 0 } },
+      code: String(random(1000)),
+    }));
+  // The merge as it was before it was cached.
+  const fullMerge = (map: ReturnType<typeof useProblems.getState>["map"], path: string) =>
+    [...(map.get(path)?.values() ?? [])]
+      .flat()
+      .sort(
+        (a, b) =>
+          a.range.start.line - b.range.start.line ||
+          a.range.start.col - b.range.start.col ||
+          SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity),
+      );
+
+  it("keeps the project counts and each file's merged list equal to a full rescan", () => {
+    clearProblems();
+    useProject.setState({ settings: {} as never });
+    const off = installProblemsEvents();
+    try {
+      for (let step = 0; step < 400; step++) {
+        if (step === 150)
+          useProject.setState({
+            settings: { inspections: { default: { "lsp:eslint": { enabled: false } } } } as never,
+          });
+        if (step === 250)
+          useProject.setState({
+            settings: { inspections: { default: { "lsp:ra": { severity: "weakWarning" } } } } as never,
+          });
+        if (step === 300) clearProblems();
+        const path = `/p/${random(12)}.rs`;
+        applyDiagnosticsEvent(path, ["ra", "eslint"][random(2)]!, items());
+        const { map, counts } = useProblems.getState();
+        expect(counts).toEqual(projectCounts(map));
+        for (const p of map.keys()) expect(fileDiagnostics(map, p)).toEqual(fullMerge(map, p));
+      }
+    } finally {
+      off();
+      useProject.setState({ settings: {} as never });
+      clearProblems();
     }
   });
 });

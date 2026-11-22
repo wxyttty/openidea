@@ -30,6 +30,7 @@ import {
   setFindOpen,
   setFindScope,
   setQuery,
+  setReplacePreview,
   type FindOptions,
   type FindScope,
 } from "../cm/find";
@@ -39,9 +40,19 @@ import { setContext } from "@/platform/context";
 import { showFindResults, type FindResultsSource } from "@/workbench/contributions";
 import { relativePath, useProject } from "@/platform/project";
 import { tx } from "@/platform/i18n";
-import { bindingsFor, hasPrimaryModifier, normalizeBinding, registerKeyClaim, shortcutLabel } from "@/platform/keymap";
+import {
+  bindingsFor,
+  formatBinding,
+  hasPrimaryModifier,
+  normalizeBinding,
+  registerKeyClaim,
+  shortcutLabel,
+} from "@/platform/keymap";
 
-/** The query is shared by all panes and survives closing the bar, like IDEA. */
+/**
+ * The last search (IDEA's find-in-file model): a newly opened bar starts from it and ⌘G
+ * uses it without a bar. Each open bar then keeps its own copy (`useFindSessions`).
+ */
 export const useFindOptions = create<Required<FindOptions>>(() => ({
   search: "",
   caseSensitive: false,
@@ -51,6 +62,21 @@ export const useFindOptions = create<Required<FindOptions>>(() => ({
   context: "any",
   preserveCase: false,
 }));
+/** The query and options of each open bar, by target id: bars on other files don't share them. */
+export const useFindSessions = create<Record<string, Required<FindOptions> | undefined>>(() => ({}));
+
+function optionsOf(id: string): Required<FindOptions> {
+  return useFindSessions.getState()[id] ?? useFindOptions.getState();
+}
+
+/** Changes a bar's options; like IDEA, the last search follows them. */
+function updateOptions(id: string, patch: (o: Required<FindOptions>) => Partial<FindOptions>) {
+  const current = optionsOf(id);
+  const next = { ...current, ...patch(current) };
+  useFindSessions.setState({ [id]: next });
+  useFindOptions.setState(next);
+}
+
 interface Counts {
   total: number;
   current: number;
@@ -74,33 +100,30 @@ export interface FindTarget {
   /** Still open: an unmount that isn't a close (React's dev-mode remount) keeps the highlights. */
   isOpen(): boolean;
   results?(options: FindOptions): FindResultsSource | null;
+  /** A diff pane's "Search In Changes" filter, kept by the diff (not the last search). */
+  inChanges?: { get(): boolean; set(on: boolean): void };
 }
 
-function activeView(paneId: string): EditorView | null {
-  const pane = useTabs.getState().panes[paneId];
-  if (!pane?.active) return null;
-  return editorController().slotFor(pane.active)?.view ?? null;
-}
+const activeTab = (paneId: string) => useTabs.getState().panes[paneId]?.active ?? null;
 
-const paneTargets = new Map<string, FindTarget>();
+const tabTargets = new Map<string, FindTarget>();
 
-function paneTarget(paneId: string): FindTarget {
-  let target = paneTargets.get(paneId);
+/** The editor of a tab: each tab has its own bar, like IDEA's per-editor search session. */
+function tabTarget(tabId: string): FindTarget {
+  let target = tabTargets.get(tabId);
   if (!target) {
     target = {
-      id: paneId,
-      view: () => activeView(paneId),
+      id: tabId,
+      view: () => editorController().slotFor(tabId)?.view ?? null,
       watch(fn) {
-        const tab = useTabs.getState().panes[paneId]?.active;
-        const slot = tab ? editorController().slotFor(tab) : null;
+        const slot = editorController().slotFor(tabId);
         if (!slot) return () => {};
         slot.listeners.add(fn);
         return () => void slot.listeners.delete(fn);
       },
-      isOpen: () => !!useFindBars.getState()[paneId],
+      isOpen: () => !!useFindBars.getState()[tabId],
       results(options) {
-        const tab = useTabs.getState().panes[paneId]?.active;
-        const slot = tab ? editorController().slotFor(tab) : null;
+        const slot = editorController().slotFor(tabId);
         if (!slot) return null;
         const state = slot.currentState();
         const scope = state.field(findScope, false) ?? { from: 0, to: state.doc.length };
@@ -136,7 +159,7 @@ function paneTarget(paneId: string): FindTarget {
         };
       },
     };
-    paneTargets.set(paneId, target);
+    tabTargets.set(tabId, target);
   }
   return target;
 }
@@ -151,21 +174,30 @@ export function findPanelTarget(arg?: unknown): FindTarget | undefined {
 
 export function openFindBarResults(arg?: unknown) {
   const target = findPanelTarget(arg);
-  const opts = useFindOptions.getState();
+  if (!target) return;
+  const opts = optionsOf(target.id);
   if (!opts.search || (opts.regexp && !regexValid(opts.search))) return;
-  const source = target?.results?.({ ...opts });
+  const source = target.results?.({ ...opts });
   if (source?.read().matches.length) {
-    rememberQuery(false);
+    rememberQuery(target.id, false);
     showFindResults(source);
   }
 }
 
-export function closeFindBar(paneId: string) {
-  useFindBars.setState({ [paneId]: undefined });
-}
-
 /** Longest selection that becomes the query. */
 const MAX_QUERY = 10_000;
+
+/** Selected text in the pane outside `.cm-editor` and the find bar (e.g. Markdown preview). */
+function paneDomSelection(view: EditorView | null): string {
+  if (!view || typeof window === "undefined") return "";
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return "";
+  const pane = view.dom.closest("[data-pane-id]");
+  const node = sel.getRangeAt(0).commonAncestorContainer;
+  const el = node instanceof Element ? node : node.parentElement;
+  if (!pane || !el || !pane.contains(el) || el.closest(".cm-editor, [role='search']")) return "";
+  return sel.toString();
+}
 
 /**
  * Opens (or refocuses) the bar, as in IDEA: the
@@ -174,48 +206,71 @@ const MAX_QUERY = 10_000;
  * multi-line query isn't kept for a later search without a selection.
  */
 export function openFindBar(paneId: string, replace: boolean) {
-  seedFind(paneTarget(paneId), replace);
-  useFindBars.setState((s) => ({ [paneId]: { replace, seq: (s[paneId]?.seq ?? 0) + 1 } }));
+  const tabId = activeTab(paneId);
+  if (!tabId) return;
+  seedFind(tabTarget(tabId), replace);
+  useFindBars.setState((s) => ({ [tabId]: { replace, seq: (s[tabId]?.seq ?? 0) + 1 } }));
 }
 
-/** The query and scope a bar opening over `target`'s selection starts with (see openFindBar). */
+/**
+ * The query and scope a bar opening over `target`'s selection starts with (see openFindBar).
+ * As in IDEA, a new bar copies the last search; an open one keeps its own query.
+ */
 export function seedFind(target: FindTarget, replace: boolean) {
   const view = target.view();
   const sel = view?.state.selection.main;
+  const open = !!useFindSessions.getState()[target.id];
+  const set = (patch: (o: Required<FindOptions>) => Partial<FindOptions>) => {
+    if (open) updateOptions(target.id, patch);
+    else
+      useFindSessions.setState({ [target.id]: { ...useFindOptions.getState(), ...patch(useFindOptions.getState()) } });
+  };
+  const domText = paneDomSelection(view);
+  if (view && domText) {
+    view.dispatch({ effects: setFindScope.of(null) });
+    if (domText.length < MAX_QUERY) {
+      set((o) => ({ search: o.regexp ? domText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : domText }));
+      setQuery(view, optionsOf(target.id));
+      findNext(view);
+    } else {
+      set(() => ({}));
+    }
+    return;
+  }
   if (view && sel && !sel.empty) {
     const text = view.state.sliceDoc(sel.from, sel.to);
     const multiline = text.includes("\n");
     openSelections.set(target.id, { from: sel.from, to: sel.to });
     if (multiline && replace) {
       view.dispatch({ effects: setFindScope.of({ from: sel.from, to: sel.to }) });
-      useFindOptions.setState({ search: "" });
+      set(() => ({ search: "" }));
     } else {
       view.dispatch({ effects: setFindScope.of(null) });
       if (text.length < MAX_QUERY)
-        useFindOptions.setState((o) => ({ search: o.regexp ? text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : text }));
+        set((o) => ({ search: o.regexp ? text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : text }));
+      else set(() => ({}));
     }
-  } else if (useFindOptions.getState().search.includes("\n")) {
-    useFindOptions.setState({ search: "" });
-  }
+  } else set((o) => (o.search.includes("\n") ? { search: "" } : {}));
 }
 
 /** Show / Hide Replace on the open bar, keeping its query and scope. */
-function setReplaceShown(paneId: string, replace: boolean) {
-  useFindBars.setState((s) => ({ [paneId]: { replace, seq: s[paneId]?.seq ?? 0 } }));
+function setReplaceShown(tabId: string, replace: boolean) {
+  useFindBars.setState((s) => ({ [tabId]: { replace, seq: s[tabId]?.seq ?? 0 } }));
 }
 
-/** ⌘G / ⇧⌘G: next / previous occurrence of the last search, with or without the bar. */
+/** ⌘G / ⇧⌘G: next / previous occurrence of the bar's search, or of the last one without a bar. */
 export function findAgain(paneId: string, forward: boolean) {
-  const target = paneTarget(paneId);
-  const view = target.view();
-  if (!view) return;
+  const tabId = activeTab(paneId);
+  if (!tabId) return;
+  const target = tabTarget(tabId);
+  if (!target.view()) return;
   if (!searchAgain(target, forward)) openFindBar(paneId, false);
 }
 
-/** Next / previous occurrence of the last search in `target`; false without a usable query. */
+/** Next / previous occurrence of `target`'s search; false without a usable query. */
 export function searchAgain(target: FindTarget, forward: boolean): boolean {
   const view = target.view();
-  const opts = useFindOptions.getState();
+  const opts = optionsOf(target.id);
   if (!view || !opts.search || (opts.regexp && !regexValid(opts.search))) return false;
   setQuery(view, opts);
   if (forward) findNext(view);
@@ -244,7 +299,7 @@ function toggleScope(target: FindTarget) {
 function recount(target: FindTarget) {
   const view = target.view();
   if (!view) return;
-  const opts = useFindOptions.getState();
+  const opts = optionsOf(target.id);
   const r = countMatches(view.state);
   const { from, to } = view.state.selection.main;
   useFindCounts.setState({ [target.id]: opts.search ? { ...r, excluded: isExcluded(view.state, from, to) } : null });
@@ -252,26 +307,39 @@ function recount(target: FindTarget) {
   view.dispatch({ effects: setFindMarks.of(opts.search ? r.starts : []) });
 }
 
-function rememberQuery(replace: boolean) {
-  const o = useFindOptions.getState();
+function rememberQuery(id: string, replace: boolean) {
+  const o = optionsOf(id);
   rememberSearch("find", o.search);
   if (replace) rememberSearch("replace", o.replace);
 }
 
 export function FindBar({ paneId }: { paneId: string }) {
-  const bar = useFindBars((s) => s[paneId]);
-  const activeTab = useTabs((s) => s.panes[paneId]?.active ?? null);
-  if (!bar) return null;
+  const tabId = useTabs((s) => s.panes[paneId]?.active ?? null);
+  const bar = useFindBars((s) => (tabId ? s[tabId] : undefined));
+  if (!tabId || !bar) return null;
+  const target = tabTarget(tabId);
   return (
     <FindPanel
-      target={paneTarget(paneId)}
-      version={activeTab}
+      key={tabId}
+      target={target}
+      version={tabId}
       replace={bar.replace}
       seq={bar.seq}
-      onReplaceShown={(replace) => setReplaceShown(paneId, replace)}
+      onReplaceShown={(replace) => setReplaceShown(tabId, replace)}
       onClose={() => {
-        closeFindBar(paneId);
-        activeView(paneId)?.focus();
+        useFindBars.setState({ [tabId]: undefined });
+        const view = target.view();
+        if (view && view.dom.offsetParent !== null) {
+          view.focus();
+        } else {
+          if (view && !view.state.selection.main.empty) {
+            view.dispatch({ selection: { anchor: view.state.selection.main.head } });
+          }
+          view?.dom
+            .closest("[data-pane-id]")
+            ?.querySelector<HTMLElement>('[role="document"]')
+            ?.focus({ preventScroll: true });
+        }
       }}
     />
   );
@@ -292,7 +360,8 @@ export interface FindPanelProps {
 
 export function FindPanel({ target, version, replace, seq, onReplaceShown, onClose }: FindPanelProps) {
   const id = target.id;
-  const opts = useFindOptions();
+  const lastOptions = useFindOptions();
+  const opts = useFindSessions((s) => s[id]) ?? lastOptions;
   const count = useFindCounts((s) => s[id] ?? null);
   const scoped = useFindScoped((s) => !!s[id]);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -306,7 +375,14 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
   const filterRef = useRef<HTMLButtonElement>(null);
   const [historyMenu, setHistoryMenu] = useState<"find" | "replace" | null>(null);
   const [filterMenu, setFilterMenu] = useState(false);
-  const setOpts = (patch: Partial<FindOptions>) => useFindOptions.setState(patch);
+  const setOpts = (patch: Partial<FindOptions>) => updateOptions(id, () => patch);
+  // Search In Changes applies to finding only, as in IDEA: the replace bar searches the whole side.
+  const [inChangesOn, setInChangesOn] = useState(() => !!target.inChanges?.get());
+  const inChanges = !!target.inChanges && !replace && inChangesOn;
+  const toggleInChanges = () => {
+    target.inChanges?.set(!inChangesOn);
+    setInChangesOn(!inChangesOn);
+  };
 
   useLayoutEffect(() => {
     panelTargets.set(id, target);
@@ -353,20 +429,28 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
     inputRef.current?.select();
   }, [seq]);
 
-  // Push the query into the editor; incremental search selects the nearest match.
+  // Push the query into the editor. Like IDEA, only a change of the query (typing, options)
+  // selects the nearest match: showing the bar again over its editor leaves the caret alone.
+  const shown = useRef<{ target: FindTarget; version: unknown; opts: FindOptions; inChanges: boolean } | null>(null);
   useEffect(() => {
     const view = target.view();
     if (!view) return;
+    const prev = shown.current;
+    const changed =
+      prev?.target === target && prev.version === version && (prev.opts !== opts || prev.inChanges !== inChanges);
+    shown.current = { target, version, opts, inChanges };
     const valid = !opts.regexp || regexValid(opts.search);
-    setQuery(view, valid ? opts : { ...opts, search: "" });
-    view.dispatch({ effects: setFindOpen.of(true) });
-    if (valid && opts.search && useFindPreferences.getState().scrollToResults) {
+    setQuery(view, valid ? { ...opts, inChanges } : { ...opts, search: "" });
+    view.dispatch({
+      effects: [setFindOpen.of(true), setReplacePreview.of(replace && opts.regexp ? !!opts.preserveCase : null)],
+    });
+    if (changed && valid && opts.search && useFindPreferences.getState().scrollToResults) {
       const from = view.state.selection.main.from;
       view.dispatch({ selection: { anchor: from } });
       findNext(view);
     }
     recount(target);
-  }, [opts, target, version]);
+  }, [opts, target, version, inChanges, replace]);
 
   // Keep the counter current while the document / selection changes.
   useEffect(() => {
@@ -385,13 +469,16 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
   // Closing clears highlights, marks and the selection scope (not React's dev-mode remount).
   useEffect(
     () => () => {
-      if (!target.isOpen()) target.view()?.dispatch({ effects: [setFindOpen.of(false)] });
+      if (target.isOpen()) return;
+      target.view()?.dispatch({ effects: [setFindOpen.of(false)] });
+      useFindSessions.setState({ [target.id]: undefined });
+      tabTargets.delete(target.id);
     },
     [target],
   );
 
   const close = () => {
-    rememberQuery(replace);
+    rememberQuery(id, replace);
     onClose();
   };
   const run = (cmd: (v: EditorView) => boolean) => {
@@ -400,15 +487,15 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
     recount(target);
   };
   const doReplace = () => {
-    rememberQuery(true);
+    rememberQuery(id, true);
     run((v) => replaceNext(v, opts.preserveCase));
   };
   const doReplaceAll = () => {
-    rememberQuery(true);
+    rememberQuery(id, true);
     run((v) => replaceAll(v, opts.preserveCase));
   };
   const toggle = (key: "caseSensitive" | "wholeWord" | "regexp" | "preserveCase") =>
-    useFindOptions.setState((o) => ({ [key]: !o[key] }));
+    updateOptions(id, (o) => ({ [key]: !o[key] }));
 
   const onKeyDown = (e: KeyboardEvent, field: "find" | "replace") => {
     const input = e.target as HTMLTextAreaElement | HTMLInputElement;
@@ -428,7 +515,7 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
         if (hasPrimaryModifier(e)) doReplaceAll();
         else doReplace();
       } else {
-        if (e.key === "Enter") rememberQuery(false);
+        if (e.key === "Enter") rememberQuery(id, false);
         run(back ? findPrevious : findNext);
       }
     } else if (e.altKey && !e.metaKey && !e.ctrlKey) {
@@ -484,7 +571,15 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
       : [{ label: kind === "find" ? "No recent searches" : "No recent replacements", disabled: true }];
   };
   const filterItems: MenuItem[] = [
-    { label: "Search In Selection", shortcut: "⌥E", checked: scoped || undefined, run: () => toggleScope(target) },
+    {
+      label: "Search In Selection",
+      shortcut: formatBinding("Alt+E"),
+      checked: scoped || undefined,
+      run: () => toggleScope(target),
+    },
+    ...(target.inChanges && !replace
+      ? [{ label: "Search In Changes", checked: inChangesOn || undefined, run: toggleInChanges }]
+      : []),
     { kind: "separator" },
     { kind: "header", label: "Search Scope" },
     ...SEARCH_CONTEXTS.map((c) => ({
@@ -516,164 +611,185 @@ export function FindPanel({ target, version, replace, seq, onReplaceShown, onClo
   const canReplace = !!opts.search && !invalid;
 
   return (
-    <div
-      ref={panelRef}
-      onFocusCapture={() => {
-        focusedTarget = target;
-        setContext("findBarFocus", true);
-        setContext(
-          "findBarHasResults",
-          !!target.results && !!opts.search && (!opts.regexp || regexValid(opts.search)) && !!count?.total,
-        );
-      }}
-      onBlurCapture={(e) => {
-        if (!panelRef.current?.contains(e.relatedTarget as Node | null)) setContext("findBarFocus", false);
-      }}
-      className={clsx(styles.find, onReplaceShown && styles.findExpandable)}
-      role="search"
-      aria-label={replace ? "Replace in file" : "Find in file"}
-    >
-      {onReplaceShown && (
-        <IconButton
-          icon={replace ? "chevron-down" : "chevron-right"}
-          title={replace ? "Hide Replace" : "Show Replace"}
-          size="small"
-          className={styles.findExpand}
-          aria-expanded={replace}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => {
-            if (replaceBoxRef.current?.contains(document.activeElement)) inputRef.current?.focus();
-            onReplaceShown(!replace);
-          }}
+    <div className={styles.findContainer}>
+      <div
+        ref={panelRef}
+        onFocusCapture={() => {
+          focusedTarget = target;
+          setContext("findBarFocus", true);
+          setContext(
+            "findBarHasResults",
+            !!target.results && !!opts.search && (!opts.regexp || regexValid(opts.search)) && !!count?.total,
+          );
+        }}
+        onBlurCapture={(e) => {
+          if (!panelRef.current?.contains(e.relatedTarget as Node | null)) setContext("findBarFocus", false);
+        }}
+        className={styles.find}
+        role="search"
+        aria-label={replace ? "Replace in file" : "Find in file"}
+      >
+        {onReplaceShown && (
+          <IconButton
+            icon={replace ? "chevron-down" : "chevron-right"}
+            title={replace ? "Hide Replace" : "Show Replace"}
+            size="small"
+            className={styles.findExpand}
+            aria-expanded={replace}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (replaceBoxRef.current?.contains(document.activeElement)) inputRef.current?.focus();
+              onReplaceShown(!replace);
+            }}
+          />
+        )}
+        <div ref={findBoxRef} className={styles.findField}>
+          <SearchField
+            ref={inputRef}
+            value={opts.search}
+            onChange={(search) => setOpts({ search })}
+            placeholder="Find"
+            aria-label="Find"
+            invalid={invalid || none}
+            multiline
+            onHistory={() => setHistoryMenu("find")}
+            onKeyDown={(e) => onKeyDown(e, "find")}
+            className={styles.findInput}
+            toggles={[
+              {
+                id: "case",
+                icon: "case",
+                title: "Match Case",
+                shortcut: formatBinding("Alt+C"),
+                pressed: opts.caseSensitive,
+                onToggle: () => toggle("caseSensitive"),
+              },
+              {
+                id: "word",
+                icon: "word",
+                title: "Words",
+                shortcut: formatBinding("Alt+W"),
+                pressed: opts.wholeWord,
+                onToggle: () => toggle("wholeWord"),
+              },
+              {
+                id: "regex",
+                icon: "regex",
+                title: "Regex",
+                shortcut: formatBinding("Alt+X"),
+                pressed: opts.regexp,
+                onToggle: () => toggle("regexp"),
+              },
+            ]}
+          />
+        </div>
+        <div className={styles.findButtons}>
+          <span className={clsx(styles.findCount, (none || invalid) && styles.findCountNone)} aria-live="polite">
+            {counter}
+          </span>
+          <IconButton
+            icon="arrow-up"
+            title="Previous Occurrence"
+            shortcut={formatBinding("Shift+Enter")}
+            size="small"
+            onClick={() => run(findPrevious)}
+          />
+          <IconButton
+            icon="arrow-down"
+            title="Next Occurrence"
+            shortcut={formatBinding("Enter")}
+            size="small"
+            onClick={() => run(findNext)}
+          />
+          <IconButton
+            ref={filterRef}
+            icon="filter"
+            title="Filter Search Results"
+            size="small"
+            pressed={scoped || inChanges || opts.context !== "any"}
+            onClick={() => setFilterMenu(true)}
+          />
+          <IconButton ref={moreRef} icon="more" title="More" size="small" onClick={() => setMoreMenu(true)} />
+          <IconButton icon="close" title="Close" shortcut="⎋" size="small" onClick={close} />
+        </div>
+        {replace && (
+          <>
+            <div ref={replaceBoxRef} className={styles.replaceField}>
+              <SearchField
+                ref={replaceRef}
+                value={opts.replace}
+                onChange={(value) => setOpts({ replace: value })}
+                placeholder="Replace"
+                aria-label="Replace"
+                multiline
+                onHistory={() => setHistoryMenu("replace")}
+                onKeyDown={(e) => onKeyDown(e, "replace")}
+                toggles={[
+                  {
+                    id: "preserveCase",
+                    icon: "preserve-case",
+                    title: "Preserve Case",
+                    pressed: opts.preserveCase,
+                    onToggle: () => toggle("preserveCase"),
+                  },
+                ]}
+              />
+            </div>
+            <div className={styles.replaceButtons}>
+              <Button
+                size="small"
+                title={tx`Replace (${formatBinding("Alt+P")})`}
+                onClick={doReplace}
+                disabled={!canReplace}
+              >
+                <T>Replace</T>
+              </Button>
+              <Button
+                size="small"
+                title={tx`Replace All (${formatBinding("Alt+A")})`}
+                onClick={doReplaceAll}
+                disabled={!canReplace}
+              >
+                <T>Replace All</T>
+              </Button>
+              <Button
+                size="small"
+                title={
+                  count?.excluded ? tx`Include (${formatBinding("Alt+L")})` : tx`Exclude (${formatBinding("Alt+L")})`
+                }
+                onClick={() => run(excludeCurrent)}
+                disabled={!canReplace || (!count?.total && !count?.excluded)}
+              >
+                {count?.excluded ? <T>Include</T> : <T>Exclude</T>}
+              </Button>
+            </div>
+          </>
+        )}
+        <Menu
+          open={historyMenu !== null}
+          anchor={historyMenu === "replace" ? replaceBoxRef : findBoxRef}
+          items={historyMenu ? historyItems(historyMenu) : []}
+          placement="bottom-start"
+          aria-label="Recent searches"
+          onClose={() => setHistoryMenu(null)}
         />
-      )}
-      <div ref={findBoxRef} className={styles.findField}>
-        <SearchField
-          ref={inputRef}
-          value={opts.search}
-          onChange={(search) => setOpts({ search })}
-          placeholder="Find"
-          aria-label="Find"
-          invalid={invalid || none}
-          multiline
-          onHistory={() => setHistoryMenu("find")}
-          onKeyDown={(e) => onKeyDown(e, "find")}
-          toggles={[
-            {
-              id: "case",
-              icon: "case",
-              title: "Match Case",
-              shortcut: "⌥C",
-              pressed: opts.caseSensitive,
-              onToggle: () => toggle("caseSensitive"),
-            },
-            {
-              id: "word",
-              icon: "word",
-              title: "Words",
-              shortcut: "⌥W",
-              pressed: opts.wholeWord,
-              onToggle: () => toggle("wholeWord"),
-            },
-            {
-              id: "regex",
-              icon: "regex",
-              title: "Regex",
-              shortcut: "⌥X",
-              pressed: opts.regexp,
-              onToggle: () => toggle("regexp"),
-            },
-          ]}
+        <Menu
+          open={moreMenu}
+          anchor={moreRef}
+          items={moreItems}
+          placement="bottom-end"
+          aria-label="Find options"
+          onClose={() => setMoreMenu(false)}
+        />
+        <Menu
+          open={filterMenu}
+          anchor={filterRef}
+          items={filterItems}
+          placement="bottom-end"
+          aria-label="Filter search results"
+          onClose={() => setFilterMenu(false)}
         />
       </div>
-      <div className={styles.findButtons}>
-        <span className={clsx(styles.findCount, (none || invalid) && styles.findCountNone)} aria-live="polite">
-          {counter}
-        </span>
-        <IconButton
-          icon="arrow-up"
-          title="Previous Occurrence"
-          shortcut="⇧↵"
-          size="small"
-          onClick={() => run(findPrevious)}
-        />
-        <IconButton icon="arrow-down" title="Next Occurrence" shortcut="↵" size="small" onClick={() => run(findNext)} />
-        <IconButton
-          ref={filterRef}
-          icon="filter"
-          title="Filter Search Results"
-          size="small"
-          pressed={scoped || opts.context !== "any"}
-          onClick={() => setFilterMenu(true)}
-        />
-        <IconButton ref={moreRef} icon="more" title="More" size="small" onClick={() => setMoreMenu(true)} />
-      </div>
-      <IconButton icon="close" title="Close" shortcut="⎋" size="small" className={styles.findClose} onClick={close} />
-      {replace && (
-        <>
-          <div ref={replaceBoxRef} className={styles.findField}>
-            <SearchField
-              ref={replaceRef}
-              value={opts.replace}
-              onChange={(value) => setOpts({ replace: value })}
-              placeholder="Replace"
-              aria-label="Replace"
-              multiline
-              onHistory={() => setHistoryMenu("replace")}
-              onKeyDown={(e) => onKeyDown(e, "replace")}
-              toggles={[
-                {
-                  id: "preserveCase",
-                  icon: "preserve-case",
-                  title: "Preserve Case",
-                  pressed: opts.preserveCase,
-                  onToggle: () => toggle("preserveCase"),
-                },
-              ]}
-            />
-          </div>
-          <div className={styles.replaceButtons}>
-            <Button size="small" title="Replace (⌥P)" onClick={doReplace} disabled={!canReplace}>
-              <T>Replace</T>
-            </Button>
-            <Button size="small" title="Replace All (⌥A)" onClick={doReplaceAll} disabled={!canReplace}>
-              <T>Replace All</T>
-            </Button>
-            <Button
-              size="small"
-              title={count?.excluded ? "Include (⌥L)" : "Exclude (⌥L)"}
-              onClick={() => run(excludeCurrent)}
-              disabled={!canReplace || (!count?.total && !count?.excluded)}
-            >
-              {count?.excluded ? <T>Include</T> : <T>Exclude</T>}
-            </Button>
-          </div>
-        </>
-      )}
-      <Menu
-        open={historyMenu !== null}
-        anchor={historyMenu === "replace" ? replaceBoxRef : findBoxRef}
-        items={historyMenu ? historyItems(historyMenu) : []}
-        placement="bottom-start"
-        aria-label="Recent searches"
-        onClose={() => setHistoryMenu(null)}
-      />
-      <Menu
-        open={moreMenu}
-        anchor={moreRef}
-        items={moreItems}
-        placement="bottom-end"
-        aria-label="Find options"
-        onClose={() => setMoreMenu(false)}
-      />
-      <Menu
-        open={filterMenu}
-        anchor={filterRef}
-        items={filterItems}
-        placement="bottom-end"
-        aria-label="Filter search results"
-        onClose={() => setFilterMenu(false)}
-      />
     </div>
   );
 }

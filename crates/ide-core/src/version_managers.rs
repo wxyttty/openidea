@@ -18,6 +18,8 @@ pub enum Tool {
     Go,
     Maven,
     Gradle,
+    Ruby,
+    Zig,
 }
 
 impl Tool {
@@ -30,6 +32,8 @@ impl Tool {
             Tool::Go => &["go", "golang"],
             Tool::Maven => &["maven"],
             Tool::Gradle => &["gradle"],
+            Tool::Ruby => &["ruby"],
+            Tool::Zig => &["zig"],
         }
     }
 }

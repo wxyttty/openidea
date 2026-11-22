@@ -26,9 +26,13 @@ pub fn init_script(jvm_args: &[String]) -> String {
     let list = jvm_args.iter().map(|a| groovy_string(a)).collect::<Vec<_>>().join(", ");
     format!(
         "// Written by OpenIDEA: VM options of the run configuration.\n\
+         import org.gradle.util.GradleVersion\n\
+         // `configureEach` (lazy) is Gradle 4.9+; older ones configure each task as it is added.\n\
+         def each = {{ tasks, Closure action -> GradleVersion.current() >= GradleVersion.version('4.9') ? \
+         tasks.configureEach(action) : tasks.all(action) }}\n\
          allprojects {{\n    \
-             tasks.withType(JavaExec).configureEach {{ jvmArgs([{list}]) }}\n    \
-             tasks.withType(Test).configureEach {{ jvmArgs([{list}]) }}\n\
+             each(tasks.withType(JavaExec)) {{ t -> t.jvmArgs([{list}]) }}\n    \
+             each(tasks.withType(Test)) {{ t -> t.jvmArgs([{list}]) }}\n\
          }}\n"
     )
 }
@@ -41,17 +45,22 @@ pub fn default_dir() -> PathBuf {
 /// Writes the script for `jvm_args` under `dir` (named by its content, so launches share
 /// it and nothing needs deleting) and returns its path.
 pub fn write_init_script(dir: &Path, jvm_args: &[String]) -> std::io::Result<PathBuf> {
+    write_script(dir, "jvm-args", &init_script(jvm_args))
+}
+
+/// Writes the init script `text` under `dir` as `<prefix>-<hash>.init.gradle` (written
+/// once per content, so launches share it) and returns its path.
+pub fn write_script(dir: &Path, prefix: &str, text: &str) -> std::io::Result<PathBuf> {
     use std::hash::{Hash, Hasher};
-    let text = init_script(jvm_args);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
-    let file = dir.join(format!("jvm-args-{:016x}.init.gradle", h.finish()));
+    let file = dir.join(format!("{prefix}-{:016x}.init.gradle", h.finish()));
     if std::fs::read_to_string(&file).is_ok_and(|t| t == text) {
         return Ok(file);
     }
     std::fs::create_dir_all(dir)?;
     let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &text)?;
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &file).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
@@ -70,8 +79,10 @@ mod tests {
     fn adds_each_argument_to_java_exec_and_test_tasks() {
         let script = init_script(&args(&["-Ddemo.flag=on", "--add-opens", "java.base/java.lang=ALL-UNNAMED"]));
         let list = "['-Ddemo.flag=on', '--add-opens', 'java.base/java.lang=ALL-UNNAMED']";
-        assert!(script.contains(&format!("tasks.withType(JavaExec).configureEach {{ jvmArgs({list}) }}")), "{script}");
-        assert!(script.contains(&format!("tasks.withType(Test).configureEach {{ jvmArgs({list}) }}")), "{script}");
+        assert!(script.contains(&format!("each(tasks.withType(JavaExec)) {{ t -> t.jvmArgs({list}) }}")), "{script}");
+        assert!(script.contains(&format!("each(tasks.withType(Test)) {{ t -> t.jvmArgs({list}) }}")), "{script}");
+        // Gradle before 4.9 has no `configureEach` (#3864).
+        assert!(script.contains("? tasks.configureEach(action) : tasks.all(action)"), "{script}");
     }
 
     #[test]

@@ -5,90 +5,51 @@
  * runtime application of keymap / UI font size / high-contrast settings.
  *
  * On the desktop Settings open in a native child window (`activateSettingsWindow`
- * runs there); in the browser build they open as an in-page dialog.
+ * runs there) unless Appearance › "Open Settings in a separate window" is off;
+ * then, and in the browser build, they open as an in-page dialog.
  *
  * `executeAction("file.settings", "keymap")` opens a specific page;
  * `file.newProjectsSettings` (IDEA's Settings for New Projects) edits the
  * global layer only, which new projects inherit.
  */
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { registerActions, type Action } from "@/platform/actions";
+import { registerActions } from "@/platform/actions";
 import { call, commands, isTauri } from "@/platform/ipc";
-import { isPopupOpen, lazyComponent } from "@/ui";
-import { loadSettings, useProject } from "@/platform/project";
-import { restoreRemote } from "@/platform/remote";
+import { lazyWhen } from "@/ui";
+import { useProject } from "@/platform/project";
 import { provideSettingsSearchIndex, registerOverlay } from "@/workbench/contributions";
 import { windowBackgroundHex } from "@/workbench/theme";
-import { LazySettingsDialog, loadBuiltinPages, unloadBuiltinPages } from "./dialog/LazySettingsDialog";
+import { NEW_PROJECTS_PAGE, settingsActions } from "./actions";
 import {
-  closeSettings,
-  openSettings,
-  selectPage,
-  setNewProjects,
-  setQuery,
-  settingsTitle,
-  useSettingsDialog,
-} from "./model/staging";
-import { zoomActions } from "./appearanceRuntime";
+  LazyProjectStructureDialog,
+  LazySettingsDialog,
+  loadBuiltinPages,
+  unloadBuiltinPages,
+} from "./dialog/LazySettingsDialog";
+import { openProjectStructure, openSettings, useSettingsDialog } from "./model/staging";
+import {
+  appearanceToggleActions,
+  navigationBarActions,
+  presentationAssistantAction,
+  zoomActions,
+} from "./appearanceRuntime";
+import { PresentationAssistant } from "./presentation/PresentationAssistant";
 import { activateFileTypes } from "./fileTypesRuntime";
 import { trackRuntimeSettings } from "./runtime";
-import { installActionProxies, installSettingsHost } from "./window/bridge";
-import { AssignShortcutOverlay, showAssignShortcut } from "./keymap/AssignShortcut";
+import { activateSettingsWindow, relaunchSettings } from "./settingsWindow";
+import { installSettingsHost } from "./window/bridge";
+import { showAssignShortcut, useAssignShortcut } from "./keymap/assignShortcutStore";
 import { settingsSearchEntries } from "./searchIndex";
 import { activatePythonStatus } from "./languages/PythonStatus";
-import { nativeToAsciiAction } from "./nativeToAscii";
-import { isImeKey } from "@/platform/ime";
+import { activatePhpStatus } from "./languages/PhpStatus";
+import { trackIconThemePages } from "./iconThemePages";
 
-export { settingsWindowParent } from "./window/bridge";
-export const SettingsWindow = lazyComponent(() => import("./window/SettingsWindow").then((m) => m.SettingsWindow));
+export { activateSettingsWindow };
 
-/** Same event as `windows::LAUNCH_EVENT`: a pending launch (page) is waiting. */
-const LAUNCH_EVENT = "openidea://launch";
+const separateWindow = () => useProject.getState().settings?.appearance?.settingsInSeparateWindow !== false;
 
-/** Java's page first: JDK, Maven and the language server are what new projects most often need. */
-const NEW_PROJECTS_PAGE = "languages.java";
-
-function settingsActions(open: (page?: string, newProjects?: boolean) => void): Action[] {
-  return [
-    nativeToAsciiAction(),
-    {
-      id: "file.settings",
-      title: "Settings…",
-      category: "File",
-      icon: "settings",
-      keywords: ["preferences", "options", "configure"],
-      run: ({ arg }) => open(typeof arg === "string" ? arg : undefined),
-    },
-    {
-      id: "file.newProjectsSettings",
-      title: "Settings for New Projects…",
-      category: "File",
-      icon: "settings",
-      keywords: ["new projects setup", "default settings", "default project", "default jdk", "global settings"],
-      run: ({ arg }) => open(typeof arg === "string" ? arg : NEW_PROJECTS_PAGE, true),
-    },
-    {
-      id: "settings.keymap",
-      title: "Keymap…",
-      category: "File",
-      icon: "keyboard",
-      keywords: ["shortcuts", "keyboard", "bindings"],
-      run: () => open("keymap"),
-    },
-    {
-      id: "settings.appearance",
-      title: "Appearance…",
-      category: "View",
-      icon: "sun",
-      keywords: ["theme", "accent", "font size"],
-      run: () => open("appearance"),
-    },
-  ];
-}
-
-/** Native Settings window when the backend can make one, else the dialog. */
+/** The native Settings window when it is enabled and the backend can make one, else the dialog. */
 async function showSettings(page?: string, newProjects = false) {
-  if (isTauri()) {
+  if (isTauri() && separateWindow()) {
     try {
       await call(commands.windowOpenSettings(page ?? null, newProjects, windowBackgroundHex()));
       return;
@@ -96,21 +57,46 @@ async function showSettings(page?: string, newProjects = false) {
       console.warn("settings window unavailable, using the dialog", e);
     }
   }
-  await loadBuiltinPages();
-  openSettings(page, { newProjects });
+  const targetPage = page ?? (newProjects ? NEW_PROJECTS_PAGE : useSettingsDialog.getState().pageId);
+  await loadBuiltinPages({ pageId: targetPage });
+  // Like a launch into the open window: go to the page, keep the edits not applied yet.
+  if (useSettingsDialog.getState().open) relaunchSettings({ page, newProjects });
+  else openSettings(page, { newProjects });
 }
+
+const useAssignShortcutOpen = () => useAssignShortcut((s) => s.actionId !== null);
 
 export function activate(): () => void {
   const disposers = [
     trackRuntimeSettings(),
+    trackIconThemePages(),
     activatePythonStatus(),
+    activatePhpStatus(),
     unloadBuiltinPages,
     registerOverlay({ id: "settings.dialog", component: LazySettingsDialog }),
-    registerActions(zoomActions()),
-    registerActions(settingsActions((page, newProjects) => void showSettings(page, newProjects))),
+    registerOverlay({ id: "settings.projectStructure", component: LazyProjectStructureDialog }),
+    registerOverlay({ id: "settings.presentationAssistant", component: PresentationAssistant }),
     activateFileTypes(),
-    registerOverlay({ id: "settings.assignShortcut", component: AssignShortcutOverlay }),
+    registerOverlay({
+      id: "settings.assignShortcut",
+      component: lazyWhen(useAssignShortcutOpen, () =>
+        import("./keymap/AssignShortcut").then((m) => m.AssignShortcutOverlay),
+      ),
+    }),
     registerActions([
+      ...zoomActions(),
+      ...appearanceToggleActions(),
+      presentationAssistantAction(),
+      ...navigationBarActions(),
+      ...settingsActions((page, newProjects) => showSettings(page, newProjects)),
+      {
+        id: "file.projectStructure",
+        title: "Project Structure…",
+        category: "File",
+        icon: "folder",
+        keywords: ["project structure", "sdk", "jdk", "modules", "libraries", "facets", "artifacts", "sources"],
+        run: ({ arg }) => openProjectStructure(typeof arg === "string" ? arg : undefined),
+      },
       {
         // Search Everywhere's ⌥↵ on an action (arg: the action id).
         id: "settings.assignShortcut",
@@ -125,95 +111,5 @@ export function activate(): () => void {
     provideSettingsSearchIndex(settingsSearchEntries),
     isTauri() ? installSettingsHost() : () => {},
   ];
-  return () => disposers.reverse().forEach((d) => d());
-}
-
-function navigate(page: string | undefined) {
-  if (!page) return;
-  setQuery("");
-  selectPage(page);
-}
-
-interface SettingsLaunch {
-  page?: string;
-  newProjects: boolean;
-}
-
-async function takeLaunch(): Promise<SettingsLaunch | null> {
-  const launch = await commands.windowTakeLaunch().catch(() => null);
-  return launch && { page: launch.settingsPage ?? undefined, newProjects: launch.newProjects };
-}
-
-/** A launch for the open window: its page, and the mode when it asks for new projects. */
-function relaunch(launch: SettingsLaunch | null) {
-  if (!launch) return;
-  if (launch.newProjects) setNewProjects(true);
-  navigate(launch.page);
-}
-
-function listenLaunch(): () => void {
-  let disposed = false;
-  let off: (() => void) | undefined;
-  void getCurrentWebviewWindow()
-    .listen(LAUNCH_EVENT, () => void takeLaunch().then(relaunch))
-    .then((u) => {
-      if (disposed) return u();
-      off = u;
-      // A page requested before we listened: its event is gone, the launch is not.
-      void takeLaunch().then(relaunch);
-    });
-  return () => {
-    disposed = true;
-    off?.();
-  };
-}
-
-/** Esc and ⌘W cancel, like closing the window; ⌘, stays here. */
-function installWindowKeys(): () => void {
-  const onKey = (e: KeyboardEvent) => {
-    if (e.defaultPrevented || isImeKey(e)) return;
-    const mod = e.metaKey || e.ctrlKey;
-    if ((e.key === "Escape" && !isPopupOpen()) || (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "w")) {
-      e.preventDefault();
-      closeSettings();
-    } else if (mod && e.key === ",") {
-      e.preventDefault();
-    }
-  };
-  window.addEventListener("keydown", onKey);
-  return () => window.removeEventListener("keydown", onKey);
-}
-
-/**
- * The settings window (`settings-<parent>`): settings pages only, working on
- * the parent's project; Cancel / OK / Esc close the window.
- */
-export function activateSettingsWindow(parent: string): () => void {
-  const disposers = [
-    trackRuntimeSettings(),
-    unloadBuiltinPages,
-    registerActions(settingsActions((page, newProjects) => relaunch({ page, newProjects: !!newProjects }))),
-    installActionProxies(parent),
-    listenLaunch(),
-    installWindowKeys(),
-    useSettingsDialog.subscribe((s, prev) => {
-      if (prev.open && !s.open) void getCurrentWebviewWindow().close();
-      if (s.newProjects !== prev.newProjects) {
-        void getCurrentWebviewWindow()
-          .setTitle(settingsTitle(s.newProjects))
-          .catch(() => {});
-      }
-    }),
-  ];
-  void (async () => {
-    await loadBuiltinPages();
-    await restoreRemote();
-    const project = await commands.projectCurrent().catch(() => null);
-    if (project) useProject.setState({ project, settings: project.settings });
-    else await loadSettings().catch((e) => console.warn("cannot load settings", e));
-    // `listenLaunch` may have taken the launch first and applied it already.
-    const launch = await takeLaunch();
-    openSettings(launch?.page, { newProjects: launch?.newProjects ?? useSettingsDialog.getState().newProjects });
-  })();
   return () => disposers.reverse().forEach((d) => d());
 }

@@ -2,14 +2,21 @@ import { describe, expect, it } from "vitest";
 import type { DbColumnInfo } from "@/platform/ipc";
 import {
   alterTableSql,
+  canDrop,
+  canModifyTable,
+  createDatabaseSql,
+  createSchemaSql,
   createTableSql,
   draftOf,
+  dropDatabaseSql,
+  templateOf,
   dropSql,
   ident,
   reference,
   renameSql,
   scriptSql,
   truncateSql,
+  quoteIdent,
   type ColumnDraft,
 } from "./objects";
 
@@ -29,6 +36,51 @@ const users = [
 ];
 
 describe("database object SQL", () => {
+  it("uses ClickHouse object syntax and escapes identifiers", () => {
+    expect(quoteIdent("clickhouse", 'a\\b"c')).toBe('"a\\\\b\\"c"');
+    expect(ident("clickhouse", "price$usd")).toBe('"price$usd"');
+    expect(renameSql("clickhouse", { kind: "table", schema: "default", name: "users" }, "people")).toBe(
+      'rename table "default".users to "default".people;',
+    );
+    expect(
+      dropSql("clickhouse", { kind: "schema", schema: "", name: "analytics" }, { ifExists: true, cascade: true }),
+    ).toBe("drop database if exists analytics;");
+    expect(
+      dropSql(
+        "clickhouse",
+        { kind: "materializedView", schema: "default", name: "totals" },
+        { ifExists: true, cascade: true },
+      ),
+    ).toBe('drop table if exists "default".totals;');
+    expect(truncateSql("clickhouse", "default", "users", { restartIdentity: true, cascade: true })).toBe(
+      'truncate table "default".users;',
+    );
+    expect(canDrop("clickhouse", { kind: "index", schema: "default", name: "ix" })).toBe(false);
+    expect(canModifyTable("clickhouse")).toBe(false);
+    expect(alterTableSql("clickhouse", "default", "users", "people", users.map(draftOf))).toEqual([]);
+  });
+
+  it("creates ClickHouse MergeTree tables without a relational primary key", () => {
+    const drafts = [col("id", "UInt64", { primaryKey: true, nullable: false }), col("name", "Nullable(String)")].map(
+      draftOf,
+    );
+    expect(createTableSql("clickhouse", "default", "people", drafts)).toBe(
+      'create table "default".people\n(\n    id UInt64,\n    name Nullable(String)\n)\nengine = MergeTree\norder by tuple();\n',
+    );
+  });
+
+  it("writes guarded ClickHouse mutation templates without unique key assumptions", () => {
+    expect(scriptSql("clickhouse", "update", "default", "users", users)).toBe(
+      'alter table "default".users\nupdate email = ?,\n       name = ?\nwhere 1 = 0;\n',
+    );
+    expect(scriptSql("clickhouse", "delete", "default", "users", users)).toBe(
+      'alter table "default".users\ndelete\nwhere 1 = 0;\n',
+    );
+    expect(() => scriptSql("clickhouse", "update", "default", "users", users.slice(0, 1))).toThrow(
+      "ClickHouse sorting key columns cannot be updated.",
+    );
+  });
+
   it("quotes only when needed", () => {
     expect(ident("postgres", "users")).toBe("users");
     expect(ident("postgres", "Users")).toBe('"Users"');
@@ -41,6 +93,13 @@ describe("database object SQL", () => {
     expect(reference("postgres", { kind: "column", schema: "public", name: "users", column: "email" })).toBe(
       "public.users.email",
     );
+  });
+
+  it("drops an Oracle package with neither IF EXISTS nor CASCADE", () => {
+    expect(dropSql("oracle", { kind: "package", schema: "hr", name: "pkg" }, { ifExists: true, cascade: true })).toBe(
+      'drop package "hr"."pkg";',
+    );
+    expect(reference("oracle", { kind: "package", schema: "hr", name: "pkg" })).toBe('"hr"."pkg"');
   });
 
   it("renames per dialect", () => {
@@ -132,5 +191,203 @@ describe("database object SQL", () => {
     expect(alterTableSql("mysql", "app", "users", "users", p)).toEqual([
       "alter table app.users change column name name varchar(40) default '' not null;",
     ]);
+  });
+});
+
+describe("oracle object SQL", () => {
+  const emp = [col("ID", "NUMBER", { primaryKey: true, nullable: false }), col("NAME", "VARCHAR2(40)")];
+  const d = emp.map(draftOf);
+
+  it("keeps unquoted names that the server folds to upper case", () => {
+    expect(ident("oracle", "EMPLOYEES")).toBe("EMPLOYEES");
+    expect(ident("oracle", "employees")).toBe('"employees"');
+    expect(reference("oracle", { kind: "table", schema: "HR", name: "EMPLOYEES" })).toBe("HR.EMPLOYEES");
+  });
+
+  it("generates Oracle DDL and DML", () => {
+    expect(truncateSql("oracle", "HR", "EMPLOYEES", { restartIdentity: true, cascade: true })).toBe(
+      "truncate table HR.EMPLOYEES;",
+    );
+    expect(scriptSql("oracle", "selectFirst", "HR", "EMPLOYEES", emp)).toContain("fetch first 10 rows only;");
+    expect(scriptSql("oracle", "selectFirst", "HR", "EMPLOYEES", emp)).not.toContain("limit");
+    expect(dropSql("oracle", { kind: "index", schema: "HR", name: "E_IDX" }, { ifExists: true, cascade: false })).toBe(
+      "drop index HR.E_IDX;",
+    );
+    expect(dropSql("oracle", { kind: "schema", schema: "", name: "APP" }, { ifExists: false, cascade: false })).toBe(
+      "drop user APP cascade;",
+    );
+    expect(renameSql("oracle", { kind: "view", schema: "HR", name: "V_EMP" }, "V_STAFF")).toBe(
+      "rename HR.V_EMP to V_STAFF;",
+    );
+    expect(createTableSql("oracle", "HR", "T", d)).toContain("primary key (ID)");
+  });
+
+  it("alters columns with MODIFY and parenthesised ADD", () => {
+    const p = emp.map(draftOf);
+    p[1] = { ...p[1]!, dataType: "VARCHAR2(80)", notNull: true, name: "FULL_NAME" };
+    p.push({
+      key: 99,
+      original: null,
+      name: "HIRED",
+      dataType: "DATE",
+      notNull: false,
+      default: "SYSDATE",
+      primaryKey: false,
+      dropped: false,
+    } satisfies ColumnDraft);
+    expect(alterTableSql("oracle", "HR", "EMPLOYEES", "EMPLOYEES", p)).toEqual([
+      "alter table HR.EMPLOYEES modify (NAME VARCHAR2(80) not null);",
+      "alter table HR.EMPLOYEES modify (NAME not null);",
+      "alter table HR.EMPLOYEES rename column NAME to FULL_NAME;",
+      "alter table HR.EMPLOYEES add (HIRED DATE default SYSDATE);",
+    ]);
+  });
+});
+
+describe("snowflake object SQL", () => {
+  const emp = [
+    col("ID", "NUMBER(38,0)", { primaryKey: true, nullable: false }),
+    col("NAME", "VARCHAR(40)", { default: "'x'" }),
+  ];
+  const drop = { ifExists: true, cascade: true };
+
+  it("keeps unquoted names that the server folds to upper case", () => {
+    expect(ident("snowflake", "EMPLOYEES")).toBe("EMPLOYEES");
+    expect(ident("snowflake", "EMP_2$")).toBe("EMP_2$");
+    expect(ident("snowflake", "employees")).toBe('"employees"');
+    expect(ident("snowflake", "My Table")).toBe('"My Table"');
+    expect(ident("snowflake", 'a"b')).toBe('"a""b"');
+    expect(ident("snowflake", "QUALIFY")).toBe('"QUALIFY"');
+    expect(ident("snowflake", "ORDER")).toBe('"ORDER"');
+    expect(quoteIdent("snowflake", "x")).toBe('"x"');
+    expect(reference("snowflake", { kind: "column", schema: "HR", name: "EMPLOYEES", column: "name" })).toBe(
+      'HR.EMPLOYEES."name"',
+    );
+  });
+
+  it("renames within the object's schema", () => {
+    expect(renameSql("snowflake", { kind: "table", schema: "HR", name: "EMP" }, "STAFF")).toBe(
+      "alter table HR.EMP rename to HR.STAFF;",
+    );
+    expect(renameSql("snowflake", { kind: "view", schema: "HR", name: "V_EMP" }, "V_STAFF")).toBe(
+      "alter view HR.V_EMP rename to HR.V_STAFF;",
+    );
+    expect(renameSql("snowflake", { kind: "column", schema: "HR", name: "EMP", column: "A" }, "b")).toBe(
+      'alter table HR.EMP rename column A to "b";',
+    );
+  });
+
+  it("drops and truncates, and has no indexes or triggers", () => {
+    expect(dropSql("snowflake", { kind: "table", schema: "HR", name: "EMP" }, drop)).toBe(
+      "drop table if exists HR.EMP;",
+    );
+    expect(dropSql("snowflake", { kind: "view", schema: "HR", name: "V" }, drop)).toBe("drop view if exists HR.V;");
+    expect(dropSql("snowflake", { kind: "materializedView", schema: "HR", name: "MV" }, drop)).toBe(
+      "drop materialized view if exists HR.MV;",
+    );
+    expect(dropSql("snowflake", { kind: "sequence", schema: "HR", name: "S" }, drop)).toBe(
+      "drop sequence if exists HR.S;",
+    );
+    expect(
+      dropSql("snowflake", { kind: "function", schema: "HR", name: "F", arguments: "NUMBER, VARCHAR" }, drop),
+    ).toBe("drop function if exists HR.F(NUMBER, VARCHAR);");
+    expect(dropSql("snowflake", { kind: "procedure", schema: "HR", name: "P" }, { ...drop, ifExists: false })).toBe(
+      "drop procedure HR.P();",
+    );
+    expect(dropSql("snowflake", { kind: "column", schema: "HR", name: "EMP", column: "NAME" }, drop)).toBe(
+      "alter table HR.EMP drop column NAME;",
+    );
+    expect(dropSql("snowflake", { kind: "schema", schema: "", name: "HR" }, drop)).toBe("drop schema if exists HR;");
+    expect(truncateSql("snowflake", "HR", "EMP", { restartIdentity: true, cascade: true })).toBe(
+      "truncate table HR.EMP;",
+    );
+    expect(canDrop("snowflake", { kind: "index", schema: "HR", name: "I" })).toBe(false);
+    expect(canDrop("snowflake", { kind: "trigger", schema: "HR", name: "T" })).toBe(false);
+    expect(canDrop("snowflake", { kind: "table", schema: "HR", name: "EMP" })).toBe(true);
+    expect(canModifyTable("snowflake")).toBe(true);
+  });
+
+  it("creates tables and script templates", () => {
+    const d = emp.map(draftOf);
+    d.push({ ...d[1]!, key: 9, original: null, name: "note", dataType: "", default: "", notNull: true });
+    expect(createTableSql("snowflake", "HR", "T", d)).toBe(
+      "create table HR.T\n(\n    ID NUMBER(38,0) not null,\n    NAME VARCHAR(40) default 'x',\n" +
+        '    "note" VARCHAR not null,\n    primary key (ID)\n);\n',
+    );
+    expect(scriptSql("snowflake", "selectFirst", "HR", "EMP", emp)).toBe("select *\nfrom HR.EMP\nlimit 10;\n");
+  });
+
+  it("alters columns with ALTER COLUMN and never sets a default on an existing column", () => {
+    const p = emp.map(draftOf);
+    p[0] = { ...p[0]!, notNull: false, default: "1" };
+    p[1] = { ...p[1]!, name: "FULL_NAME", dataType: "VARCHAR(80)", notNull: true, default: "" };
+    p.push({
+      key: 99,
+      original: null,
+      name: "HIRED",
+      dataType: "DATE",
+      notNull: false,
+      default: "CURRENT_DATE",
+      primaryKey: false,
+      dropped: false,
+    } satisfies ColumnDraft);
+    expect(alterTableSql("snowflake", "HR", "EMP", "STAFF", p)).toEqual([
+      "alter table HR.EMP alter column ID drop not null;",
+      "alter table HR.EMP rename column NAME to FULL_NAME;",
+      "alter table HR.EMP alter column FULL_NAME set data type VARCHAR(80);",
+      "alter table HR.EMP alter column FULL_NAME set not null;",
+      "alter table HR.EMP alter column FULL_NAME drop default;",
+      "alter table HR.EMP add column HIRED DATE default CURRENT_DATE;",
+      "alter table HR.EMP rename to HR.STAFF;",
+    ]);
+    const dropped = emp.map(draftOf);
+    dropped[1] = { ...dropped[1]!, dropped: true };
+    expect(alterTableSql("snowflake", "HR", "EMP", "EMP", dropped)).toEqual(["alter table HR.EMP drop column NAME;"]);
+  });
+});
+
+describe("database and schema SQL", () => {
+  it("creates a PostgreSQL database with only the options given", () => {
+    expect(createDatabaseSql("postgres", "shop", {})).toBe("create database shop;");
+    expect(
+      createDatabaseSql("postgres", "Shop Copy", {
+        owner: "app",
+        template: "template0",
+        encoding: "UTF8",
+        tablespace: " ",
+      }),
+    ).toBe(`create database "Shop Copy" owner app template template0 encoding 'UTF8';`);
+    expect(createDatabaseSql("postgres", "shop", { encoding: "it's" })).toBe("create database shop encoding 'it''s';");
+  });
+
+  it("names the database the server copies for a new one", () => {
+    expect(templateOf("postgres", {})).toBe("template1");
+    expect(templateOf("postgres", { template: "template0" })).toBe("template0");
+    expect(templateOf("sqlServer", { template: "ignored" })).toBe("model");
+  });
+
+  it("creates a SQL Server database with a collation", () => {
+    expect(createDatabaseSql("sqlServer", "shop", { collation: "Latin1_General_CI_AS", owner: "ignored" })).toBe(
+      "create database shop collate Latin1_General_CI_AS;",
+    );
+  });
+
+  it("creates a schema with an owner, and a MySQL schema as a database", () => {
+    expect(createSchemaSql("postgres", "sales", {})).toBe("create schema sales;");
+    expect(createSchemaSql("postgres", "sales", { owner: "app" })).toBe("create schema sales authorization app;");
+    expect(createSchemaSql("sqlServer", "sales", { owner: "dbo" })).toBe("create schema sales authorization dbo;");
+    expect(createSchemaSql("mysql", "shop", { charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci" })).toBe(
+      "create database shop character set utf8mb4 collate utf8mb4_0900_ai_ci;",
+    );
+    expect(createSchemaSql("mysql", "shop", {})).toBe("create database shop;");
+  });
+
+  it("drops a database, forcing out other sessions when asked", () => {
+    expect(dropDatabaseSql("postgres", "shop", false)).toBe("drop database shop;");
+    expect(dropDatabaseSql("postgres", "shop", true)).toBe("drop database shop with (force);");
+    expect(dropDatabaseSql("sqlServer", "shop", false)).toBe("drop database shop;");
+    expect(dropDatabaseSql("sqlServer", "shop", true)).toBe(
+      "alter database shop set single_user with rollback immediate;\ndrop database shop;",
+    );
   });
 });

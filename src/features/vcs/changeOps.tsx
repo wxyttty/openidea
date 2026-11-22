@@ -1,20 +1,26 @@
 /** Local change operations: commit, rollback, add, stash. */
-import { useEffect, useState } from "react";
-import type { FileStatus, PartialCommitFile, Stash } from "@/bindings";
+import { useEffect, useId, useState } from "react";
+import type { FileStatus, Stash } from "@/bindings";
 import { call, commands } from "@/platform/ipc";
-import { Checkbox, Dialog, Icon, Input, T, fileIconName } from "@/ui";
+import { Button, Checkbox, Dialog, Input, Radio, T } from "@/ui";
 import { notifications } from "@/workbench/contributions";
-import { commitRepos, groupOf, planCommit, renamedFromPath } from "./changes";
-import { useChangelists, withListDefaults } from "./changelists";
+import { addedThenDeleted, groupOf, remainingOverrides, renamedFromPath } from "./changes";
 import { runCommitChecks } from "./commitChecks";
+import { contributedCheckProblems, currentPlan, selectionOf } from "./commitSelection";
 import { forgetAmendDraft, keepMessageAfterCommit, rememberMessage, useCommit } from "./commitStore";
 import { workflowSettings } from "@/platform/workflowSettings";
+import { notifyFileOperation } from "@/platform/fileOps";
 import { confirmDialog, openDialog } from "./dialogs";
-import { hunkKeys } from "./hunks";
-import { KIND_COLOR, baseName, dirName, effectiveKind, relTo, rootOf, stripSlash } from "./model";
+import { RepoPicker, useBranchInfo } from "./gitMenuDialogs";
+import { baseName, effectiveKind, stripSlash } from "./model";
 import { logConsole, runOp, saveAll } from "./ops";
-import { currentRepo, loadStashes, refreshNow, useVcs } from "./store";
+import { ensureCommitIdentity } from "./commitIdentity";
+import { conflictsInstead, showCompareRevisions } from "./operations";
+import { FileChecklist } from "./shelf";
+import { currentRepo, loadStashes, refreshNow, repoName, useVcs } from "./store";
 import styles from "./common.module.css";
+import rollbackStyles from "./RollbackDialog.module.css";
+import unstashStyles from "./UnstashDialog.module.css";
 import { tx } from "@/platform/i18n";
 
 export function firstLine(message: string): string {
@@ -28,21 +34,14 @@ export function firstLine(message: string): string {
 
 /** Stages the included changes and commits them. Returns the new commit id. */
 export async function commitChanges(): Promise<string | undefined> {
-  const { message, amend, signOff, author, runHooks } = useCommit.getState();
+  const { message, amend } = useCommit.getState();
   if (!message.trim() && !amend) {
     notifications().notify({ group: "vcs", level: "warning", title: "Commit message is empty" });
     return undefined;
   }
   await saveAll();
   await refreshNow();
-  const status = useVcs.getState().status;
-  const checks = withListDefaults(
-    status,
-    useVcs.getState().root ?? "",
-    useChangelists.getState().state,
-    useCommit.getState().checks,
-  );
-  const plan = planCommit(status, checks);
+  const plan = currentPlan();
   // Concluding a merge needs no further changes (e.g. every conflict resolved as "yours").
   const merging = useVcs.getState().branch?.operation === "merge";
   if (!plan.included.length && !amend && !merging) {
@@ -59,30 +58,39 @@ export async function commitChanges(): Promise<string | undefined> {
     });
     return undefined;
   }
-  const candidates = plan.included.map((f) => ({ path: stripSlash(f.path), exists: effectiveKind(f) !== "deleted" }));
+  const candidates = plan.included.map((f) => ({
+    path: stripSlash(f.path),
+    exists: effectiveKind(f) !== "deleted" && !addedThenDeleted(f),
+  }));
   // IDEA: failed checks show in the commit panel; the next Commit ("Commit Anyway") skips them.
-  if (!useCommit.getState().checkProblems.length) {
-    const problems = await runCommitChecks(candidates, amend);
+  const checked = !useCommit.getState().checkProblems.length;
+  if (checked) {
+    const { problems, blocked } = await runCommitChecks(candidates, amend);
+    if (problems.length) useCommit.setState({ checkProblems: problems });
+    if (blocked) return undefined;
+  }
+  // After the checks: their modifications (reformat…) are part of the commit.
+  const selection = await selectionOf(plan);
+  if (checked) {
+    const problems = await contributedCheckProblems(selection);
     if (problems.length) {
       useCommit.setState({ checkProblems: problems });
       return undefined;
     }
   }
-  const partial = await partialCommitFiles(plan.partial);
-  // Like IDEA, every repository with included changes gets a commit with the same message.
-  const roots = useVcs.getState().roots;
-  const repos = commitRepos(plan.included, roots, currentRepo());
+  if (
+    !(await ensureCommitIdentity(
+      selection.repositories.map((r) => r.root || null),
+      amend,
+    ))
+  )
+    return undefined;
   const id = await runOp(
     amend ? "Amend commit" : "Commit",
     async () => {
-      if (plan.unstage.length) await call(commands.vcsUnstage(plan.unstage));
-      const stage = [...plan.stage, ...partial.whole];
-      if (stage.length) await call(commands.vcsStage(stage));
       let id = "";
-      for (const repo of repos) {
-        const files = partial.files.filter((f) => (rootOf(f.path, roots) ?? null) === repo || repos.length === 1);
-        const options = { amend, signOff, author: author.trim() || null, runHooks, partial: files };
-        id = await call(commands.vcsCommit(repo, message.trim(), options));
+      for (const repo of selection.repositories) {
+        id = await call(commands.vcsCommit(repo.root || null, message.trim(), repo.options));
       }
       return id;
     },
@@ -90,43 +98,66 @@ export async function commitChanges(): Promise<string | undefined> {
       success: () => {
         const n = plan.included.length;
         const summary = firstLine(message);
-        const where = repos.length > 1 ? ` in ${repos.length} repositories` : "";
-        return `${n} file${n === 1 ? "" : "s"} ${amend ? "amended" : "committed"}${where}${summary ? `: ${summary}` : ""}`;
+        const several = selection.repositories.length;
+        const done = amend
+          ? several > 1
+            ? n === 1
+              ? tx`1 file amended in ${several} repositories`
+              : tx`${n} files amended in ${several} repositories`
+            : n === 1
+              ? tx("1 file amended")
+              : tx`${n} files amended`
+          : several > 1
+            ? n === 1
+              ? tx`1 file committed in ${several} repositories`
+              : tx`${n} files committed in ${several} repositories`
+            : n === 1
+              ? tx("1 file committed")
+              : tx`${n} files committed`;
+        return summary ? `${done}: ${summary}` : done;
       },
     },
   );
   if (id !== undefined) {
     rememberMessage(message);
     forgetAmendDraft();
-    useCommit.setState({ amend: false, checks: new Map(), excludedHunks: new Map(), checkProblems: [] });
+    // What the user left out of this commit stays left out; only the committed changes start over.
+    const { checks: userChecks, excludedHunks } = useCommit.getState();
+    useCommit.setState({
+      amend: false,
+      checks: remainingOverrides(userChecks, plan.included),
+      excludedHunks: remainingOverrides(excludedHunks, plan.included),
+      checkProblems: [],
+    });
     keepMessageAfterCommit(message, workflowSettings().vcs.commit.clearInitialMessage);
   }
   return id;
 }
 
-/**
- * The included blocks of files committed partially, as hunk ranges against HEAD of the
- * text on disk (saved just before). A file whose blocks are all included again (e.g. it
- * was edited since) is committed whole.
- */
-async function partialCommitFiles(paths: readonly string[]): Promise<{ files: PartialCommitFile[]; whole: string[] }> {
-  const files: PartialCommitFile[] = [];
-  const whole: string[] = [];
-  const excludedHunks = useCommit.getState().excludedHunks;
-  for (const path of paths) {
-    const [head, disk] = await Promise.all([call(commands.vcsFileAt(path, "HEAD")), call(commands.fsReadText(path))]);
-    const hunks = await commands.vcsDiffHunks(head ?? "", disk);
-    const keys = hunkKeys(disk, hunks);
-    const excluded = excludedHunks.get(path) ?? excludedHunks.get(`${path}/`);
-    const chosen = hunks.filter((_, i) => !excluded?.has(keys[i]!));
-    if (chosen.length === hunks.length) whole.push(path);
-    else
-      files.push({
-        path,
-        hunks: chosen.map(({ start, lines, oldStart, oldLines }) => ({ start, lines, oldStart, oldLines })),
-      });
-  }
-  return { files, whole };
+/** Delete… on unversioned files in the Changes view, as in IDEA: they move to the Trash. */
+/** Delete… in the Changes view: moves the files to the Trash (a tracked file then shows as deleted). */
+export async function deleteFiles(paths: readonly string[]) {
+  if (!paths.length) return;
+  const question = paths.length === 1 ? tx`Delete '${baseName(paths[0]!)}'?` : tx`Delete ${paths.length} items?`;
+  const ok = await confirmDialog({
+    title: "Delete",
+    okLabel: "Delete",
+    danger: true,
+    message: (
+      <>
+        {question}
+        <br />
+        <T>Items are moved to the Trash.</T>
+      </>
+    ),
+  });
+  if (!ok) return;
+  await runOp("Delete", async () => {
+    for (const path of paths) {
+      await call(commands.fsDelete(path));
+      notifyFileOperation({ kind: "deleted", paths: [path] });
+    }
+  });
 }
 
 /** Files the Rollback action applies to by default. */
@@ -188,23 +219,27 @@ export function showRollbackDialog(files: FileStatus[]) {
 }
 
 function RollbackDialog({ files, onClose }: { files: FileStatus[]; onClose: () => void }) {
-  const root = useVcs((s) => s.root) ?? "";
   const [selected, setSelected] = useState(() => new Set(files.map((f) => f.path)));
   const [deleteAdded, setDeleteAdded] = useState(false);
-  const hasAdded = files.some((f) => f.staged === "added");
+  const chosen = files.filter((f) => selected.has(f.path));
+  const counts = { added: 0, modified: 0, deleted: 0 };
+  for (const file of chosen) {
+    const kind = effectiveKind(file);
+    counts[kind === "added" || kind === "deleted" ? kind : "modified"]++;
+  }
+  const { added, modified, deleted } = counts;
   const run = async () => {
-    const chosen = files.filter((f) => selected.has(f.path));
     onClose();
     if (!chosen.length) return;
     await saveAll();
     const { unstage, discard } = rollbackPlan(chosen, deleteAdded);
     await runOp(
-      "Rollback",
+      tx("Rollback"),
       async () => {
         if (unstage.length) await call(commands.vcsUnstage(unstage));
         if (discard.length) await call(commands.vcsDiscard(discard));
       },
-      { success: `Rolled back ${chosen.length} file${chosen.length === 1 ? "" : "s"}` },
+      { success: chosen.length === 1 ? tx("Rolled back 1 file") : tx`Rolled back ${chosen.length} files` },
     );
   };
   return (
@@ -212,49 +247,40 @@ function RollbackDialog({ files, onClose }: { files: FileStatus[]; onClose: () =
       open
       title="Rollback Changes"
       onClose={onClose}
-      width={520}
-      footerStart={
-        hasAdded && (
-          <Checkbox checked={deleteAdded} onChange={setDeleteAdded} label="Delete local copies of added files" />
-        )
-      }
+      className={rollbackStyles.dialog}
+      width={540}
+      minWidth={320}
+      minHeight={240}
+      resizable="both"
       buttons={[
-        { label: "Rollback", role: "default", autoFocus: true, disabled: !selected.size, onClick: () => void run() },
-        { label: "Cancel", role: "cancel" },
+        { label: "Rollback", role: "default", disabled: !chosen.length, onClick: () => void run() },
+        { label: "Close", role: "cancel" },
       ]}
     >
-      <div className={styles.section}>
-        {files.length === 1
-          ? tx`${selected.size} of ${files.length} file will be reverted to their last committed state. Uncommitted changes are lost.`
-          : tx`${selected.size} of ${files.length} files will be reverted to their last committed state. Uncommitted changes are lost.`}
+      <div className={rollbackStyles.content}>
+        <FileChecklist
+          files={files}
+          selected={selected}
+          onChange={setSelected}
+          label="Files to roll back"
+          className={rollbackStyles.tree}
+        />
+        <div className={rollbackStyles.summary} role="status">
+          {!chosen.length && <T>No files selected</T>}
+          {added > 0 && <span className={rollbackStyles.added}>{tx`${added} added`}</span>}
+          {modified > 0 && <span className={rollbackStyles.modified}>{tx`${modified} modified`}</span>}
+          {deleted > 0 && <span className={rollbackStyles.deleted}>{tx`${deleted} deleted`}</span>}
+        </div>
+        <Checkbox
+          checked={added > 0 && deleteAdded}
+          disabled={!added}
+          onChange={setDeleteAdded}
+          label="Delete local copies of added files"
+        />
+        <p className={rollbackStyles.warning}>
+          <T>Rollback discards uncommitted changes in the selected files.</T>
+        </p>
       </div>
-      <div className={styles.fileList} role="group" aria-label={tx("Files to roll back")}>
-        {files.map((f) => {
-          const kind = effectiveKind(f) ?? "modified";
-          return (
-            <div key={f.path} className={styles.fileRow}>
-              <Checkbox
-                aria-label={tx`Include ${baseName(f.path)}`}
-                checked={selected.has(f.path)}
-                onChange={(v) =>
-                  setSelected((s) => {
-                    const n = new Set(s);
-                    if (v) n.add(f.path);
-                    else n.delete(f.path);
-                    return n;
-                  })
-                }
-              />
-              <Icon name={fileIconName(baseName(f.path))} size={14} />
-              <span className={styles.fileName} style={{ color: KIND_COLOR[kind] }}>
-                {baseName(f.path)}
-              </span>
-              <span className={styles.fileDir}>{dirName(relTo(root, stripSlash(f.path)))}</span>
-            </div>
-          );
-        })}
-      </div>
-      <div style={{ height: 12 }} />
     </Dialog>
   );
 }
@@ -284,24 +310,38 @@ export async function addToVcs(paths: readonly string[]) {
     });
     return;
   }
-  await runOp(`Add ${targets.length} file${targets.length === 1 ? "" : "s"} to Git`, () =>
+  await runOp(targets.length === 1 ? tx("Add 1 file to Git") : tx`Add ${targets.length} files to Git`, () =>
     call(commands.vcsStage(targets.map(stripSlash))),
   );
 }
 
-/** Stash Changes dialog: message, Keep index (staged changes stay), include untracked files. */
-export function stashChanges(repo = currentRepo()): Promise<void> {
+/**
+ * Stash Changes dialog: message, Keep index (staged changes stay), include untracked files.
+ * `repo`: the repository it starts on; selected `paths` stash in the repositories holding them.
+ */
+export function stashChanges(paths: readonly string[] = [], repo = currentRepo()): Promise<void> {
   return new Promise((resolve) => {
     const close = openDialog(() => (
       <StashDialog
+        initialRepo={repo}
+        pickRepo={!paths.length}
         onDone={async (r) => {
           close();
           if (r) {
             await saveAll();
             await runOp(
-              "Stash changes",
-              () => call(commands.vcsStashPush(repo, r.message || null, r.includeUntracked, r.keepIndex)),
-              { success: "Changes stashed" },
+              tx("Stash changes"),
+              () =>
+                call(
+                  commands.vcsStashPush(
+                    r.repo,
+                    r.message || null,
+                    r.includeUntracked,
+                    r.keepIndex,
+                    paths.length ? [...paths] : null,
+                  ),
+                ),
+              { success: tx("Changes stashed") },
             );
             void loadStashes().catch(() => undefined);
           }
@@ -313,15 +353,22 @@ export function stashChanges(repo = currentRepo()): Promise<void> {
 }
 
 function StashDialog({
+  initialRepo,
+  pickRepo,
   onDone,
 }: {
-  onDone: (r: { message: string; keepIndex: boolean; includeUntracked: boolean } | null) => void;
+  initialRepo: string | null;
+  pickRepo: boolean;
+  onDone: (r: { repo: string | null; message: string; keepIndex: boolean; includeUntracked: boolean } | null) => void;
 }) {
+  const [repo, setRepo] = useState(initialRepo);
   const [message, setMessage] = useState("");
   const [keepIndex, setKeepIndex] = useState(false);
   const [includeUntracked, setIncludeUntracked] = useState(false);
-  const branch = useVcs((s) => s.branch?.head ?? null);
-  const submit = () => onDone({ message: message.trim(), keepIndex, includeUntracked });
+  const showRepo = useVcs((s) => pickRepo && s.roots.length > 1);
+  const branch = useBranchInfo(repo)?.head ?? null;
+  const messageId = useId();
+  const submit = () => onDone({ repo, message: message.trim(), keepIndex, includeUntracked });
   return (
     <Dialog
       open
@@ -334,25 +381,38 @@ function StashDialog({
       ]}
     >
       <form
-        className={styles.form}
+        className={`${styles.form} ${styles.stashForm}`}
         onSubmit={(e) => {
           e.preventDefault();
           submit();
         }}
       >
-        {branch && <div className={styles.hint}>{tx`Current branch: ${branch}`}</div>}
-        <label className={styles.fieldLabel}>
-          <T>Message:</T>
-        </label>
-        <Input
-          data-autofocus
-          aria-label="Message"
-          placeholder="WIP"
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-        />
-        <Checkbox checked={keepIndex} onChange={setKeepIndex} label="Keep index" />
-        <Checkbox checked={includeUntracked} onChange={setIncludeUntracked} label="Include untracked files" />
+        {showRepo && (
+          <div className={styles.stashRepo}>
+            <T>Repository:</T>
+            <RepoPicker repo={repo} onChange={setRepo} />
+          </div>
+        )}
+        {branch && <div className={styles.stashBranch}>{tx`Current branch: ${branch}`}</div>}
+        <div className={styles.stashMessage}>
+          <label htmlFor={messageId}>
+            <T>Message:</T>
+          </label>
+          <textarea
+            id={messageId}
+            className={styles.textarea}
+            data-autofocus
+            aria-label={tx("Message")}
+            placeholder={tx("WIP")}
+            rows={3}
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+          />
+        </div>
+        <div className={styles.stashOptions}>
+          <Checkbox checked={keepIndex} onChange={setKeepIndex} label="Keep index" />
+          <Checkbox checked={includeUntracked} onChange={setIncludeUntracked} label="Include untracked files" />
+        </div>
       </form>
     </Dialog>
   );
@@ -372,10 +432,10 @@ export interface UnstashOptions {
 export function unstashTitles(o: UnstashOptions): { title: string; success: string } {
   const ref = `stash@{${o.index}}`;
   if (o.branch)
-    return { title: tx`Unstash ${ref} as branch ${o.branch}`, success: `Unstashed ${ref} on branch ${o.branch}` };
+    return { title: tx`Unstash ${ref} as branch ${o.branch}`, success: tx`Unstashed ${ref} on branch ${o.branch}` };
   return o.pop
-    ? { title: tx`Pop ${ref}`, success: `Unstashed ${ref}` }
-    : { title: tx`Apply ${ref}`, success: `Applied ${ref}` };
+    ? { title: tx`Pop ${ref}`, success: tx`Unstashed ${ref}` }
+    : { title: tx`Apply ${ref}`, success: tx`Applied ${ref}` };
 }
 
 export async function unstash(o: UnstashOptions, repo = currentRepo()) {
@@ -383,6 +443,7 @@ export async function unstash(o: UnstashOptions, repo = currentRepo()) {
   const { title, success } = unstashTitles(o);
   await runOp(title, () => call(commands.vcsStashApply(repo, o.index, o.pop, o.reinstateIndex, o.branch)), {
     success,
+    onError: conflictsInstead,
   });
   void loadStashes().catch((e) => logConsole("err", String(e)));
 }
@@ -391,30 +452,76 @@ export function applyStash(index: number, pop: boolean, repo = currentRepo()) {
   return unstash({ index, pop, reinstateIndex: false, branch: null }, repo);
 }
 
-/** Unstash Changes dialog: pick a stash; Pop, Reinstate index, or As new branch. */
+/** Unstash Changes dialog: pick a stash; Pop, Reinstate index, or As new branch; view or drop it. */
 export function showUnstashDialog(index = 0, repo = currentRepo()) {
   openDialog((close) => <UnstashDialog initial={index} repo={repo} onClose={close} />);
 }
 
-function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: string | null; onClose: () => void }) {
-  const [stashes, setStashes] = useState<Stash[]>([]);
+function UnstashDialog({
+  initial,
+  repo: initialRepo,
+  onClose,
+}: {
+  initial: number;
+  repo: string | null;
+  onClose: () => void;
+}) {
+  const id = useId();
+  const [{ repo, index }, setSelection] = useState({ repo: initialRepo, index: initial });
+  const roots = useVcs((s) => s.roots);
+  const projectRoot = useVcs((s) => s.root);
+  const root = repo ?? roots[0] ?? projectRoot;
+  const head = useBranchInfo(repo);
+  const currentBranch = head?.head ?? (head?.headCommit ? tx("Detached HEAD") : "—");
+  const [loaded, setLoaded] = useState<{ repo: string | null; tick: number; stashes: Stash[] } | null>(null);
+  const [tick, setTick] = useState(0);
+  const [dropping, setDropping] = useState(false);
+  const stashes = loaded?.repo === repo ? loaded.stashes : null;
+  const loading = stashes === null || loaded?.tick !== tick;
   useEffect(() => {
     let live = true;
     void call(commands.vcsStashes(repo))
-      .then((value) => live && setStashes(value))
-      .catch((e) => logConsole("err", String(e)));
+      .then((stashes) => live && setLoaded({ repo, tick, stashes }))
+      .catch((e) => {
+        if (live) setLoaded({ repo, tick, stashes: [] });
+        logConsole("err", String(e));
+      });
     return () => {
       live = false;
     };
-  }, [repo]);
-  const [index, setIndex] = useState(initial);
+  }, [repo, tick]);
   const [pop, setPop] = useState(false);
   const [reinstateIndex, setReinstateIndex] = useState(false);
   const [branch, setBranch] = useState("");
   const asBranch = branch.trim();
-  const chosen = stashes.find((s) => s.index === index) ?? stashes[0];
+  const chosen = stashes?.find((s) => s.index === index) ?? stashes?.[0];
+  const ready = !!chosen && !loading && !dropping;
+  const chooseRepo = (next: string) => {
+    if (root === next) return;
+    setSelection({ repo: next, index: 0 });
+    setLoaded(null);
+    setBranch("");
+  };
+  const view = () => {
+    if (!ready || !chosen) return;
+    const ref = `stash@{${chosen.index}}`;
+    showCompareRevisions(`${ref}^`, ref, `${ref}^`, ref, repo);
+  };
+  const drop = async () => {
+    if (!ready || !chosen || !stashes) return;
+    setDropping(true);
+    try {
+      if (!(await dropStash(chosen.index, chosen.message, repo))) return;
+      // The older stashes move up: the next one takes the dropped one's index, else the new last one.
+      const next = Math.max(0, Math.min(chosen.index, stashes.length - 2));
+      setSelection((selection) => (selection.repo === repo ? { repo, index: next } : selection));
+      setTick((n) => n + 1);
+    } finally {
+      setDropping(false);
+    }
+  };
   const submit = () => {
-    if (!chosen) return;
+    if (!ready || !chosen) return;
     onClose();
     void unstash({ index: chosen.index, pop, reinstateIndex, branch: asBranch || null }, repo);
   };
@@ -423,56 +530,114 @@ function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: stri
       open
       title="Unstash Changes"
       onClose={onClose}
-      width={520}
+      width={600}
       buttons={[
         {
           label: asBranch ? "Create Branch" : pop ? "Pop Stash" : "Apply Stash",
           role: "default",
-          disabled: !chosen,
+          disabled: !ready,
           onClick: submit,
         },
         { label: "Cancel", role: "cancel" },
       ]}
     >
       <form
-        className={styles.form}
+        className={unstashStyles.form}
         onSubmit={(e) => {
           e.preventDefault();
           submit();
         }}
       >
-        <div className={styles.choiceList} role="radiogroup" aria-label={tx("Stashes")}>
-          {stashes.length === 0 && (
-            <div className={styles.hint}>
-              <T>No stashes</T>
-            </div>
-          )}
-          {stashes.map((s) => (
-            <label key={s.index} className={styles.radioRow}>
-              <input type="radio" name="stash" checked={chosen?.index === s.index} onChange={() => setIndex(s.index)} />
-              <span className={styles.radioText}>
-                <span>{`stash@{${s.index}}: ${s.message}`}</span>
-              </span>
+        {roots.length > 1 ? (
+          <>
+            <label className={unstashStyles.label} htmlFor={`${id}-repo`}>
+              <T>Repository:</T>
             </label>
-          ))}
+            <RepoPicker id={`${id}-repo`} repo={repo} onChange={chooseRepo} />
+          </>
+        ) : (
+          <>
+            <span className={unstashStyles.label}>
+              <T>Repository:</T>
+            </span>
+            <span className={unstashStyles.fact}>{root ? repoName(root) : "—"}</span>
+          </>
+        )}
+        <span className={unstashStyles.label}>
+          <T>Current branch:</T>
+        </span>
+        <span className={unstashStyles.fact} title={currentBranch}>
+          {currentBranch}
+        </span>
+        <span className={unstashStyles.listLabel} id={`${id}-stashes`}>
+          <T>Stashes:</T>
+        </span>
+        <div className={unstashStyles.stashPanel}>
+          <div
+            className={unstashStyles.stashes}
+            role="radiogroup"
+            aria-labelledby={`${id}-stashes`}
+            aria-busy={loading || dropping}
+          >
+            {stashes?.length ? (
+              stashes.map((stash) => {
+                const name = `stash@{${stash.index}}: ${stash.message}`;
+                return (
+                  <Radio
+                    key={stash.index}
+                    className={unstashStyles.stash}
+                    name={`${id}-stash`}
+                    checked={chosen?.index === stash.index}
+                    disabled={loading || dropping}
+                    onChange={() => setSelection({ repo, index: stash.index })}
+                    label={
+                      <span className={unstashStyles.stashText} title={name}>
+                        {name}
+                      </span>
+                    }
+                  />
+                );
+              })
+            ) : (
+              <div className={unstashStyles.status}>
+                <T>{stashes === null ? "Loading…" : "No stashes"}</T>
+              </div>
+            )}
+          </div>
+          <div className={unstashStyles.actions}>
+            <Button disabled={!ready} onClick={view}>
+              Show Changes
+            </Button>
+            <Button disabled={!ready} onClick={() => void drop()}>
+              Drop Stash
+            </Button>
+          </div>
         </div>
-        <Checkbox checked={pop || !!asBranch} disabled={!!asBranch} onChange={setPop} label="Pop stash" />
-        <Checkbox
-          checked={reinstateIndex || !!asBranch}
-          disabled={!!asBranch}
-          onChange={setReinstateIndex}
-          label="Reinstate index"
-        />
-        <label className={styles.fieldLabel}>
+        <div className={unstashStyles.options}>
+          <Checkbox checked={pop || !!asBranch} disabled={!!asBranch} onChange={setPop} label="Pop stash" />
+          <Checkbox
+            checked={reinstateIndex || !!asBranch}
+            disabled={!!asBranch}
+            onChange={setReinstateIndex}
+            label="Reinstate index"
+          />
+        </div>
+        <label className={unstashStyles.label} htmlFor={`${id}-branch`}>
           <T>As new branch:</T>
         </label>
-        <Input mono aria-label="As new branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
+        <Input
+          id={`${id}-branch`}
+          aria-label={tx("As new branch")}
+          value={branch}
+          onChange={(e) => setBranch(e.target.value)}
+        />
       </form>
     </Dialog>
   );
 }
 
-export async function dropStash(index: number, message: string, repo = currentRepo()) {
+/** Drops the stash once confirmed; whether it was confirmed. */
+export async function dropStash(index: number, message: string, repo = currentRepo()): Promise<boolean> {
   const ok = await confirmDialog({
     title: "Drop Stash",
     message: message
@@ -481,9 +646,10 @@ export async function dropStash(index: number, message: string, repo = currentRe
     okLabel: "Drop",
     danger: true,
   });
-  if (!ok) return;
-  await runOp(`Drop stash@{${index}}`, () => call(commands.vcsStashDrop(repo, index)), {
-    success: `Dropped stash@{${index}}`,
+  if (!ok) return false;
+  await runOp(tx`Drop ${`stash@{${index}}`}`, () => call(commands.vcsStashDrop(repo, index)), {
+    success: tx`Dropped ${`stash@{${index}}`}`,
   });
   void loadStashes().catch((e) => logConsole("err", String(e)));
+  return true;
 }

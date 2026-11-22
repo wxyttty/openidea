@@ -7,7 +7,7 @@
 import { useMemo, useState, type KeyboardEvent } from "react";
 import { HighlightedText, Icon, List, Popup, SearchField, Select, T, fuzzyMatch, listNavigate } from "@/ui";
 import { useTx } from "@/platform/i18n";
-import { nameWithOwner, sameRepository, useGhRepository, type GHRemote } from "../data/repository";
+import { NO_REMOTES, nameWithOwner, sameRepository, useGhRepository, type GHRemote } from "../data/repository";
 import { ChooserPopup } from "../ui/ChooserPopup";
 import {
   baseText,
@@ -91,7 +91,7 @@ type HeadRow = { section: string } | { branch: HeadBranch; text: string; match: 
 /** The head: the repository (several GitHub remotes only), then its branches, local first. */
 function HeadPopup(props: { anchor: HTMLElement; initialRepo: GHRemote; onClose: () => void }) {
   const tx = useTx();
-  const remotes = useGhRepository((s) => s.remotes);
+  const remotes = useGhRepository((s) => s.connection?.remotes ?? NO_REMOTES);
   const branches = useCreatePr((s) => s.branches);
   const current = useCreatePr((s) => s.direction?.headBranch ?? null);
   const [repo, setRepo] = useState(props.initialRepo);
@@ -178,7 +178,6 @@ function HeadPopup(props: { anchor: HTMLElement; initialRepo: GHRemote; onClose:
         onActivate={(r) => choose(r)}
         focusable={false}
         hoverSelects
-        rowHeight={24}
         className={styles.headList}
         aria-label="Branches"
         empty={<div className={styles.hint}>{tx("Nothing to show")}</div>}

@@ -35,13 +35,15 @@ fn mise_and_asdf_installs_are_detected_and_pinned_versions_used() {
     let tmp = dunce::canonicalize(tmp.path()).unwrap();
     let mise = tmp.join("mise");
     let asdf = tmp.join("asdf");
-    // SAFETY: the only test in this binary; nothing else reads the environment yet.
+    // SAFETY: the only test in this binary that writes the environment; the daemon
+    // tests below read it, so they run after this one's fixtures are in place.
     unsafe {
         std::env::set_var("HOME", tmp.join("home"));
         std::env::set_var("MISE_DATA_DIR", &mise);
         std::env::set_var("ASDF_DATA_DIR", &asdf);
         std::env::set_var("MISE_GLOBAL_CONFIG_FILE", tmp.join("no-global.toml"));
         std::env::remove_var("JAVA_HOME");
+        std::env::remove_var("MVND_HOME");
     }
 
     let installs = mise.join("installs");
@@ -59,6 +61,9 @@ fn mise_and_asdf_installs_are_detected_and_pinned_versions_used() {
     script(&maven.join("bin/mvn"), "Apache Maven 3.9.6");
     write(&maven.join("lib/maven-core-3.9.6.jar"), "");
     script(&installs.join("gradle/8.7/bin/gradle"), "Gradle 8.7");
+    // Zig: asdf keeps the executable at the install root, zvm under ~/.zvm.
+    script(&asdf.join("installs/zig/0.14.1/zig"), "0.14.1");
+    script(&tmp.join("home/.zvm/0.13.0/zig"), "0.13.0");
 
     let project = tmp.join("project");
     write(
@@ -88,6 +93,13 @@ fn mise_and_asdf_installs_are_detected_and_pinned_versions_used() {
     let mavens = detect(SdkKind::Maven, Some(&project));
     let mvn = find(&mavens, &maven);
     assert_eq!((mvn.source.as_str(), mvn.version.as_deref()), ("mise", Some("3.9.6")));
+
+    let zigs = detect(SdkKind::Zig, Some(&project));
+    let zig = find(&zigs, &asdf.join("installs/zig"));
+    assert_eq!((zig.source.as_str(), zig.version.as_deref()), ("asdf", Some("0.14.1")));
+    assert_eq!(zig.path, asdf.join("installs/zig/0.14.1"), "the setting stores the directory");
+    let zvm = find(&zigs, &tmp.join("home/.zvm"));
+    assert_eq!((zvm.source.as_str(), zvm.version.as_deref()), ("zvm", Some("0.13.0")));
 
     // Nothing configured in Settings: the pinned versions apply.
     let s = Settings::default();
@@ -131,11 +143,99 @@ fn mise_and_asdf_installs_are_detected_and_pinned_versions_used() {
     ide_sdk::apply::apply_to_run_configs(&mut plain, &project, &s);
     assert_eq!(plain[0].command, installs.join("gradle/8.7/bin/gradle").to_string_lossy());
 
+    // The Maven daemon replaces the pinned Maven when it is on and installed; the
+    // project JDK (21, from mise.toml) can host its JVM.
+    let mut daemon = s.clone();
+    daemon.languages.java.maven.daemon = true;
+    daemon.languages.java.maven.mvnd_home = tmp.join("missing/mvnd").to_string_lossy().into_owned();
+    assert_eq!(
+        ide_sdk::apply::maven_command(&project, &daemon),
+        Some(maven.join("bin/mvn")),
+        "a dead-end mvnd home falls back to the pinned Maven"
+    );
+    let mvnd = tmp.join("mvnd");
+    script(&mvnd.join("bin/mvnd"), "mvnd 1.0-m7");
+    daemon.languages.java.maven.mvnd_home = mvnd.to_string_lossy().into_owned();
+    assert_eq!(
+        ide_sdk::apply::maven_command(&project, &daemon),
+        Some(mvnd.join("bin/mvnd")),
+        "a bare home resolves to <home>/bin/mvnd"
+    );
+    // The executable itself, like `maven.home`, also works.
+    daemon.languages.java.maven.mvnd_home = mvnd.join("bin/mvnd").to_string_lossy().into_owned();
+    assert_eq!(ide_sdk::apply::maven_command(&project, &daemon), Some(mvnd.join("bin/mvnd")));
+
     // The project's Maven wrapper keeps precedence over a pinned Maven.
     script(&project.join("mvnw"), "");
     assert_eq!(ide_sdk::apply::maven_command(&project, &s), None);
+    // ...but not over the daemon.
+    assert_eq!(ide_sdk::apply::maven_command(&project, &daemon), Some(mvnd.join("bin/mvnd")));
 
     // A version the project pins but that isn't installed: nothing is made up.
     write(&project.join("mise.toml"), "[tools]\njava = '25'\n");
     assert_eq!(ide_sdk::apply::project_jdk(&project, &s), None);
+}
+
+#[test]
+fn maven_daemon_run_configs_follow_the_setting_and_the_jdk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dunce::canonicalize(tmp.path()).unwrap();
+    let project = tmp.join("project");
+    write(&project.join("pom.xml"), "<project/>");
+    let mvnd = tmp.join("mvnd");
+    script(&mvnd.join("bin/mvnd"), "mvnd 1.0-m7");
+    let mvn = tmp.join("mvn");
+    script(&mvn.join("bin/mvn"), "Apache Maven 3.9.6");
+    let mvnd_path = mvnd.join("bin/mvnd").to_string_lossy().into_owned();
+    let mvn_path = mvn.join("bin/mvn").to_string_lossy().into_owned();
+
+    let mut s = Settings::default();
+    s.languages.java.maven.daemon = true;
+    s.languages.java.maven.mvnd_home = mvnd_path.clone();
+    s.languages.java.maven.home = mvn_path.clone();
+
+    let run = |command: &str, detected: bool| RunConfig {
+        id: "maven:x".into(),
+        name: "x".into(),
+        kind: "maven".into(),
+        command: command.into(),
+        args: vec!["package".into()],
+        cwd: None,
+        env: BTreeMap::new(),
+        detected,
+        is_test: false,
+        debug_adapter: None,
+        allow_parallel: false,
+        extras: Default::default(),
+    };
+
+    // No project JDK: the daemon may pick its own, so it stays on mvnd.
+    let mut configs = [run("mvn", true), run("mvn", false)];
+    ide_sdk::apply::apply_to_run_configs(&mut configs, &project, &s);
+    assert_eq!(configs[0].command, mvnd_path, "detected config runs the daemon");
+    assert_eq!(configs[1].command, mvnd_path, "saved `mvn` config is pointed at the daemon");
+
+    // A launcher the user wrote into a configuration is theirs: an absolute path
+    // or a bare `mvnd` stays as configured.
+    let mut configs = [run(&mvn_path, false), run("mvnd", false)];
+    ide_sdk::apply::apply_to_run_configs(&mut configs, &project, &s);
+    assert_eq!(configs[0].command, mvn_path, "a custom absolute launcher is kept");
+    assert_eq!(configs[1].command, "mvnd", "a user-written mvnd is kept");
+
+    // A project JDK older than the daemon's Java 17 requirement keeps mvn.
+    let jdk8 = tmp.join("jdk8");
+    jdk(&jdk8, "1.8.0_392");
+    s.languages.java.jdk = jdk8.to_string_lossy().into_owned();
+    let mut configs = [run("mvn", true), run("mvn", false)];
+    ide_sdk::apply::apply_to_run_configs(&mut configs, &project, &s);
+    assert_eq!(configs[0].command, mvn_path, "JDK 8 cannot host the daemon JVM");
+    assert_eq!(configs[1].command, mvn_path);
+
+    // With the daemon off, the same configurations run the configured Maven.
+    s.languages.java.maven.daemon = false;
+    s.languages.java.jdk = String::new();
+    let mut configs = [run("mvn", true), run("mvn", false)];
+    ide_sdk::apply::apply_to_run_configs(&mut configs, &project, &s);
+    assert_eq!(configs[0].command, mvn_path);
+    assert_eq!(configs[1].command, mvn_path);
 }

@@ -1,13 +1,19 @@
 .dialog {
   --rp-bg-chrome: var(--bg-frame, var(--bg-app));
+  container-type: inline-size;
   max-height: 80vh;
   background: var(--bg-popup, var(--bg-elev));
+}
+.dialog > :global([data-dialog-body]) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .header {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   height: 40px;
   padding: 0 12px 0 16px;
   background: var(--rp-bg-chrome);
@@ -24,7 +30,7 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   height: 24px;
   padding: 0 6px;
   border-radius: var(--radius-small);
@@ -78,7 +84,7 @@
 }
 .tools {
   flex: none;
-  width: 230px;
+  width: clamp(140px, 32%, 230px);
   display: flex;
   flex-direction: column;
   padding: 6px 0 4px;
@@ -96,11 +102,25 @@
 .locations > * {
   flex: 1;
 }
+.switcher {
+  min-height: min(350px, 80vh);
+}
+.switcher .columns {
+  flex: auto;
+  height: auto;
+  max-height: 440px;
+}
+.switcher .tools {
+  width: clamp(112px, 32%, 184px);
+}
+.switcher .footer {
+  font-size: var(--fs-small);
+}
 .locationsLink {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: 28px;
   margin: 2px 10px 0;
   padding: 0 4px;
@@ -132,9 +152,13 @@
 .current {
   font-style: italic;
 }
+.fileName,
+.locationName {
+  flex: 0 1 auto;
+}
 .dir {
-  flex: none;
-  max-width: 50%;
+  flex: 0 1000 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--fg-subtle);
@@ -157,28 +181,28 @@
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   border-bottom: 1px solid var(--border-popup);
 }
 .locationHeader {
   display: flex;
+  flex: none;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: 20px;
 }
 .locationName {
-  flex: none;
+  font-weight: 600;
 }
 .changed {
+  flex: none;
   margin-left: auto;
   color: var(--vcs-modified);
   font-size: var(--fs-small);
 }
 .snippet {
   margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-small);
-  line-height: 16px;
+  font-size: var(--fs-code);
   color: var(--fg-muted);
   overflow: hidden;
 }
@@ -233,38 +257,38 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Lezer classHighlighter tokens (same colours as Search Everywhere's text hits). */
-.code :global(.tok-keyword),
-.code :global(.tok-modifier),
-.code :global(.tok-controlKeyword),
-.code :global(.tok-operatorKeyword) {
-  color: var(--syn-keyword);
-}
-.code :global(.tok-string),
-.code :global(.tok-string2) {
-  color: var(--syn-string);
-}
-.code :global(.tok-number),
-.code :global(.tok-bool),
-.code :global(.tok-atom) {
-  color: var(--syn-number);
-}
-.code :global(.tok-typeName),
-.code :global(.tok-className),
-.code :global(.tok-namespace) {
-  color: var(--syn-type);
-}
-.code :global(.tok-comment) {
-  color: var(--syn-comment);
-  font-style: italic;
-}
-.code :global(.tok-meta),
-.code :global(.tok-macroName) {
-  color: var(--syn-annotation);
-}
-.code :global(.tok-propertyName) {
-  color: var(--syn-property);
-}
-.code :global(.tok-variableName.tok-definition) {
-  color: var(--syn-function);
+
+@container (max-width: 480px) {
+  .header {
+    height: auto;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+  }
+  .speed {
+    order: 1;
+    flex-basis: 100%;
+    background: var(--bg-input);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+  .speed .filterIcon {
+    visibility: visible;
+  }
+  .speed .filter {
+    caret-color: var(--fg-strong);
+  }
+  .hint,
+  .tools .shortcut {
+    display: none;
+  }
+  .switcher .columns {
+    --list-inset: var(--space-1);
+  }
+  .switcher .columns [role="option"] {
+    gap: var(--space-1);
+    padding-inline: var(--space-1);
+  }
+  .locationsLink {
+    margin-inline: var(--space-1);
+  }
 }

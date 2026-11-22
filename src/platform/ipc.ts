@@ -8,16 +8,29 @@
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { commands, type IdeError, type IdeEvent, type RequestId } from "@/bindings";
+import { notifyEach } from "./listeners";
 
 export { commands };
 export type * from "@/bindings";
 
 export class IpcError extends Error {
   readonly kind: IdeError["kind"];
+  readonly data: IdeError["data"];
   constructor(error: IdeError) {
     super(error.message);
     this.name = "IpcError";
     this.kind = error.kind;
+    this.data = error.data;
+  }
+}
+
+/** Matches both wrapped IPC errors and raw invoke rejections by kind. */
+export function isErrorKind(e: unknown, kind: IdeError["kind"]): boolean {
+  if (typeof e !== "object" || e === null) return false;
+  try {
+    return "kind" in e && e.kind === kind;
+  } catch {
+    return false;
   }
 }
 
@@ -46,6 +59,11 @@ export function unavailableText(e: unknown, fallback = "No language server avail
   return e instanceof IpcError && e.kind === "unavailable" && LACKS_FEATURE.test(e.message) ? e.message : fallback;
 }
 
+/** True when `unavailable` means no server is running for the file, rather than a running server lacking the feature. */
+export function isNoServer(e: unknown): boolean {
+  return e instanceof IpcError && e.kind === "unavailable" && !LACKS_FEATURE.test(e.message);
+}
+
 // Ids are shared by every window of the backend and outlive a reload there (a cancel that
 // arrives before its request began is remembered), so each page starts at a random point.
 let nextId = 1 + Math.floor(Math.random() * 0x7000_0000);
@@ -62,13 +80,16 @@ type Handler = (event: IdeEvent) => void;
 const handlers = new Map<string, Set<Handler>>();
 let unlisten: Promise<UnlistenFn> | null = null;
 
+function dispatch(event: IdeEvent) {
+  const what = `IDE event ${event.type}`;
+  notifyEach(handlers.get(event.type) ?? [], (h) => h(event), what);
+  notifyEach(handlers.get("*") ?? [], (h) => h(event), what);
+}
+
 function ensureListening() {
   if (unlisten || !isTauri()) return;
   // Window-scoped: a global `listen` also receives events emitted to other windows.
-  unlisten = getCurrentWebviewWindow().listen<IdeEvent>(IDE_EVENT, ({ payload }) => {
-    handlers.get(payload.type)?.forEach((h) => h(payload));
-    handlers.get("*")?.forEach((h) => h(payload));
-  });
+  unlisten = getCurrentWebviewWindow().listen<IdeEvent>(IDE_EVENT, ({ payload }) => dispatch(payload));
 }
 
 /** Resolves once backend events reach this window's handlers. */
@@ -85,15 +106,15 @@ export function onIdeEvent<K extends IdeEvent["type"]>(
   ensureListening();
   let set = handlers.get(type);
   if (!set) handlers.set(type, (set = new Set()));
-  const h = handler as Handler;
+  // A wrapper per subscription, so unsubscribing one of two identical handlers keeps the other.
+  const h: Handler = (event) => handler(event as EventOf<K>);
   set.add(h);
   return () => set.delete(h);
 }
 
 /** Test helper: dispatch an event as if it came from the backend. */
 export function emitLocalIdeEvent(event: IdeEvent) {
-  handlers.get(event.type)?.forEach((h) => h(event));
-  handlers.get("*")?.forEach((h) => h(event));
+  dispatch(event);
 }
 
 export function isTauri(): boolean {

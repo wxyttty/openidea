@@ -4,6 +4,9 @@ import type { RunConfig } from "@/platform/ipc";
 const invoked: Array<[string, unknown[]]> = [];
 let shortenCommandLine: string | null = null;
 let kotlinFiles = false;
+let debugAdapter = "java-debug";
+const files: Record<string, string> = {};
+let missingTools: string[] = [];
 vi.mock("@/platform/ipc", async (orig) => {
   const real = await orig<typeof import("@/platform/ipc")>();
   const ok = (data: unknown) => Promise.resolve({ status: "ok", data });
@@ -17,8 +20,15 @@ vi.mock("@/platform/ipc", async (orig) => {
             ? [{ path: "/p/api/src/main/java/a/Main.java", relPath: "api/src/main/java/a/Main.java" }]
             : [],
         ),
-      fsReadText: () => ok("package a;\npublic class Main {}"),
+      fsReadText: (path: string) => ok(files[path] ?? "package a;\npublic class Main {}"),
       runConfigs: () => ok([]),
+      toolsList: () =>
+        ok(
+          ["kotlin-debug-adapter", "kotlin-lsp"].map((name) => ({
+            name,
+            status: missingTools.includes(name) ? "missing" : "installed",
+          })),
+        ),
       fsReadDir: (path: string) =>
         ok(
           kotlinFiles && path.endsWith("/src")
@@ -41,6 +51,10 @@ vi.mock("@/platform/ipc", async (orig) => {
           hints: [],
         });
       },
+      javaDebugAdapter: (...a: unknown[]) => {
+        invoked.push(["javaDebugAdapter", a]);
+        return ok(debugAdapter);
+      },
       javaDebugServer: (...a: unknown[]) => {
         invoked.push(["javaDebugServer", a]);
         return ok(41234);
@@ -49,12 +63,13 @@ vi.mock("@/platform/ipc", async (orig) => {
   };
 });
 
-const { isJavaDebuggable, javaAttachConfig, javaLaunchConfig } = await import("../java");
+const { isJavaDebuggable, javaAttachConfig, javaLaunchConfig, javaProjectName, jvmAttachDebuggerReady } =
+  await import("../java");
 
 const app: RunConfig = {
   id: "application:a.Main",
   name: "Main",
-  kind: "spring-boot",
+  kind: "application",
   command: "java",
   args: ["-Xmx1g", "-cp", "${classpath}", "a.Main", "--port", "8081 x"],
   cwd: "api",
@@ -70,6 +85,7 @@ describe("Java debugging (java-debug through jdtls)", () => {
     invoked.length = 0;
     shortenCommandLine = null;
     kotlinFiles = false;
+    debugAdapter = "java-debug";
   });
 
   it("launches Application configs with the resolved classpath on jdtls' debug server", async () => {
@@ -77,7 +93,8 @@ describe("Java debugging (java-debug through jdtls)", () => {
     expect(isJavaDebuggable({ ...app, kind: "maven" })).toBe(false);
     const l = await javaLaunchConfig(app, "/p");
     expect(invoked).toEqual([
-      ["javaResolveLaunch", ["api", false, true, expect.any(Number)]],
+      ["javaResolveLaunch", ["api", false, "automatic", expect.any(Number)]],
+      ["javaDebugAdapter", ["api"]],
       ["javaDebugServer", ["api"]],
     ]);
     expect(l).toMatchObject({ adapter: "java-debug", request: "launch", cwd: "/p/api", args: [], env: { A: "1" } });
@@ -90,7 +107,31 @@ describe("Java debugging (java-debug through jdtls)", () => {
       args: '--port "8081 x"',
       console: "internalConsole",
       shortenCommandLine: "none",
+      projectName: "p",
     });
+  });
+
+  it("echoes the equivalent Java command in the Debug console", async () => {
+    const report = vi.fn();
+    await javaLaunchConfig(app, "/p", {
+      request: 1,
+      signal: new AbortController().signal,
+      report,
+    });
+    expect(report).toHaveBeenCalledWith(
+      '/jdk21/bin/java -Xmx1g -cp /p/target/classes:/m2/a.jar a.Main --port "8081 x"\n',
+    );
+  });
+
+  it("debugs Spring Boot with coloured console output, as Run does", async () => {
+    const boot = { ...app, kind: "spring-boot" };
+    expect(JSON.parse((await javaLaunchConfig(boot, "/p")).extraJson!).vmArgs).toBe(
+      "-Dspring.output.ansi.enabled=always -Xmx1g",
+    );
+    const own = { ...boot, args: ["-Dspring.output.ansi.enabled=never", ...app.args] };
+    expect(JSON.parse((await javaLaunchConfig(own, "/p")).extraJson!).vmArgs).toBe(
+      "-Dspring.output.ansi.enabled=never -Xmx1g",
+    );
   });
 
   it("passes the configuration's VM options to java-debug's vmArgs, before the main class", async () => {
@@ -148,10 +189,39 @@ describe("Java debugging (java-debug through jdtls)", () => {
     expect(invoked.some(([command]) => command === "javaDebugServer")).toBe(false);
   });
 
+  it("debugs a module jdtls doesn't serve with java-analyzer's adapter", async () => {
+    debugAdapter = "java-analyzer";
+    const l = await javaLaunchConfig(app, "/p");
+    expect(l).toMatchObject({ adapter: "java-analyzer", request: "launch", cwd: "/p/api", env: { A: "1" } });
+    expect(JSON.parse(l.extraJson!)).toEqual({
+      projectRoot: "/p/api",
+      mainClass: "a.Main",
+      classPaths: ["/p/target/classes", "/m2/a.jar"],
+      modulePaths: [],
+      javaExec: "/jdk21/bin/java",
+      vmArgs: ["-Xmx1g"],
+      args: ["--port", "8081 x"],
+    });
+    const a = await javaAttachConfig({ name: "mvn test", module: "api", hostName: "remote", port: 5005 }, "/p");
+    expect(a).toMatchObject({ adapter: "java-analyzer", request: "attach", cwd: "/p/api" });
+    expect(JSON.parse(a.extraJson!)).toEqual({
+      projectRoot: "/p/api",
+      hostName: "remote",
+      port: 5005,
+      timeout: 30_000,
+    });
+    expect(invoked.some(([command]) => command === "javaDebugServer")).toBe(false);
+  });
+
   it("attaches to a JDWP agent", async () => {
     const l = await javaAttachConfig({ name: "mvn test", module: "", hostName: "127.0.0.1", port: 5005 }, "/p");
     expect(l).toMatchObject({ request: "attach", cwd: "/p" });
-    expect(JSON.parse(l.extraJson!)).toMatchObject({ debugServer: 41234, hostName: "127.0.0.1", port: 5005 });
+    expect(JSON.parse(l.extraJson!)).toMatchObject({
+      debugServer: 41234,
+      hostName: "127.0.0.1",
+      port: 5005,
+      projectName: "p",
+    });
   });
 });
 
@@ -160,8 +230,67 @@ it.each(["sibling", "/outside/modules"])("debugs from %s with the main class mod
   for (const module of ["api", undefined]) {
     invoked.length = 0;
     const launch = await javaLaunchConfig({ ...app, module, cwd }, "/p");
-    expect(invoked).toContainEqual(["javaResolveLaunch", ["api", false, true, expect.any(Number)]]);
+    expect(invoked).toContainEqual(["javaResolveLaunch", ["api", false, "automatic", expect.any(Number)]]);
     expect(invoked).toContainEqual(["javaDebugServer", ["api"]]);
     expect(launch.cwd).toBe(cwd.startsWith("/") ? cwd : `/p/${cwd}`);
   }
+});
+
+describe("naming the Java project jdtls imported", () => {
+  beforeEach(() => {
+    invoked.length = 0;
+    for (const key of Object.keys(files)) delete files[key];
+  });
+
+  it("uses the Maven artifactId, not the folder name, and skips the parent's", async () => {
+    files["/p/pom.xml"] =
+      "<project><parent><artifactId>orders-parent</artifactId></parent><artifactId>openidea-fixture-orders</artifactId></project>";
+    expect(await javaProjectName("/p")).toBe("openidea-fixture-orders");
+  });
+
+  it("prefers the Eclipse project descriptor", async () => {
+    files["/p/.project"] = "<projectDescription><name>taihe</name></projectDescription>";
+    files["/p/pom.xml"] = "<project><artifactId>orders</artifactId></project>";
+    expect(await javaProjectName("/p")).toBe("taihe");
+  });
+
+  it("falls back to the folder name when the project says nothing, including unresolved properties", async () => {
+    expect(await javaProjectName("/p/api")).toBe("api");
+    files["/p/pom.xml"] = "<project><artifactId>${revision}</artifactId></project>";
+    expect(await javaProjectName("/p")).toBe("p");
+  });
+});
+
+it("reports a save failure before starting Java Debug", async () => {
+  invoked.length = 0;
+  const saveAll = vi.fn().mockRejectedValue(new Error("save failed"));
+  await expect(
+    javaLaunchConfig(app, "/p", {
+      request: 1,
+      signal: new AbortController().signal,
+      saveAll,
+    }),
+  ).rejects.toThrow("save failed");
+  expect(invoked).toEqual([]);
+});
+
+describe("the debugger for a build tool's JVMs", () => {
+  it("is ready for Kotlin sources when kotlin-lsp or kotlin-debug-adapter is installed", async () => {
+    kotlinFiles = true;
+    const retry = vi.fn();
+    try {
+      for (const missing of [[], ["kotlin-debug-adapter"], ["kotlin-lsp"]]) {
+        missingTools = missing;
+        expect(await jvmAttachDebuggerReady("app", "/p", retry)).toBe(true);
+      }
+      missingTools = ["kotlin-debug-adapter", "kotlin-lsp"];
+      expect(await jvmAttachDebuggerReady("app", "/p", retry)).toBe(false);
+      kotlinFiles = false;
+      expect(await jvmAttachDebuggerReady("app", "/p", retry)).toBe(true);
+      expect(retry).not.toHaveBeenCalled();
+    } finally {
+      kotlinFiles = false;
+      missingTools = [];
+    }
+  });
 });

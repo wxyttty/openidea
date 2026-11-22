@@ -4,31 +4,30 @@
  * `scratch[_n].<ext>` name and opens it as a normal document.
  */
 import { IpcError, call, commands, emitLocalIdeEvent, isTauri } from "@/platform/ipc";
-import { ipcPath } from "@/platform/paths";
+import { appDataDir } from "@/platform/platformInfo";
 import { editorService, notifications } from "@/workbench/contributions";
-import { scratchFileName, scratchLanguages, type ScratchLanguage } from "./model";
+import { scratchContent, scratchFileName, scratchLanguages, type ScratchLanguage } from "./model";
 
 export interface ScratchBackend {
   /** Absolute app data dir. */
   dataDir(): Promise<string>;
   listNames(dir: string): Promise<string[]>;
   createDir(dir: string): Promise<void>;
-  createFile(path: string): Promise<void>;
+  createFile(path: string, text: string): Promise<void>;
   languages(): Promise<ScratchLanguage[]>;
-  open(path: string): Promise<void>;
+  open(path: string, caret: { line: number; col: number } | null): Promise<void>;
 }
 
 export const tauriScratchBackend: ScratchBackend = {
-  // `appDataDir()` is native (`C:\…`); the scratch paths are used as UI paths.
-  dataDir: async () => {
-    const { appDataDir } = await import("@tauri-apps/api/path");
-    return ipcPath(await appDataDir());
-  },
+  dataDir: appDataDir,
   listNames: async (dir) => (await call(commands.fsReadDir(dir))).map((e) => e.name),
   createDir: async (dir) => void (await call(commands.fsCreateDir(dir))),
-  createFile: async (path) => void (await call(commands.fsCreateFile(path))),
+  createFile: async (path, text) =>
+    void (await call(
+      text ? commands.fsCreateFileBytes(path, [...new TextEncoder().encode(text)]) : commands.fsCreateFile(path),
+    )),
   languages: async () => scratchLanguages(await commands.languages()),
-  open: (path) => editorService().openFile(path, { focus: true }),
+  open: (path, caret) => editorService().openFile(path, { focus: true, ...(caret && { selection: caret }) }),
 };
 
 let backend: ScratchBackend = tauriScratchBackend;
@@ -64,16 +63,17 @@ export function scratchesDir(): Promise<string> {
 
 export const scratchesAvailable = () => isTauri() || backend !== tauriScratchBackend;
 
-/** Creates `scratch[_n].<ext>` for `lang` and opens it; returns its path. */
+/** Creates `scratch[_n].<ext>` for `lang` from its template and opens it; returns its path. */
 export async function createScratch(lang: ScratchLanguage): Promise<string | null> {
   try {
     const dir = await scratchesDir();
     const name = scratchFileName(await backend.listNames(dir), lang.ext);
     const path = `${dir}/${name}`;
-    await backend.createFile(path);
+    const { text, caret } = scratchContent(lang.template);
+    await backend.createFile(path, text);
     // The file watcher covers the project only: tell the project view.
     emitLocalIdeEvent({ type: "fsChanged", created: [path], modified: [], removed: [] });
-    await backend.open(path);
+    await backend.open(path, caret);
     return path;
   } catch (e) {
     notifications().notify({

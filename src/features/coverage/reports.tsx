@@ -1,6 +1,6 @@
 /**
  * Coverage reports collected elsewhere: "Import a report collected in CI from
- * disk" (lcov, JaCoCo XML, Go cover profile) and "Manage Coverage Reports"
+ * disk" (lcov, JaCoCo XML, Go cover profile, SimpleCov) and "Manage Coverage Reports"
  * (choose the shown suite, delete suites and remembered imports).
  */
 import { useMemo, useState } from "react";
@@ -12,6 +12,7 @@ import { notifications, toolWindowService } from "@/workbench/contributions";
 import { formatPercent } from "./model";
 import {
   addSuite,
+  captureCoverageProject,
   closeSuite,
   forgetImport,
   importedReports,
@@ -27,7 +28,7 @@ import styles from "./Coverage.module.css";
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 async function pickReport(): Promise<string | null> {
-  const { open } = await import("@tauri-apps/plugin-dialog");
+  const { open } = await import("@/platform/dialog");
   const file = await open({
     multiple: false,
     directory: false,
@@ -35,7 +36,7 @@ async function pickReport(): Promise<string | null> {
     filters: [
       {
         name: "Coverage reports (lcov, JaCoCo XML, Go cover profile)",
-        extensions: ["info", "lcov", "xml", "out", "txt", "cov", "coverprofile"],
+        extensions: ["info", "lcov", "xml", "out", "txt", "cov", "coverprofile", "json"],
       },
       { name: "All files", extensions: ["*"] },
     ],
@@ -49,12 +50,16 @@ export async function importReport(path?: string): Promise<Suite | null> {
     notifications().notify({ group: "run", level: "warning", title: "Importing coverage needs the desktop app" });
     return null;
   }
+  const project = captureCoverageProject();
+  if (!project) return null;
   const file = path ?? (await pickReport());
-  if (!file) return null;
+  if (!file || !project.isCurrent()) return null;
   try {
     const data = await call(commands.coverageImport(file));
-    const suite = addSuite(basename(file), data, file);
-    rememberImport({ path: file, name: suite.name, importedAt: suite.createdAt });
+    const name = basename(file);
+    const suite = project.isCurrent() ? addSuite(name, data, file) : null;
+    rememberImport(project.root, { path: file, name, importedAt: suite?.createdAt ?? Date.now() });
+    if (!suite) return null;
     try {
       toolWindowService().show("coverage");
     } catch {
@@ -70,6 +75,7 @@ export async function importReport(path?: string): Promise<Suite | null> {
     });
     return suite;
   } catch (e) {
+    if (!project.isCurrent()) return null;
     notifications().notify({
       group: "run",
       level: "error",
@@ -84,10 +90,11 @@ export async function importReport(path?: string): Promise<Suite | null> {
 const useManageDialog = create<{ open: boolean }>(() => ({ open: false }));
 
 export const openManageReports = () => useManageDialog.setState({ open: true });
+export const closeManageReports = () => useManageDialog.setState({ open: false });
 
 export function ManageReportsOverlay() {
   const open = useManageDialog((s) => s.open);
-  return open ? <ManageReportsDialog onClose={() => useManageDialog.setState({ open: false })} /> : null;
+  return open ? <ManageReportsDialog onClose={closeManageReports} /> : null;
 }
 
 function ManageReportsDialog({ onClose }: { onClose: () => void }) {

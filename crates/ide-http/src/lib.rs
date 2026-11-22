@@ -6,6 +6,7 @@
 //! of the backend, with the proxy of System Settings › HTTP Proxy.
 
 pub mod client;
+pub mod curl;
 pub mod env;
 pub mod exec;
 pub mod history;
@@ -42,13 +43,28 @@ pub async fn run_streaming(
     cancel: &CancellationToken,
     on_chunk: &mut (dyn FnMut(&[u8]) + Send),
 ) -> IdeResult<HttpExchange> {
-    let parsed = parse::parse(input.text);
-    let raw = parsed
-        .requests
-        .get(input.index as usize)
-        .ok_or_else(|| IdeError::not_found(format!("no request #{}", input.index + 1)))?;
-    let envs = Environments::load(input.file, input.root)?;
-    let request = exec::prepare(raw, &parsed.variables, &envs, input.env, input.file.and_then(Path::parent))?;
+    let request = prepare(&input)?;
+    send_streaming(request, input.file, cancel, on_chunk).await
+}
+
+/// Sends an already prepared request (one the user approved as shown); `file` is the
+/// request file it came from, for the history.
+pub async fn send(
+    request: PreparedRequest,
+    file: Option<&Path>,
+    cancel: &CancellationToken,
+) -> IdeResult<HttpExchange> {
+    send_streaming(request, file, cancel, &mut |_| {}).await
+}
+
+/// Like [`send`], reporting each response body chunk as it arrives; the caller
+/// times and size-meters the stream so a long response fills the viewer live.
+pub async fn send_streaming(
+    request: PreparedRequest,
+    file: Option<&Path>,
+    cancel: &CancellationToken,
+    on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+) -> IdeResult<HttpExchange> {
     let time_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
@@ -72,12 +88,28 @@ pub async fn run_streaming(
             url: request.url.clone(),
             status: response.as_ref().map(|r| r.status),
             total_ms: response.as_ref().map(|r| r.total_ms),
-            file: input.file.map(IpcPath::from),
+            file: file.map(IpcPath::from),
             error,
         },
         request,
         response,
     })
+}
+
+/// Request `index` of `text` with its variables substituted and includes read.
+pub fn prepare(input: &RunInput<'_>) -> IdeResult<PreparedRequest> {
+    let parsed = parse::parse(input.text);
+    let raw = parsed
+        .requests
+        .get(input.index as usize)
+        .ok_or_else(|| IdeError::not_found(format!("no request #{}", input.index + 1)))?;
+    let envs = Environments::load(input.file, input.root)?;
+    exec::prepare(raw, &parsed.variables, &envs, input.env, input.file.and_then(Path::parent))
+}
+
+/// Convert to cURL and Copy: request `index` of `text`, resolved, as a cURL command.
+pub fn curl(input: &RunInput<'_>) -> IdeResult<String> {
+    prepare(input).map(|r| curl::to_curl(&r))
 }
 
 /// Environment names available to `file`.

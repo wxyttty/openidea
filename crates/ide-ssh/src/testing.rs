@@ -1,6 +1,8 @@
 //! An in-process SSH server for tests (feature `testing`): password `dev` /
-//! `secret`, commands answered by a closure, and SFTP served from a local
-//! folder (remote `/x` is `<root>/x`).
+//! `secret`, commands answered by a closure, SFTP served from a local
+//! folder (remote `/x` is `<root>/x`), and a shell that echoes its input
+//! (`exit` ends it with status 0). `direct-tcpip` channels are forwarded to local TCP
+//! ports, and refused when nothing listens there.
 
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
@@ -41,7 +43,7 @@ struct Sshd {
 impl server::Server for Sshd {
     type Handler = Conn;
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Conn {
-        Conn { root: self.root.clone(), exec: self.exec.clone(), channels: Arc::default() }
+        Conn { root: self.root.clone(), exec: self.exec.clone(), channels: Arc::default(), shells: Default::default() }
     }
 }
 
@@ -49,6 +51,7 @@ struct Conn {
     root: PathBuf,
     exec: ExecFn,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+    shells: std::collections::HashSet<ChannelId>,
 }
 
 impl server::Handler for Conn {
@@ -69,6 +72,27 @@ impl server::Handler for Conn {
         Ok(())
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host: &str,
+        port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Ok(mut upstream) = tokio::net::TcpStream::connect((host, port as u16)).await else {
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+        });
+        Ok(())
+    }
+
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -81,6 +105,61 @@ impl server::Handler for Conn {
         session.exit_status_request(channel, code)?;
         session.eof(channel)?;
         session.close(channel)?;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        cols: u32,
+        rows: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        session.data(channel, format!("pty {cols}x{rows}\r\n").into_bytes())?;
+        Ok(())
+    }
+
+    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+        self.shells.insert(channel);
+        session.channel_success(channel)?;
+        session.data(channel, b"$ ".to_vec())?;
+        Ok(())
+    }
+
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        cols: u32,
+        rows: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.data(channel, format!("resized {cols}x{rows}\r\n").into_bytes())?;
+        Ok(())
+    }
+
+    async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        if !self.shells.contains(&channel) {
+            return Ok(());
+        }
+        session.data(channel, data.to_vec())?;
+        if String::from_utf8_lossy(data).contains("exit") {
+            self.shells.remove(&channel);
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        }
+        Ok(())
+    }
+
+    async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+        self.shells.remove(&channel);
         Ok(())
     }
 
@@ -164,6 +243,7 @@ impl russh_sftp::server::Handler for Sftp {
             .read(pflags.contains(OpenFlags::READ))
             .write(pflags.contains(OpenFlags::WRITE))
             .create(pflags.contains(OpenFlags::CREATE))
+            .create_new(pflags.contains(OpenFlags::EXCLUDE))
             .truncate(pflags.contains(OpenFlags::TRUNCATE))
             .open(path)
             .map_err(code)?;
@@ -213,6 +293,11 @@ impl russh_sftp::server::Handler for Sftp {
     }
 
     async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
+        #[cfg(unix)]
+        if let Some(mode) = attrs.permissions {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(self.local(&path), std::fs::Permissions::from_mode(mode)).map_err(code)?;
+        }
         if let Some(t) = attrs.mtime {
             let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(t.into());
             let f = std::fs::File::options().write(true).open(self.local(&path)).map_err(code)?;
@@ -252,6 +337,12 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         std::fs::remove_dir(self.local(&path)).map_err(code)?;
+        Ok(ok(id))
+    }
+
+    #[cfg(unix)]
+    async fn symlink(&mut self, id: u32, target: String, link: String) -> Result<Status, Self::Error> {
+        std::os::unix::fs::symlink(target, self.local(&link)).map_err(code)?;
         Ok(ok(id))
     }
 

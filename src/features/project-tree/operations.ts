@@ -2,16 +2,25 @@
  * File operations behind the project view's actions: new / rename / delete,
  * internal copy-cut-paste, drag & drop moves and OS file imports.
  */
+import { writeClipboardText } from "@/platform/clipboard";
 import { createElement, Fragment } from "react";
 import { askUsagesDetected, fileUsages, viewUsages } from "@/editor/refactor";
 import { executeAction, getAction } from "@/platform/actions";
+import {
+  canRevealInFileManager,
+  fileManagerName,
+  fileManagerPath,
+  openWithSystemApp,
+  revealInFileManager,
+} from "@/platform/fileManager";
 import { maybeEditorService, notifications } from "@/workbench/contributions";
 import { ask, confirmChecked } from "@/workbench/messages";
 import { osClipboard } from "./clipboard";
-import { runFileRefactoring } from "./fileRefactor";
+import { lastFileRefactoring, nextFileOperation, runFileRefactoring, undoFileRefactoring } from "./fileRefactor";
 import { openFileRefactorDialog, rememberedOptions } from "./FileRefactorDialogs";
-import { projectFs } from "./fs";
-import type { ProjectNode } from "./model";
+import { beginLocalImport, projectFs } from "./fs";
+import { IpcError, isCancelled } from "@/platform/ipc";
+import { MEMBER_PREFIX, type ProjectNode } from "./model";
 import {
   isInside,
   isSameOrInside,
@@ -19,7 +28,6 @@ import {
   nameOf,
   packageSegments,
   parentOf,
-  relativeTo,
   uniqueName,
   validateName,
   type PackageKind,
@@ -37,17 +45,18 @@ import {
   startEditing,
   useProjectTree,
 } from "./store";
-import { tx } from "@/platform/i18n";
+import { tx, txPart } from "@/platform/i18n";
+import { hostOs, isRemoteWindow } from "@/platform/remote";
+import { usePlatform } from "@/platform/platformInfo";
+import { pathToCopy, type PathKind } from "@/platform/copyPath";
+import { projectFolder, useProject } from "@/platform/project";
+export type { PathKind } from "@/platform/copyPath";
 
 /** Nodes that may be renamed, moved or deleted (not roots, groups or library sources). */
 const mutable = (n: ProjectNode) => !n.root && !n.placeholder && !n.readOnly;
 
 const get = () => useProjectTree.getState();
-
-const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-const isWindows = /Win/i.test(ua);
-/** macOS and Windows file systems are case-insensitive by default. */
-const caseInsensitive = /Mac|Win/i.test(ua);
+const caseInsensitiveOs = (os: string) => os === "windows" || os === "macos";
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -82,12 +91,27 @@ export function leadNode(): ProjectNode | null {
 
 /** Selected paths without entries nested in other selected folders. */
 export function topLevelPaths(nodes: ProjectNode[] = selectedNodes()): string[] {
-  const paths = nodes.map((n) => n.path);
+  const paths = assetPaths(nodes.map((n) => n.path));
   return paths.filter((p) => !paths.some((q) => q !== p && isInside(p, q)));
+}
+
+/** A visible sidecar is already included by the backend asset operation. */
+function assetPaths(paths: string[]): string[] {
+  const { root, unity } = get();
+  if (!root || !unity) return paths;
+  return paths.filter(
+    (p) => !(isInside(p, joinPath(root, "Assets")) && p.endsWith(".meta") && paths.includes(p.slice(0, -5))),
+  );
+}
+
+function isUnityAssetFolder(path: string): boolean {
+  const { root, unity } = get();
+  return !!(root && unity && isSameOrInside(path, joinPath(root, "Assets")));
 }
 
 /** Folder that receives new / pasted items: the selected folder or the selected file's parent. */
 export function targetFolder(node: ProjectNode | null = leadNode()): string | null {
+  if (!node && get().lead?.startsWith(MEMBER_PREFIX)) return null;
   const { root } = get();
   if (!root) return null;
   if (!node) return get().members?.[0] ?? (get().members ? null : root);
@@ -109,14 +133,22 @@ function expandFolder(path: string) {
 // ---------------------------------------------------------------------------
 // Open
 
-export async function openFile(path: string, opts: { preview?: boolean; focus?: boolean } = {}) {
+export async function openFile(
+  path: string,
+  opts: { preview?: boolean; focus?: boolean; external?: boolean; side?: boolean } = {},
+) {
   const editor = maybeEditorService();
   if (!editor) {
     notifications().notify({ level: "warning", title: "No editor available", body: path, key: "project.noEditor" });
     return;
   }
   try {
-    await editor.openFile(path, { preview: opts.preview, focus: opts.focus ?? true });
+    await editor.openFile(path, {
+      preview: opts.preview,
+      focus: opts.focus ?? true,
+      external: opts.external,
+      ...(opts.side && { side: true }),
+    });
   } catch (e) {
     fail(`Cannot open ${nameOf(path)}`, e);
   }
@@ -124,6 +156,16 @@ export async function openFile(path: string, opts: { preview?: boolean; focus?: 
 
 export function openSelection() {
   for (const n of selectedNodes()) if (!n.dir) void openFile(n.path);
+}
+
+/** Files among the selected nodes, for actions that open them. */
+export function selectedFiles(): ProjectNode[] {
+  return selectedNodes().filter((n) => !n.dir && !n.placeholder && !n.member);
+}
+
+/** Open in Right Split (⇧Enter): the selected files in the pane right of the current editor. */
+export async function openSelectionInRightSplit(nodes = selectedFiles()) {
+  for (const [i, n] of nodes.entries()) await openFile(n.path, { side: true, focus: i === nodes.length - 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +261,9 @@ export function cancelEditing() {
 export function checkEditingName(name: string) {
   const { editing } = get();
   if (!editing) return { error: null };
+  const os = hostOs();
+  const isWindows = os === "windows";
+  const caseInsensitive = caseInsensitiveOs(os);
   if (editing.kind === "new" && editing.pkg) {
     const { segments, error } = packageSegments(name, editing.pkg);
     if (!segments) return { error };
@@ -263,7 +308,7 @@ export async function commitEditing(name: string): Promise<boolean> {
           // An existing intermediate package keeps its own `__init__.py`.
           await fs.createFile(joinPath(dir, "__init__.py")).catch(() => {});
     } catch (e) {
-      fail(editing.nodeKind === "file" ? "Cannot create file" : "Cannot create folder", e);
+      fail(editing.nodeKind === "file" ? tx("Cannot create file") : tx("Cannot create folder"), e);
       return true;
     }
     await refreshAfterCreate(editing.parent, path);
@@ -291,8 +336,14 @@ async function refreshAfterCreate(parent: string, path: string) {
 // ---------------------------------------------------------------------------
 // Delete
 
-function describe(paths: string[]): string {
-  return paths.length === 1 ? `'${nameOf(paths[0]!)}'` : `${paths.length} items`;
+/** The Delete dialog's question, e.g. "Delete 'src' and its contents?". */
+function deleteQuestion(paths: string[], folders: boolean): string {
+  if (paths.length === 1) {
+    const name = nameOf(paths[0]!);
+    return folders ? tx`Delete '${name}' and its contents?` : tx`Delete '${name}'?`;
+  }
+  const count = paths.length;
+  return folders ? tx`Delete ${count} items (including folder contents)?` : tx`Delete ${count} items?`;
 }
 
 /** Visible rows in display order (roots, then children of expanded folders). */
@@ -433,14 +484,15 @@ export async function deleteSelection(nodes: ProjectNode[] = selectedNodes()) {
   const answer = await confirmChecked({
     title: "Delete",
     ok: "Delete",
+    presentation: searchable ? "form" : undefined,
     checkbox: searchable ? "Safe delete (with usage search)" : undefined,
     checked: searchable && safeDeleteEnabled(),
     message: createElement(
       Fragment,
       null,
-      `Delete ${describe(paths)}${folders ? (paths.length === 1 ? " and its contents" : " (including folder contents)") : ""}?`,
+      deleteQuestion(paths, folders > 0),
       createElement("br"),
-      "Items are moved to the Trash.",
+      tx("Items are moved to the Trash."),
     ),
   });
   if (!answer) return;
@@ -456,18 +508,70 @@ export async function deleteSelection(nodes: ProjectNode[] = selectedNodes()) {
   const fs = projectFs(root);
   const parents = new Set<string>();
   const errors: string[] = [];
+  const deleted: NonNullable<typeof lastDelete>["items"] = [];
   for (const p of paths) {
     try {
-      await fs.delete(p);
+      const restore = await fs.delete(p);
       parents.add(parentOf(p));
+      deleted.push({ path: p, restore });
     } catch (e) {
       errors.push(`${nameOf(p)}: ${errorMessage(e)}`);
     }
   }
+  if (deleted.length && get().root === root) lastDelete = { root, items: deleted, seq: nextFileOperation() };
   if (errors.length)
     notifications().notify({ level: "error", title: "Some items could not be deleted", body: errors.join("\n") });
   await Promise.all([...parents].map((d) => loadDir(d, true)));
   if (next) revealPath(next, refocus);
+}
+
+/** The last Delete in the Project view and the exact snapshots from that operation. */
+let lastDelete: { root: string; items: Array<{ path: string; restore: () => Promise<string[]> }>; seq: number } | null =
+  null;
+
+/** Undo in the Project view: reverts the latest delete or move / rename; false when there is none. */
+export function undoLastFileOperation(): boolean {
+  const move = lastFileRefactoring();
+  if (lastDelete && lastDelete.root === get().root && (!move || lastDelete.seq > move.seq)) {
+    void undoDelete();
+    return true;
+  }
+  if (!move) return false;
+  void undoFileRefactoring();
+  return true;
+}
+
+/** Restores only entries captured before this Delete. */
+export async function undoDelete(): Promise<boolean> {
+  const op = lastDelete;
+  if (!op || get().root !== op.root) return false;
+  lastDelete = null;
+  const failed = new Set<string>();
+  const parents = new Set<string>();
+  let restored: string | undefined;
+  for (const { path, restore } of op.items) {
+    if (get().root !== op.root) break;
+    try {
+      const skipped = await restore();
+      for (const skippedPath of skipped) failed.add(skippedPath);
+      if (!restored && !skipped.includes(path)) restored = path;
+    } catch {
+      failed.add(path);
+    }
+    parents.add(parentOf(path));
+  }
+  if (get().root !== op.root) return false;
+  await Promise.all([...parents].map((d) => loadDir(d, true)));
+  if (restored) revealPath(restored, true);
+  const names = [...failed].join("\n");
+  if (failed.size)
+    notifications().notify({
+      level: "warning",
+      title: "Some items could not be restored",
+      body: tx`Check the system Trash for these items. ${names}`,
+      key: "project.undoDelete",
+    });
+  return !failed.size;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,35 +580,76 @@ export async function deleteSelection(nodes: ProjectNode[] = selectedNodes()) {
 export function copySelection(cut: boolean) {
   const paths = topLevelPaths(selectedNodes().filter((n) => (cut ? mutable(n) : !n.root && !n.group)));
   if (!paths.length) return;
-  setClipboard({ paths, cut });
-  // Hand the files to the OS too, so Explorer can paste them (as IDEA does).
-  void osClipboard().setFiles(paths);
+  // Remote paths are useful as text, but do not name files on the client.
+  const remote = isRemoteWindow();
+  const osWrite = (async () => {
+    if (!remote) return osClipboard().setFiles(paths);
+    await writeClipboardText(paths.join("\n"));
+    return true;
+  })().catch(() => false);
+  setClipboard({ paths, cut, remote, osWrite });
 }
 
-/** Files on the OS clipboard, cached: `canPaste` runs while a menu renders. */
+/** Files or an image on the OS clipboard, cached: `canPaste` runs while a menu renders. */
 let osHasFiles = false;
+let osHasImage = false;
 
 /** Keeps Paste enabled for what Explorer copied; called when the window gains focus. */
 export async function refreshOsClipboard() {
-  osHasFiles = await osClipboard().hasFiles();
+  try {
+    await readOsClipboard();
+  } catch {
+    // A busy clipboard is not evidence that the user's copy has changed.
+  }
+}
+
+async function readOsClipboard(): Promise<string[] | null> {
+  const { clipboard } = get();
+  const handedOff = await clipboard?.osWrite;
+  const [external, image] = await Promise.all([osClipboard().files(), osClipboard().hasImage()]);
+  // A newer Copy/Cut owns the state if this read (or its hand-off) was delayed.
+  if (get().clipboard !== clipboard) return null;
+  osHasFiles = external.length > 0;
+  osHasImage = image;
+  // Our remote text write removes file URLs, so any files were copied later.
+  // A failed write leaves ownership uncertain; retain the remote copy then.
+  if (handedOff && (clipboard?.remote ? external.length > 0 : !sameFiles(external, clipboard?.paths)))
+    setClipboard(null);
+  return external;
 }
 
 export function canPaste(): boolean {
-  return !!get().clipboard?.paths.length || osHasFiles;
+  return !!get().clipboard?.paths.length || osHasFiles || osHasImage;
 }
 
 /**
  * Paste: cut items go through the Move dialog, copied ones through the Copy
- * dialog (IDEA). Files copied in Explorer paste as copies.
+ * dialog (IDEA). Files copied in Explorer paste as copies; an image (a
+ * screenshot) is saved as `img.png`.
  */
 export async function paste(target = targetFolder()) {
-  const { clipboard } = get();
   if (!target || isReadOnlyPath(target)) return;
-  const external = await osClipboard().files();
+  let external: string[] = [];
+  try {
+    const files = await readOsClipboard();
+    if (files === null) return;
+    external = files;
+  } catch (e) {
+    if (!get().clipboard?.paths.length) {
+      fail(tx("Cannot access the clipboard"), e);
+      return;
+    }
+  }
+  const { clipboard } = get();
   // The last copy is the one the user expects to paste, so another app's files
   // win over ours — unless they are the copy we handed to the OS ourselves.
-  if (external.length && !sameFiles(external, clipboard?.paths)) return pasteFromOsClipboard(external, target);
-  if (!clipboard?.paths.length) return;
+  if (!clipboard?.remote && external.length && !sameFiles(external, clipboard?.paths))
+    return pasteFromOsClipboard(external, target);
+  if (!clipboard?.paths.length) {
+    if (await pasteImage(target)) return;
+    notifications().notify({ level: "info", title: "No files on the clipboard" });
+    return;
+  }
   const isDir = (p: string) =>
     get().listings.has(p) || currentModel().byKey.get(currentModel().keyOfPath.get(p) ?? p)?.dir === true;
   const single = clipboard.paths.length === 1 && isDir(clipboard.paths[0]!);
@@ -516,15 +661,49 @@ export async function paste(target = targetFolder()) {
   });
 }
 
+/**
+ * Saves the clipboard's image in `target` as `img.png`, or `img_1.png`, `img_2.png`
+ * … when taken, and selects it. False when the clipboard holds no image.
+ */
+async function pasteImage(target: string): Promise<boolean> {
+  let png: Uint8Array | null;
+  try {
+    png = await osClipboard().image();
+  } catch (e) {
+    fail(tx("Cannot access the clipboard"), e);
+    return true;
+  }
+  if (!png) return false;
+  await loadDir(target);
+  const taken = new Set((get().listings.get(target) ?? []).map((e) => e.name));
+  for (let i = 0; ; i++) {
+    const name = i ? `img_${i}.png` : "img.png";
+    if (taken.has(name)) continue;
+    const path = joinPath(target, name);
+    try {
+      await projectFs(get().root ?? target).createFileBytes(path, png);
+    } catch (e) {
+      // Created since the listing was read: take the next name.
+      if (e instanceof IpcError && e.kind === "alreadyExists") continue;
+      fail(tx`Cannot paste the image into ${name}`, e);
+      return true;
+    }
+    await loadDir(target, true);
+    revealPath(path, true);
+    return true;
+  }
+}
+
 /** Pasting from Explorer copies, whatever the source: never a move or a refactoring. */
 async function pasteFromOsClipboard(paths: string[], target: string) {
   osHasFiles = true;
-  await transfer(paths, target, "copy");
+  await transfer(paths, target, "copy", undefined, "local");
 }
 
 /** The same files, as the clipboard keeps them (`/`-separated, any order). */
 function sameFiles(files: string[], paths: string[] | undefined): boolean {
   if (!paths || files.length !== paths.length) return false;
+  const caseInsensitive = caseInsensitiveOs(usePlatform.getState().os);
   const key = (list: string[]) =>
     list
       .map((p) => (caseInsensitive ? p.toLowerCase() : p))
@@ -559,35 +738,54 @@ export async function transfer(
   target: string,
   mode: "move" | "copy",
   name?: string,
+  source: "project" | "local" = "project",
 ): Promise<string | boolean> {
+  paths = assetPaths(paths);
   if (mode === "move") return moveInto(paths, target);
   const { root } = get();
   if (!root) return false;
   const fs = projectFs(root);
   await loadDir(target);
+  const caseInsensitive = caseInsensitiveOs(hostOs());
   const taken = new Set(siblingsOf(target).map((n) => (caseInsensitive ? n.toLowerCase() : n)));
-  const isTaken = (n: string) => taken.has(caseInsensitive ? n.toLowerCase() : n);
+  const hasName = (n: string) => taken.has(caseInsensitive ? n.toLowerCase() : n);
+  const isTaken = (n: string) => hasName(n) || (isUnityAssetFolder(target) && hasName(`${n}.meta`));
   const touched = new Set<string>([target]);
   const errors: string[] = [];
   let first: string | null = null;
   const newName = name;
-  for (const src of paths) {
-    const name = nameOf(src);
-    if (isSameOrInside(target, src) && target !== parentOf(src) && src !== target) {
-      errors.push(`${name}: cannot copy a folder into itself`);
-      continue;
+  const upload = source === "local" && isRemoteWindow() ? beginLocalImport() : undefined;
+  try {
+    for (const src of paths) {
+      if (upload?.cancelled) break;
+      const name = nameOf(src);
+      if (
+        !(source === "local" && isRemoteWindow()) &&
+        isSameOrInside(target, src) &&
+        target !== parentOf(src) &&
+        src !== target
+      ) {
+        errors.push(`${name}: cannot copy a folder into itself`);
+        continue;
+      }
+      const srcIsDir =
+        get().listings.has(src) || currentModel().byKey.get(currentModel().keyOfPath.get(src) ?? src)?.dir === true;
+      const finalName = paths.length === 1 && newName ? newName : uniqueName(name, isTaken, srcIsDir);
+      const to = joinPath(target, finalName);
+      try {
+        if (source === "local") {
+          const skipped = await fs.importLocal(src, to, upload);
+          errors.push(...skipped);
+        } else await fs.copy(src, to);
+        taken.add(caseInsensitive ? finalName.toLowerCase() : finalName);
+        first ??= to;
+      } catch (e) {
+        if (isCancelled(e)) break;
+        errors.push(`${name}: ${errorMessage(e)}`);
+      }
     }
-    const srcIsDir =
-      get().listings.has(src) || currentModel().byKey.get(currentModel().keyOfPath.get(src) ?? src)?.dir === true;
-    const finalName = paths.length === 1 && newName ? newName : uniqueName(name, isTaken, srcIsDir);
-    const to = joinPath(target, finalName);
-    try {
-      await fs.copy(src, to);
-      taken.add(caseInsensitive ? finalName.toLowerCase() : finalName);
-      first ??= to;
-    } catch (e) {
-      errors.push(`${name}: ${errorMessage(e)}`);
-    }
+  } finally {
+    upload?.finish();
   }
   if (errors.length)
     notifications().notify({ level: "error", title: "Some items could not be copied", body: errors.join("\n") });
@@ -604,7 +802,9 @@ export async function transfer(
  * the options last used in the Move dialog). Refuses to overwrite.
  */
 async function moveInto(paths: string[], target: string): Promise<boolean> {
+  paths = assetPaths(paths);
   await loadDir(target);
+  const caseInsensitive = caseInsensitiveOs(hostOs());
   const taken = new Set(siblingsOf(target).map((n) => (caseInsensitive ? n.toLowerCase() : n)));
   const errors: string[] = [];
   const moves: { from: string; to: string }[] = [];
@@ -650,42 +850,67 @@ export async function dropPaths(paths: string[], target: string, copy: boolean) 
 export async function importExternal(paths: string[], target: string) {
   const { root } = get();
   if (!root || !paths.length || isReadOnlyPath(target)) return;
+  if (isRemoteWindow()) return void (await transfer(paths, target, "copy", undefined, "local"));
   const inside = paths.filter((p) => isSameOrInside(p, root));
   const outside = paths.filter((p) => !isSameOrInside(p, root));
   if (inside.length) await dropPaths(inside, target, false);
-  if (outside.length) await transfer(outside, target, "copy");
+  if (outside.length) await transfer(outside, target, "copy", undefined, "local");
 }
 
 // ---------------------------------------------------------------------------
 // Paths / external
 
-export type PathKind = "absolute" | "relative" | "name";
-
 export function pathsFor(kind: PathKind, nodes: ProjectNode[] = selectedNodes()): string[] {
   const { root } = get();
-  return nodes.map((n) =>
-    kind === "absolute" ? n.path : kind === "name" ? nameOf(n.path) : relativeTo(root ?? "", n.path) || ".",
-  );
+  const project = useProject.getState().project;
+  return nodes
+    .map((n) => pathToCopy(kind, n.path, project ? (projectFolder(project, n.path)?.root ?? null) : root))
+    .filter((p): p is string => p !== null);
 }
 
 export async function copyPaths(kind: PathKind, nodes: ProjectNode[] = selectedNodes()) {
   const text = pathsFor(kind, nodes).join("\n");
   if (!text) return;
   try {
-    await navigator.clipboard.writeText(text);
+    await writeClipboardText(text);
+    void executeAction("editor.showHint", { text: tx`Copied ${text}` });
   } catch (e) {
-    fail("Cannot access the clipboard", e);
+    fail(tx("Cannot access the clipboard"), e);
   }
 }
 
+/**
+ * The path the local OS's file manager can open: in a WSL session the node
+ * paths are inside the distro (`/home/…`), which `revealItemInDir` reads as
+ * local paths — translate them to `\\wsl.localhost\<distro>\…` UNC shares.
+ */
+export function revealablePath(path: string): string {
+  return fileManagerPath(path);
+}
+
+/** For a reveal invoked where the menus hide it (shortcut, Search Everywhere) in an SSH or dev-container window. */
+export function notifyRevealUnavailable() {
+  const fileManager = txPart(fileManagerName());
+  notifications().notify({ level: "warning", title: tx`Remote project files cannot be shown in ${fileManager}` });
+}
+
 export async function revealInFinder(nodes: ProjectNode[] = selectedNodes()) {
-  const paths = nodes.map((n) => n.path);
-  if (!paths.length) return;
+  if (!canRevealInFileManager()) return notifyRevealUnavailable();
   try {
-    const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
-    await revealItemInDir(paths.length === 1 ? paths[0]! : paths);
+    await revealInFileManager(nodes.map((n) => n.path));
   } catch (e) {
-    fail("Cannot reveal in Finder", e);
+    const fileManager = txPart(fileManagerName());
+    fail(tx`Cannot reveal in ${fileManager}`, e);
+  }
+}
+
+/** Opens each selected file with the application the OS associates with it. */
+export async function openWithAssociatedApp(nodes: ProjectNode[] = selectedNodes()) {
+  for (const file of nodes.filter((n) => !n.dir && !n.placeholder)) {
+    if (!(await openWithSystemApp(file.path))) {
+      notifications().notify({ level: "error", title: tx`Cannot open ${nameOf(file.path)} with its application` });
+      return;
+    }
   }
 }
 
@@ -698,6 +923,20 @@ export function delegate(id: string, arg: unknown): boolean {
   if (!getAction(id)) return false;
   void executeAction(id, arg);
   return true;
+}
+
+/**
+ * Reformat Code (⌥⌘L) for project view nodes: a single file is reformatted at once,
+ * a directory or several nodes open the Reformat Code dialog. False when nothing applies.
+ */
+export function reformatNodes(nodes: readonly ProjectNode[]): boolean {
+  const targets = nodes.filter((n) => !n.group && !n.readOnly);
+  if (!targets.length) return false;
+  if (targets.length === 1 && !targets[0]!.dir) return delegate("code.reformatFile", { path: targets[0]!.path });
+  return delegate("code.reformatFiles", {
+    files: targets.filter((n) => !n.dir).map((n) => n.path),
+    directories: targets.filter((n) => n.dir).map((n) => n.path),
+  });
 }
 
 /** Argument for VCS actions: one path or several. */

@@ -1,10 +1,10 @@
 /** Debug tool window: toolbar, Threads & Variables (frames + variables), Console. */
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { writeClipboardText } from "@/platform/clipboard";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import clsx from "clsx";
-import { executeAction, getAction } from "@/platform/actions";
-import { evaluateWhen, useContextKeys } from "@/platform/context";
+import { executeAction } from "@/platform/actions";
 import { basename, useProject } from "@/platform/project";
-import { call, commands, type Scope, type Variable } from "@/platform/ipc";
+import { call, commands, isTauri, type Scope, type Variable } from "@/platform/ipc";
 import {
   EmptyState,
   Icon,
@@ -16,37 +16,50 @@ import {
   SplitHandle,
   SplitPanel,
   Tabs,
+  Toolbar,
   showContextMenu,
   type MenuItem,
   type TabItem,
   T,
 } from "@/ui";
+import type { SelectOption } from "@/ui/Select";
+import { revealVertically } from "@/ui/Tabs";
 import { setMuted, useBreakpoints } from "../breakpoints/store";
 import { frameLabel, groupFrames } from "../frames";
 import { blurDebugView, focusDebugView } from "./focusedView";
+import { useActionEnabled } from "./useActionEnabled";
 import {
   addWatch,
+  closeSessionTab,
   evaluate,
+  isLive,
+  isThreadSuspended,
   selectFrame,
   selectSession,
   selectThread,
   revealFrame,
+  rootOf,
   sessionSupports,
   useDebug,
   type DebugSession,
 } from "../state";
+import { remoteWaitingNote } from "../remote";
+import { sessionTabs } from "./sessionTabs";
+import { debugTabMenu } from "../tabActions";
+import { stopNote } from "../js/eventBreakpoints";
+import { NetworkView } from "../js/NetworkView";
+import { liveWatchesApply, useLiveWatches } from "../js/liveWatches";
+import { pageProfileItems, useJsProfile } from "../js/profile";
+import { MemoryView } from "../memory/MemoryView";
 import { DebugConsole } from "./DebugConsole";
 import { VariablesView, type VarRoot } from "./VariablesView";
+import { useExpressionCompletion } from "./ExpressionCompletion";
 import { sortVariables } from "../values";
 import { workflowSettings } from "@/platform/workflowSettings";
+import { useToolWindowShown } from "@/workbench/contributions";
+import { useToolWindowLayout } from "@/workbench/toolwindows/store";
 import styles from "./DebugToolWindow.module.css";
-import { tx } from "@/platform/i18n";
-
-function useActionEnabled(id: string): boolean {
-  const ctx = useContextKeys();
-  const a = getAction(id);
-  return !!a && evaluateWhen(a.when, ctx);
-}
+import { tx, useTx } from "@/platform/i18n";
 
 function ToolButton({ action, icon, tone }: { action: string; icon: string; tone?: "danger" }) {
   const enabled = useActionEnabled(action);
@@ -81,6 +94,12 @@ const MORE_ITEMS: MenuItem[] = [
 function MoreActions() {
   const ref = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
+  const page = useDebug((s) => {
+    const a = s.active == null ? undefined : s.sessions[s.active];
+    return a && isLive(a) && a.caps?.jsPage ? a.id : null;
+  });
+  const recording = useJsProfile((s) => page != null && !!s.recording[page]);
+  const items = useMemo(() => [...MORE_ITEMS, ...pageProfileItems(page != null, recording)], [page, recording]);
   return (
     <>
       <IconButton
@@ -94,12 +113,23 @@ function MoreActions() {
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       />
-      <Menu open={open} anchor={ref} items={MORE_ITEMS} placement="bottom-start" onClose={() => setOpen(false)} />
+      <Menu open={open} anchor={ref} items={items} placement="bottom-start" onClose={() => setOpen(false)} />
     </>
   );
 }
 
-type Tab = "variables" | "console";
+type Tab = "variables" | "console" | "memory" | "network";
+
+/** The view the user last picked; the tool window opens on it again (Console until one is picked). */
+let chosenTab: Tab = "console";
+
+/** Threads & Variables › Focus On Breakpoint: whether a breakpoint hit selects that tab. */
+async function setVariablesOnBreakpoint(on: boolean) {
+  if (!isTauri()) return;
+  useProject.setState({
+    settings: await call(commands.settingsSet("global", "debugger.variablesOnBreakpoint", JSON.stringify(on))),
+  });
+}
 
 function statusText(s: DebugSession): string {
   if (s.status === "terminated") return s.exitCode != null ? `Finished · exit code ${s.exitCode}` : "Finished";
@@ -113,42 +143,101 @@ export function DebugTabs() {
   const active = useDebug((s) => s.active);
   const list = Object.values(sessions);
   if (!list.length) return null;
-  const items: TabItem[] = list.map((s) => ({
+  const tabs = sessionTabs(list);
+  const ownerOf = (id: string) => tabs.find((t) => t.session.id === +id)?.owner ?? +id;
+  const items: TabItem[] = tabs.map(({ session: s, child, owner }) => ({
     id: String(s.id),
-    label: s.parent != null ? tx`${s.name} (child)` : s.name,
+    label: child ? tx`${s.name} (child)` : s.name,
     text: s.name,
     icon: "debug",
     italic: s.status === "terminated",
+    closable: true,
+    pinned: !child && !!sessions[owner]?.pinned,
     tooltip: statusText(s),
   }));
+  // A browser launch's own session has no tab: its page's tab stands for it.
+  const shown = tabs.find((t) => t.session.id === active) ?? tabs.find((t) => t.owner === active);
   return (
     <Tabs
       variant="compact"
       className={styles.sessionTabs}
       aria-label="Debug sessions"
       items={items}
-      activeId={active != null ? String(active) : null}
+      activeId={shown ? String(shown.session.id) : null}
       onSelect={(id) => selectSession(+id)}
+      onClose={(id) => void closeSessionTab(ownerOf(id))}
+      onTogglePin={(id) => void executeAction("debug.pinTab", ownerOf(id))}
+      onContextMenu={(id, e) => {
+        e.preventDefault();
+        showContextMenu(e, debugTabMenu(ownerOf(id)), { owner: e.currentTarget });
+      }}
       panelIdPrefix="openidea-debug"
     />
   );
 }
 
+/**
+ * Services › a configuration being debugged: the same debugger as the Debug tool window, for
+ * that session (#4773). `console` replaces the Console tab, e.g. with the console of the run the
+ * debugger is attached to.
+ */
+export function DebugServiceView({ sessionId, console: consolePane }: { sessionId: number; console?: ReactNode }) {
+  const shown = useDebug((s) => {
+    const active = s.active != null ? s.sessions[s.active] : undefined;
+    return !!active && rootOf(active).id === sessionId;
+  });
+  useEffect(() => {
+    if (useDebug.getState().sessions[sessionId]) selectSession(sessionId);
+  }, [sessionId]);
+  // The toolbar acts on the active session: using this view makes its session the active one again.
+  const reselect = () => {
+    if (!shown && useDebug.getState().sessions[sessionId]) selectSession(sessionId);
+  };
+  return (
+    <div className={styles.serviceView} onPointerDownCapture={reselect} onFocusCapture={reselect}>
+      {shown && <DebugView consolePane={consolePane} />}
+    </div>
+  );
+}
+
 export function DebugToolWindow() {
+  const sideDocked = useToolWindowLayout((s) => (s.placements.debug?.anchor ?? "bottom") !== "bottom");
+  return <DebugView sideDocked={sideDocked} />;
+}
+
+function DebugView({ consolePane, sideDocked = false }: { consolePane?: ReactNode; sideDocked?: boolean }) {
+  const tx = useTx();
   const active = useDebug((s) => (s.active != null ? s.sessions[s.active] : undefined));
   const muted = useBreakpoints((s) => s.muted);
   const [view, setView] = useState<{
     session: number | undefined;
     status: DebugSession["status"] | undefined;
     tab: Tab;
-  }>({ session: undefined, status: undefined, tab: "variables" });
+  }>({ session: undefined, status: undefined, tab: chosenTab });
   if (active && (view.session !== active.startedAt || view.status !== active.status))
     setView({
       session: active.startedAt,
       status: active.status,
-      tab: active.status === "starting" ? "console" : active.status === "paused" ? "variables" : view.tab,
+      // A breakpoint or exception brings Threads & Variables to the front unless its Focus On Breakpoint
+      // is off; finishing a step keeps the tab the user is on (e.g. Console, to watch the output while
+      // stepping), and so does Memory.
+      tab:
+        active.status === "starting"
+          ? "console"
+          : active.status === "paused" &&
+              view.tab !== "memory" &&
+              active.stopReason !== "step" &&
+              workflowSettings().debugger.variablesOnBreakpoint
+            ? "variables"
+            : view.tab,
     });
-  const tab = view.tab;
+  // A JVM session shows the Memory tab from the start, before the debugger has reported what it supports.
+  const memoryPending = !!active && !active.caps && JVM_ADAPTERS.has(rootOf(active).adapter);
+  const hasMemory = !!active && (sessionSupports("jvmMemory", active) || memoryPending);
+  const hasNetwork = !!active && sessionSupports("jsPage", active);
+  // The selected session may be one without the Memory or the Network tab.
+  const tab: Tab =
+    (view.tab === "memory" && !hasMemory) || (view.tab === "network" && !hasNetwork) ? "variables" : view.tab;
 
   if (!active) {
     return (
@@ -163,12 +252,50 @@ export function DebugToolWindow() {
 
   return (
     <div className={styles.root}>
-      <div className={styles.toolbar} role="toolbar" aria-label={tx("Debugger actions")}>
+      <div className={styles.toolbar}>
+        <Toolbar className={styles.actions} aria-label="Debugger actions">
+          <ToolButton action="debug.rerun" icon="rerun" />
+          <ToolButton action="debug.stop" icon="stop" tone="danger" />
+          <span className={styles.sep} aria-hidden />
+          <ToolButton action="debug.resume" icon="resume" />
+          <ToolButton action="debug.pause" icon="pause" />
+          <ToolButton action="debug.stepOver" icon="step-over" />
+          <ToolButton action="debug.stepInto" icon="step-into" />
+          <ToolButton action="debug.stepOut" icon="step-out" />
+          <span className={styles.sep} aria-hidden />
+          {rootOf(active).adapter === "dart" && (
+            <>
+              <ToolButton action="debug.hotReload" icon="hot-reload" />
+              <ToolButton action="debug.hotRestart" icon="refresh" />
+              {rootOf(active).vmServiceUri && <ToolButton action="debug.openDevTools" icon="external-link" />}
+              <span className={styles.sep} aria-hidden />
+            </>
+          )}
+          <IconButton
+            icon="view-breakpoints"
+            action="debug.viewBreakpoints"
+            size="small"
+            iconSize={16}
+            className={styles.tool}
+          />
+          <IconButton
+            icon="mute-breakpoint"
+            title={muted ? "Unmute Breakpoints" : "Mute Breakpoints"}
+            pressed={muted}
+            size="small"
+            iconSize={16}
+            className={styles.tool}
+            onClick={() => setMuted(!muted)}
+          />
+          <MoreActions />
+        </Toolbar>
         <div role="tablist" aria-label={tx("Debug views")} className={styles.tabs}>
           {(
             [
               ["variables", "Threads & Variables"],
               ["console", "Console"],
+              ...(hasMemory ? [["memory", "Memory"] as const] : []),
+              ...(hasNetwork ? [["network", "Network"] as const] : []),
             ] as const
           ).map(([id, label]) => (
             <button
@@ -179,75 +306,127 @@ export function DebugToolWindow() {
               aria-selected={tab === id}
               aria-controls={`debug-panel-${id}`}
               className={clsx(styles.tab, tab === id && styles.tabActive)}
-              onClick={() => setView({ session: active.startedAt, status: active.status, tab: id })}
+              onClick={() => {
+                chosenTab = id;
+                setView({ session: active.startedAt, status: active.status, tab: id });
+              }}
+              onContextMenu={
+                id === "variables"
+                  ? (e) => {
+                      e.preventDefault();
+                      showContextMenu(e, [
+                        {
+                          label: "Focus On Breakpoint",
+                          checked: workflowSettings().debugger.variablesOnBreakpoint,
+                          run: () => void setVariablesOnBreakpoint(!workflowSettings().debugger.variablesOnBreakpoint),
+                        },
+                      ]);
+                    }
+                  : undefined
+              }
             >
-              {label}
+              {tx(label)}
             </button>
           ))}
         </div>
-        {/* IDEA's XDebugger.ToolWindow.TopToolbar3 (+ its "More" group). */}
-        <span className={styles.sep} aria-hidden />
-        <ToolButton action="debug.rerun" icon="rerun" />
-        <ToolButton action="debug.stop" icon="stop" tone="danger" />
-        <span className={styles.sep} aria-hidden />
-        <ToolButton action="debug.resume" icon="resume" />
-        <ToolButton action="debug.pause" icon="pause" />
-        <ToolButton action="debug.stepOver" icon="step-over" />
-        <ToolButton action="debug.stepInto" icon="step-into" />
-        <ToolButton action="debug.stepOut" icon="step-out" />
-        <span className={styles.sep} aria-hidden />
-        <IconButton
-          icon="view-breakpoints"
-          action="debug.viewBreakpoints"
-          size="small"
-          iconSize={16}
-          className={styles.tool}
-        />
-        <IconButton
-          icon="mute-breakpoint"
-          title={muted ? "Unmute Breakpoints" : "Mute Breakpoints"}
-          pressed={muted}
-          size="small"
-          iconSize={16}
-          className={styles.tool}
-          onClick={() => setMuted(!muted)}
-        />
-        <MoreActions />
       </div>
       <div role="tabpanel" id={`debug-panel-${tab}`} aria-labelledby={`debug-tab-${tab}`} className={styles.panel}>
         {tab === "variables" ? (
-          <ThreadsAndVariables session={active} />
+          <ThreadsAndVariables session={active} sideDocked={sideDocked} />
+        ) : tab === "memory" ? (
+          memoryPending ? (
+            <div className={styles.emptyWrap}>
+              <EmptyState title="Memory">
+                <T>The Memory view is available once the program has started.</T>
+              </EmptyState>
+            </div>
+          ) : (
+            <MemoryView key={active.id} session={active} />
+          )
+        ) : tab === "network" ? (
+          <NetworkView key={active.id} session={active.id} />
         ) : (
-          <DebugConsole key={active.id} session={active} />
+          (consolePane ?? <DebugConsole key={active.id} session={active} />)
         )}
       </div>
     </div>
   );
 }
 
+/** Debug adapters whose sessions have the Memory view (`ide-dap`'s `JVM_MEMORY_ADAPTERS`). */
+const JVM_ADAPTERS = new Set(["java-debug", "kotlin-debug-adapter", "kotlin-lsp"]);
+
 // --- threads & frames ----------------------------------------------------------
 
-function ThreadsAndVariables({ session }: { session: DebugSession }) {
+const DEFAULT_THREADS_VARIABLES_LAYOUT = { frames: 34, variables: 66 };
+
+function ThreadsAndVariables({ session, sideDocked }: { session: DebugSession; sideDocked: boolean }) {
   return (
-    <SplitGroup orientation="horizontal" id="debug-threads-variables" className={styles.split}>
-      <SplitPanel id="frames" defaultSize="34%" minSize="160px">
+    <SplitGroup
+      orientation={sideDocked ? "vertical" : "horizontal"}
+      id="debug-threads-variables"
+      storageKey={sideDocked ? "openidea.debug.threadsVariables.vertical" : "openidea.debug.threadsVariables"}
+      defaultLayout={DEFAULT_THREADS_VARIABLES_LAYOUT}
+      className={styles.split}
+    >
+      <SplitPanel
+        id="frames"
+        defaultSize={`${DEFAULT_THREADS_VARIABLES_LAYOUT.frames}%`}
+        minSize={sideDocked ? "25%" : "160px"}
+      >
         <FramesPane session={session} />
       </SplitPanel>
       <SplitHandle />
-      <SplitPanel id="variables" minSize="200px">
+      <SplitPanel id="variables" minSize={sideDocked ? "25%" : "200px"}>
         <VariablesPane session={session} />
       </SplitPanel>
     </SplitGroup>
   );
 }
 
+function ThreadSelector({ session }: { session: DebugSession }) {
+  const tr = useTx();
+  const value = session.selectedThread == null ? null : String(session.selectedThread);
+  const options = session.threads.map<SelectOption>(({ id, name }) => {
+    const option = { value: String(id), label: name, verbatim: true };
+    if (!isLive(session)) return option;
+    if (!isThreadSuspended(session, id)) return { ...option, icon: "thread-running", detail: "Running" };
+    const reason =
+      id === session.stoppedThread ? session.stopReason : session.suspendedThreads?.find((t) => t.id === id)?.reason;
+    return reason === "breakpoint" || reason?.endsWith(" breakpoint")
+      ? { ...option, icon: "thread-breakpoint", detail: "At breakpoint" }
+      : { ...option, icon: "thread-suspended", detail: "Suspended" };
+  });
+  const selected = options.find((option) => option.value === value);
+  const summary = selected?.detail ? `${selected.label} (${tr(selected.detail)})` : selected?.label;
+  return (
+    <div className={styles.threadHeader}>
+      <Select
+        value={value}
+        options={options}
+        onChange={(v) => void selectThread(session.id, Number(v))}
+        aria-label="Thread"
+        aria-description={summary}
+        title={summary}
+        variant="ghost"
+        className={styles.threadSelect}
+      />
+    </div>
+  );
+}
+
 function FramesPane({ session }: { session: DebugSession }) {
   const root = useProject((s) => s.project?.root ?? null);
   const [showAll, setShowAll] = useState(false);
+  const list = useRef<HTMLDivElement>(null);
+  const selectedRow = useRef<HTMLButtonElement>(null);
   const items = useMemo(
     () => groupFrames(session.frames, root, session.selectedFrame, showAll),
     [session.frames, root, session.selectedFrame, showAll],
   );
+  useLayoutEffect(() => {
+    if (list.current && selectedRow.current) revealVertically(list.current, selectedRow.current);
+  }, [items]);
   const paused = session.status === "paused";
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
@@ -261,20 +440,9 @@ function FramesPane({ session }: { session: DebugSession }) {
   };
   return (
     <div className={styles.frames}>
-      {session.threads.length > 0 && (
-        <Select
-          value={session.selectedThread != null ? String(session.selectedThread) : null}
-          options={session.threads.map((t) => ({
-            value: String(t.id),
-            label: t.name,
-            detail: t.id === session.stoppedThread ? "suspended" : undefined,
-          }))}
-          onChange={(v) => void selectThread(session.id, +v)}
-          aria-label="Thread"
-          className={styles.threadSelect}
-        />
-      )}
+      {session.threads.length > 0 && <ThreadSelector session={session} />}
       <div
+        ref={list}
         className={styles.frameList}
         role="listbox"
         aria-label={tx("Frames")}
@@ -292,8 +460,13 @@ function FramesPane({ session }: { session: DebugSession }) {
         onBlur={() => blurDebugView("frames")}
       >
         {!paused && (
-          <div className={styles.note}>{session.status === "terminated" ? tx("Finished") : tx("Running…")}</div>
+          <div className={styles.note}>
+            {session.status === "terminated"
+              ? tx("Finished")
+              : (remoteWaitingNote(rootOf(session).runConfig) ?? tx("Running…"))}
+          </div>
         )}
+        {stopNote(session) && <div className={styles.note}>{stopNote(session)}</div>}
         {items.map((item) =>
           item.kind === "hidden" ? (
             <button
@@ -307,9 +480,11 @@ function FramesPane({ session }: { session: DebugSession }) {
           ) : (
             <button
               key={item.frame.id}
+              ref={item.frame.id === session.selectedFrame ? selectedRow : undefined}
               type="button"
               role="option"
               aria-selected={item.frame.id === session.selectedFrame}
+              title={item.frame.path ? `${frameLabel(item.frame)}, ${basename(item.frame.path)}` : item.frame.name}
               className={clsx(
                 styles.frame,
                 item.frame.id === session.selectedFrame && styles.frameSelected,
@@ -341,7 +516,7 @@ function FramesPane({ session }: { session: DebugSession }) {
                     label: "Copy Stack",
                     icon: "copy",
                     run: () =>
-                      void navigator.clipboard?.writeText(
+                      void writeClipboardText(
                         session.frames
                           .map((f) => `${frameLabel(f)}${f.path ? `, ${basename(f.path)}` : ""}`)
                           .join("\n"),
@@ -351,13 +526,15 @@ function FramesPane({ session }: { session: DebugSession }) {
               }}
             >
               <Icon name="method" size={16} className={styles.frameIcon} />
-              <span className={styles.frameName}>{item.frame.name}</span>
-              {item.frame.path && (
-                <span className={styles.frameFile}>
-                  , {basename(item.frame.path)}
-                  {item.frame.line >= 0 ? `:${item.frame.line + 1}` : ""}
+              <span className={styles.frameText}>
+                <span className={styles.frameLabel}>
+                  <span className={styles.frameName}>{item.frame.name}</span>
+                  {item.frame.path && item.frame.line >= 0 && (
+                    <span className={styles.frameLine}>:{item.frame.line + 1}</span>
+                  )}
                 </span>
-              )}
+                {item.frame.path && <span className={styles.frameFile}>, {basename(item.frame.path)}</span>}
+              </span>
             </button>
           ),
         )}
@@ -377,7 +554,10 @@ interface EvalRow {
 function VariablesPane({ session }: { session: DebugSession }) {
   const watches = useDebug((s) => s.watches);
   const stopSeq = useDebug((s) => s.stopSeq);
+  const variablesEpoch = useDebug((s) => s.variablesEpoch);
   const [expression, setExpression] = useState("");
+  const evalField = useRef<HTMLInputElement>(null);
+  const completion = useExpressionCompletion(evalField, expression, setExpression, session);
   const [lastEval, setLastEval] = useState<EvalRow | null>(null);
   const [scopeData, setScopeData] = useState<{ frame: number | null; scopes: Scope[]; locals: Variable[] }>({
     frame: null,
@@ -390,6 +570,9 @@ function VariablesPane({ session }: { session: DebugSession }) {
     rows: [],
   });
   const frame = session.status === "paused" ? session.selectedFrame : null;
+  const live = liveWatchesApply(session);
+  // A hidden tool window stays mounted: its watches must not go on running in the page.
+  const liveWatches = useLiveWatches(session, watches, useToolWindowShown());
   // Same thread and stack depth across stops: compare like with like.
   const changeScope = `${session.id}:${session.selectedThread}:${session.frames.findIndex((f) => f.id === frame)}`;
 
@@ -415,9 +598,10 @@ function VariablesPane({ session }: { session: DebugSession }) {
     return () => {
       cancelled = true;
     };
-  }, [session.id, frame, stopSeq]);
+  }, [session.id, frame, stopSeq, variablesEpoch]);
 
-  // Watches are re-evaluated on every stop / frame change.
+  // Watches are re-evaluated on every stop / frame change, and when the adapter has new values (kotlin-lsp first
+  // answers "Collecting data…").
   useEffect(() => {
     if (frame == null || !watches.length) return;
     let cancelled = false;
@@ -438,7 +622,7 @@ function VariablesPane({ session }: { session: DebugSession }) {
     };
     // `session` identity changes on every patch; frame/stopSeq capture what matters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.id, frame, stopSeq, watches]);
+  }, [session.id, frame, stopSeq, variablesEpoch, watches]);
 
   const roots = useMemo<VarRoot[]>(() => {
     const out: VarRoot[] = [];
@@ -450,7 +634,8 @@ function VariablesPane({ session }: { session: DebugSession }) {
         variable: lastEval.result,
         error: lastEval.error,
       });
-    const watchRows = watchData.frame === frame ? watchData.rows : [];
+    // While the program runs, a debugger that evaluates without suspending gives the values.
+    const watchRows = frame == null ? liveWatches : watchData.frame === frame ? watchData.rows : [];
     for (const w of watches) {
       const r = watchRows.find((x) => x.expression === w);
       out.push({
@@ -458,7 +643,7 @@ function VariablesPane({ session }: { session: DebugSession }) {
         kind: "watch",
         name: w,
         variable: r?.result ?? null,
-        error: frame == null ? "Not suspended" : (r?.error ?? null),
+        error: frame == null && !live ? "Not suspended" : (r?.error ?? null),
       });
     }
     if (frame != null && scopeData.frame === frame) {
@@ -486,13 +671,17 @@ function VariablesPane({ session }: { session: DebugSession }) {
       }
     }
     return out;
-  }, [lastEval, watches, watchData, scopeData, frame]);
+  }, [lastEval, watches, watchData, scopeData, frame, live, liveWatches]);
 
   const run = async () => {
     const e = expression.trim();
     if (!e) return;
     try {
-      setLastEval({ expression: e, result: await evaluate(e, "repl", session), error: null });
+      setLastEval({
+        expression: e,
+        result: await evaluate(e, session.adapter === "gdb" ? "watch" : "repl", session),
+        error: null,
+      });
     } catch (err) {
       setLastEval({ expression: e, result: null, error: err instanceof Error ? err.message : String(err) });
     }
@@ -502,10 +691,16 @@ function VariablesPane({ session }: { session: DebugSession }) {
     <div className={styles.variables}>
       <div className={styles.evalField}>
         <input
+          ref={evalField}
           className={styles.evalInput}
           value={expression}
-          onChange={(e) => setExpression(e.target.value)}
+          onChange={(e) => {
+            setExpression(e.target.value);
+            completion.onInput();
+          }}
+          onBlur={completion.close}
           onKeyDown={(e) => {
+            if (completion.onKeyDown(e)) return;
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.shiftKey) {
               e.preventDefault();
               addWatch(expression);
@@ -521,6 +716,7 @@ function VariablesPane({ session }: { session: DebugSession }) {
           autoComplete="off"
           disabled={frame == null}
         />
+        {completion.popup}
         <IconButton
           icon="plus"
           title="Add to Watches"
@@ -544,7 +740,7 @@ function VariablesPane({ session }: { session: DebugSession }) {
         <VariablesView
           roots={roots}
           session={session.id}
-          generation={stopSeq * 100000 + (frame ?? 0)}
+          generation={(stopSeq * 1000 + (variablesEpoch % 1000)) * 100000 + (frame ?? 0)}
           changes={{ epoch: stopSeq, scope: changeScope }}
           aria-label="Variables"
         />

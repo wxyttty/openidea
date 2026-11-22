@@ -1,6 +1,6 @@
 use super::*;
 use crate::{HostConfig, Project};
-use ide_core::{IdeEvent, TextChange, event::NotifyLevel};
+use ide_core::{IdeEvent, TextChange};
 use parking_lot::Mutex;
 use std::{path::Path, sync::Arc};
 
@@ -30,6 +30,7 @@ impl Fixture {
         let host = Host::new(HostConfig {
             config_dir: base.join("config"),
             data_dir: base.join("data"),
+            local_data_dir: base.join("data"),
             languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
             syntax: Arc::default(),
             sink_for: Box::new(move |_| {
@@ -45,18 +46,20 @@ impl Fixture {
     }
 
     async fn open(&self, path: &Path) -> DocumentInfo {
-        open(&self.host, "main", path.to_path_buf()).await.unwrap()
+        doc_open(&self.host, "main", path.to_path_buf()).await.unwrap()
     }
 
     async fn sync(&self) {
-        sync_from_disk(&self.host, "main").await.unwrap();
+        doc_sync_from_disk(&self.host, "main").await.unwrap();
     }
 
     fn document_events(&self) -> Vec<IdeEvent> {
         self.events
             .lock()
             .iter()
-            .filter(|e| matches!(e, IdeEvent::DocPatched { .. } | IdeEvent::DocDirty { .. } | IdeEvent::Notify { .. }))
+            .filter(|e| {
+                matches!(e, IdeEvent::DocPatched { .. } | IdeEvent::DocDirty { .. } | IdeEvent::DocDiskConflict { .. })
+            })
             .cloned()
             .collect()
     }
@@ -94,13 +97,14 @@ async fn unchanged_document_has_no_patch_or_event() {
 async fn dirty_document_keeps_edits_and_warns_once() {
     let f = Fixture::new();
     let original = f.open(&f.path).await;
-    edit(
+    doc_edit(
         &f.host,
         "main",
         original.id,
         original.version,
         ChangeSet { changes: vec![TextChange { from: 0, to: 0, insert: "local ".into() }] },
     )
+    .await
     .unwrap();
     f.events.lock().clear();
     std::fs::write(&f.path, "external replacement\n").unwrap();
@@ -108,7 +112,7 @@ async fn dirty_document_keeps_edits_and_warns_once() {
     let loaded = f.project.documents.snapshot(original.id).unwrap();
     assert_eq!(loaded.text, "local original\n");
     assert!(loaded.dirty);
-    assert!(matches!(f.document_events().as_slice(), [IdeEvent::Notify { level: NotifyLevel::Warning, .. }]));
+    assert!(matches!(f.document_events().as_slice(), [IdeEvent::DocDiskConflict { .. }]));
     f.events.lock().clear();
     f.sync().await;
     assert!(f.document_events().is_empty());
@@ -175,8 +179,11 @@ async fn binary_and_virtual_documents_are_skipped() {
     std::fs::write(&path, b"\0\0binary payload").unwrap();
     let binary = f.open(&path).await;
     assert!(binary.read_only);
-    let virtual_doc =
-        f.project.documents.open_virtual("test://virtual", ide_core::LanguageId::plain_text(), "virtual").unwrap();
+    let virtual_doc = f
+        .project
+        .documents
+        .open_virtual("test://virtual", ide_core::LanguageId::plain_text(), "virtual", "utf-8", false, false)
+        .unwrap();
     std::fs::write(&path, "now ordinary text").unwrap();
     f.events.lock().clear();
     f.sync().await;
@@ -192,7 +199,7 @@ async fn synchronization_only_changes_the_calling_windows_documents() {
     let other_root = f.outside.parent().unwrap().join("other-project");
     std::fs::create_dir(&other_root).unwrap();
     let other = f.host.open_project("other", &other_root).unwrap();
-    let other_doc = open(&f.host, "other", f.outside.clone()).await.unwrap();
+    let other_doc = doc_open(&f.host, "other", f.outside.clone()).await.unwrap();
     std::fs::write(&f.outside, "external change in shared file\n").unwrap();
     f.sync().await;
     assert_eq!(f.project.documents.snapshot(original.id).unwrap().text, "external change in shared file\n");

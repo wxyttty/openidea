@@ -45,7 +45,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ide_core::IdeEvent;
 use ide_host::Host;
-use ide_plugin::{Limits, PluginHost, PluginInfo, PluginStatus};
+use ide_host::plugins::{PluginEvent, PluginEventSink, PluginHost, PluginInfo, PluginStatus};
+use ide_plugin::Limits;
 use ide_workspace::{RecentProjects, SettingsScope};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -686,12 +687,12 @@ pub struct Workbench {
     plugins_list: Vec<PluginInfo>,
     plugins_notice: Option<SharedString>,
     /// Installable plugin packages found in the catalog folders.
-    plugin_catalog: Vec<ide_plugin::CatalogPlugin>,
+    plugin_catalog: Vec<ide_host::plugins::CatalogPlugin>,
     plugin_task: Option<Task<()>>,
     /// The task draining the plugin event stream.
     plugin_event_task: Option<Task<()>>,
     /// The plugin event stream (notifications and editor text insertions).
-    plugin_events: futures::channel::mpsc::UnboundedReceiver<ide_plugin::PluginEvent>,
+    plugin_events: futures::channel::mpsc::UnboundedReceiver<PluginEvent>,
     balloon_clock: Option<Task<()>>,
     condition_input: Entity<InputState>,
     log_input: Entity<InputState>,
@@ -886,13 +887,13 @@ impl Workbench {
         let recent = RecentProjects::load(&config.config_dir);
         // Plugin events (notifications, `insertText`, `replaceSelection`) are
         // queued here and drained by a task spawned once the workbench exists.
-        let (plugin_tx, plugin_rx) = futures::channel::mpsc::unbounded::<ide_plugin::PluginEvent>();
-        let plugin_sink: Arc<dyn ide_plugin::PluginEventSink> =
-            Arc::new(move |_: Option<&str>, event: ide_plugin::PluginEvent| {
-                let _ = plugin_tx.unbounded_send(event);
-            });
-        let plugins =
-            PluginHost::new(config.data_dir.join("plugins"), plugin_sink, Limits::default()).ok().map(Arc::new);
+        let (plugin_tx, plugin_rx) = futures::channel::mpsc::unbounded::<PluginEvent>();
+        let plugin_sink: Arc<dyn PluginEventSink> = Arc::new(move |_: Option<&str>, event: PluginEvent| {
+            let _ = plugin_tx.unbounded_send(event);
+        });
+        let plugins = PluginHost::new(config.data_dir.join("plugins"), plugin_sink, Limits::default())
+            .ok()
+            .map(Arc::new);
         if let Some(plugin_host) = &plugins {
             let trust = host.clone();
             plugin_host.set_project_policy(Arc::new(move |root| trust.trust.trusted(root).unwrap_or(false)));
@@ -1114,11 +1115,11 @@ impl Workbench {
                 self.status = "Project trust changed".into();
                 cx.notify();
             }
-            IdeEvent::DocPatched { doc, base_version, version, changes } => {
+            IdeEvent::DocPatched { doc, base_version, version, changes, .. } => {
                 self.editor
                     .update(cx, |editor, cx| editor.apply_patch(doc, base_version, version, changes, window, cx));
             }
-            IdeEvent::DocDirty { doc, dirty } => {
+            IdeEvent::DocDirty { doc, dirty, .. } => {
                 self.editor.update(cx, |editor, cx| editor.set_dirty(doc, dirty, cx));
             }
             IdeEvent::DocLanguage { doc, language, .. } => {
@@ -1731,16 +1732,10 @@ impl Workbench {
             while let Some(event) = rx.next().await {
                 let _ = this.update(cx, |this, cx| {
                     match event {
-                        ide_plugin::PluginEvent::InsertText { text, .. } => {
-                            this.insert_at_caret(&text, false, cx);
-                        }
-                        ide_plugin::PluginEvent::ReplaceSelection { text, .. } => {
-                            this.insert_at_caret(&text, true, cx);
-                        }
-                        ide_plugin::PluginEvent::Notification { level, title, body, .. } => {
+                        PluginEvent::Notification { level, title, body, .. } => {
                             let level = match level {
-                                ide_plugin::NotificationLevel::Error => ide_core::event::NotifyLevel::Error,
-                                ide_plugin::NotificationLevel::Warning => ide_core::event::NotifyLevel::Warning,
+                                ide_host::plugins::NotificationLevel::Error => ide_core::event::NotifyLevel::Error,
+                                ide_host::plugins::NotificationLevel::Warning => ide_core::event::NotifyLevel::Warning,
                                 _ => ide_core::event::NotifyLevel::Info,
                             };
                             let prefs = this.notification_prefs();
@@ -1757,8 +1752,8 @@ impl Workbench {
                                 cx.notify();
                             });
                         }
-                        ide_plugin::PluginEvent::CommandsChanged => this.refresh_plugins(cx),
-                        ide_plugin::PluginEvent::ThemeChanged { .. } => {}
+                        PluginEvent::CommandsChanged => this.refresh_plugins(cx),
+                        _ => {}
                     }
                     cx.notify();
                 });
@@ -2141,7 +2136,7 @@ impl Workbench {
             if let Some(path) = std::env::var_os("OPENIDEA_PLUGIN_CATALOG") {
                 dirs.push(std::path::PathBuf::from(path));
             }
-            let catalog = ide_plugin::scan_catalog(&dirs);
+            let catalog = plugins.catalog(&dirs);
             let _ = tx.unbounded_send((snapshot, catalog));
         });
         self.plugin_task = Some(cx.spawn(async move |this, cx| {
@@ -2175,15 +2170,18 @@ impl Workbench {
         // The plugin sees the unsaved buffer, so a command that formats or
         // analyses the file works on what is on screen. The closure is taken
         // once here (the editor is not shared across threads).
-        let active_path = self.editor.read(cx).active_info().map(|info| info.path);
-        let active_text = self.editor.read(cx).active_text();
-        let buffer_text: Option<ide_plugin::BufferText> = active_path.zip(active_text).map(|(path, text)| {
-            std::sync::Arc::new(move |asked: &std::path::Path| (asked == path).then(|| text.clone()))
-                as ide_plugin::BufferText
+        let editor = self.editor.read(cx).active_info().map(|info| ide_plugin::EditorContext {
+            path: info.path,
+            language: info.language.to_string(),
+            selections: Vec::new(),
         });
         let workspace_root = self.project.as_ref().map(|project| project.root.clone());
-        let invocation =
-            ide_plugin::Invocation { client: Some(self.window_name.clone()), workspace_root, buffer_text };
+        let invocation = ide_plugin::Invocation {
+            client: Some(self.window_name.clone()),
+            workspace_root,
+            editor,
+            ..Default::default()
+        };
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<Result<Option<String>, String>>();
         let status_command = command_id.clone();
         std::thread::Builder::new()
@@ -2564,23 +2562,33 @@ impl Workbench {
         }
     }
 
-    /// The plugin commands the palette lists under the current query.
+    /// The plugin commands the palette lists under the current query. Commands are
+    /// UI contributions of the `commands` point, so only live plugins have them.
     fn plugin_command_list(&self) -> Vec<(String, String, String)> {
+        let Some(plugins) = self.plugins.clone() else { return Vec::new() };
         let query = self.palette_query.to_lowercase();
-        self.plugins_list
+        let live: Vec<_> = self
+            .plugins_list
             .iter()
-            .filter(|plugin| plugin.enabled && plugin.status == PluginStatus::Active)
-            .flat_map(|plugin| {
-                let query = query.clone();
-                plugin.commands.iter().filter_map(move |command| {
-                    let title = command
-                        .category
-                        .as_ref()
-                        .map(|category| format!("{category}: {}", command.title))
-                        .unwrap_or_else(|| command.title.clone());
-                    (query.is_empty() || title.to_lowercase().contains(query.as_str()))
-                        .then(|| (plugin.id.clone(), command.id.clone(), title))
-                })
+            .filter(|plugin| plugin.enabled && plugin.status.is_live())
+            .map(|plugin| plugin.id.clone())
+            .collect();
+        plugins
+            .ui_items(ide_host::plugins::COMMANDS)
+            .into_iter()
+            .filter(|item| live.contains(&item.plugin_id))
+            .filter_map(|item| {
+                let command: ide_host::plugins::CommandDecl = serde_json::from_value(item.decl).ok()?;
+                let title = command
+                    .category
+                    .as_ref()
+                    .map(|category| format!("{category}: {}", command.title))
+                    .unwrap_or_else(|| command.title.clone());
+                (query.is_empty() || title.to_lowercase().contains(query.as_str())).then_some((
+                    item.plugin_id,
+                    command.id,
+                    title,
+                ))
             })
             .collect()
     }
@@ -4725,7 +4733,12 @@ impl Render for Workbench {
                 let Some(plugins) = this.plugins.clone() else { return };
                 if let Some(dir) = rfd::FileDialog::new().set_title("Install Plugin").pick_folder() {
                     this.plugin_action(
-                        move || plugins.install_from_dir(&dir).map(|_| ()).map_err(|err| err.to_string()),
+                        move || {
+                            plugins
+                                .install_from_dir(&dir, &ide_host::plugins::Consent::all())
+                                .map(|_| ())
+                                .map_err(|err| err.to_string())
+                        },
                         cx,
                     );
                 }
@@ -4752,7 +4765,12 @@ impl Render for Workbench {
                         let Some(plugins) = plugins.clone() else { return };
                         let path = path.clone();
                         this.plugin_action(
-                            move || plugins.install_from_dir(&path).map(|_| ()).map_err(|err| err.to_string()),
+                            move || {
+                                plugins
+                                    .install_from_dir(&path, &ide_host::plugins::Consent::all())
+                                    .map(|_| ())
+                                    .map_err(|err| err.to_string())
+                            },
                             cx,
                         );
                     });
@@ -4794,10 +4812,9 @@ impl Render for Workbench {
                                     .text_size(px(9.))
                                     .text_color(theme.fg_muted())
                                     .child(format!(
-                                        "{} cmd · {} lang · {} theme",
-                                        package.commands.len(),
-                                        package.language_count,
-                                        package.theme_count
+                                        "{} contribution{}",
+                                        package.contributions.iter().map(|c| c.count).sum::<u32>(),
+                                        if package.contributions.len() == 1 { "" } else { "s" }
                                     )),
                             )
                             .when(!installed && problem.is_none(), |this| {
@@ -4833,9 +4850,12 @@ impl Render for Workbench {
                 let enabled = plugin.enabled;
                 let status = match plugin.status {
                     PluginStatus::Active => ("active", theme.success),
+                    PluginStatus::Inactive => ("inactive", theme.fg_secondary()),
                     PluginStatus::Static => ("static", theme.info),
                     PluginStatus::Disabled => ("disabled", theme.fg_muted()),
+                    PluginStatus::NeedsConsent => ("needs consent", theme.warning),
                     PluginStatus::Failed => ("failed", theme.danger),
+                    PluginStatus::Blocked => ("blocked", theme.warning),
                 };
                 let plugins = self.plugins.clone();
                 let toggle_id = id.clone();

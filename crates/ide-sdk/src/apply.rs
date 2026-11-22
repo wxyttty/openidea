@@ -2,14 +2,17 @@
 //! language servers, run configurations and terminals.
 
 use crate::discover::{project_venv_python, workspace_tsdk};
-use crate::exec::{path_with, search_path};
-use crate::{angular, godot, pinned, vue};
+use crate::exec::{path_with, search_path, which};
+use crate::npm::{has_ts_api, native_typescript, own_typescript};
+use crate::{angular, astro, godot, pinned, vue};
 use crate::{bin_dir, exe, venv_of};
-use ide_core::settings::{LanguageServerSettings, Settings};
+use ide_core::settings::{InspectionLevel, InspectionSettings, LanguageServerSettings, Settings};
 use ide_core::version_managers::Tool;
+use ide_core::{IdeError, IdeResult};
 use ide_language::{LanguageConfig, LanguageServerConfig};
 use ide_run::RunConfig;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -28,12 +31,74 @@ pub fn setting_path(root: &Path, s: &str) -> Option<PathBuf> {
     Some(if p.is_absolute() { p } else { root.join(p) })
 }
 
+fn toml_has_table(file: &Path, table: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else { return false };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else { return false };
+    table.split('.').try_fold(&value, |value, key| value.get(key)).is_some_and(toml::Value::is_table)
+}
+
+/// The Ruff configuration file selected by `languages.ruff.configurationDirectory`.
+/// A file can be chosen directly; a directory resolves `ruff.toml`, `.ruff.toml`,
+/// then a `pyproject.toml` containing `[tool.ruff]`.
+pub fn ruff_configuration(root: &Path, configured: &str) -> IdeResult<Option<PathBuf>> {
+    let Some(path) = setting_path(root, configured) else { return Ok(None) };
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    if !path.is_dir() {
+        return Err(IdeError::invalid(format!("Ruff configuration path does not exist: {}", path.display())));
+    }
+    for name in ["ruff.toml", ".ruff.toml"] {
+        let file = path.join(name);
+        if file.is_file() {
+            return Ok(Some(file));
+        }
+    }
+    let pyproject = path.join("pyproject.toml");
+    if toml_has_table(&pyproject, "tool.ruff") {
+        return Ok(Some(pyproject));
+    }
+    Err(IdeError::invalid(format!(
+        "Ruff configuration directory has no ruff.toml, .ruff.toml, or pyproject.toml with [tool.ruff]: {}",
+        path.display()
+    )))
+}
+
 /// The project interpreter: the configured one, else a project virtualenv
-/// (`.venv`, `venv`, …) in the project root, else the Python the project pins for mise / asdf.
+/// (`.venv`, `venv`, …) or pixi environment (`.pixi/envs/<env>`) in the project
+/// root, else the Python the project pins for mise / asdf. A configured
+/// interpreter whose executable is gone (uninstalled, moved) is skipped like
+/// PyCharm's "Invalid" SDKs, so runs fall back instead of failing on a dead path.
+/// `None` when the project interpreter is a run target's (see [`crate::container_python`]).
 pub fn python_interpreter(root: &Path, s: &Settings) -> Option<PathBuf> {
+    if s.languages.python.run_target().is_some() {
+        return None;
+    }
     setting_path(root, &s.languages.python.interpreter)
+        .filter(|p| p.is_file())
         .or_else(|| project_venv_python(root))
         .or_else(|| pinned::pinned_python(root))
+}
+
+/// An explicit project interpreter wins; otherwise use the closest virtualenv to the file.
+pub fn python_interpreter_near(root: &Path, near: Option<&Path>, s: &Settings) -> Option<PathBuf> {
+    if s.languages.python.run_target().is_some() {
+        return None;
+    }
+    if let Some(python) = setting_path(root, &s.languages.python.interpreter).filter(|p| p.is_file()) {
+        return Some(python);
+    }
+    let near = near.filter(|dir| dir.starts_with(root)).unwrap_or(root);
+    near.ancestors()
+        .take_while(|dir| dir.starts_with(root))
+        .find_map(project_venv_python)
+        .or_else(|| pinned::pinned_python(near))
+}
+
+/// The project Ruby: the configured one, else the `.ruby-version` / mise / asdf
+/// install, else `ruby` on PATH.
+pub fn ruby_interpreter(root: &Path, s: &Settings) -> Option<PathBuf> {
+    setting_path(root, &s.languages.ruby.interpreter).or_else(|| crate::ruby::project_ruby(root))
 }
 
 /// The configured `node` executable's directory, else the `bin` of the Node.js the
@@ -45,6 +110,13 @@ pub(crate) fn node_dir(root: &Path, s: &Settings) -> Option<PathBuf> {
             .map(|(dir, _)| dir.join("bin"))
             .filter(|bin| bin.join(exe("node")).is_file()),
     }
+}
+
+/// The directory of the configured `php` executable (it also holds the matching `phpize`,
+/// `pecl`…): put on the `PATH` so `#!/usr/bin/env php` scripts such as `vendor/bin/phpunit`
+/// and Composer run on the selected interpreter.
+pub(crate) fn php_dir(root: &Path, s: &Settings) -> Option<PathBuf> {
+    setting_path(root, &s.languages.php.interpreter).and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
 /// The configured Rust toolchain's `bin` directory and rustup toolchain name.
@@ -69,6 +141,40 @@ pub(crate) fn goroot(root: &Path, s: &Settings) -> Option<PathBuf> {
         .or_else(|| pinned::pinned_install(root, Tool::Go).and_then(|(dir, _)| pinned::goroot_in_install(&dir)))
 }
 
+/// The directory of the configured Zig install (holding `zig`), else `None` for `PATH`.
+pub(crate) fn zig_bin(root: &Path, s: &Settings) -> Option<PathBuf> {
+    setting_path(root, &s.languages.zig.zig)
+        .map(|p| if p.is_file() { p.parent().map(Path::to_path_buf).unwrap_or(p) } else { p })
+}
+
+/// Runtime choices for package-manager based IDE tool installs.
+#[derive(Default)]
+pub struct ToolInstallEnvironment {
+    pub commands: std::collections::BTreeMap<String, PathBuf>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Uses the same configured / project-pinned SDKs as Run and language servers.
+/// Build tags and target OS settings intentionally do not apply to host tools.
+pub fn tool_install_environment(root: &Path, s: &Settings) -> ToolInstallEnvironment {
+    let mut runtime = ToolInstallEnvironment::default();
+    if let Some(go) = goroot(root, s) {
+        runtime.commands.insert("go".into(), go.join("bin").join(exe("go")));
+        runtime.env.insert("GOROOT".into(), go.to_string_lossy().into_owned());
+    }
+    if let Some(node) = node_dir(root, s) {
+        let node = setting_path(root, &s.languages.node.interpreter).unwrap_or_else(|| node.join(exe("node")));
+        runtime.commands.insert("node".into(), node);
+    }
+    if let Some(ruby) = ruby_interpreter(root, s) {
+        runtime.commands.insert("ruby".into(), ruby);
+    }
+    if let Some(python) = python_interpreter(root, s) {
+        runtime.commands.insert("python".into(), python);
+    }
+    runtime
+}
+
 /// A JDK setting: a JDK home, its `bin` or its `bin/java`.
 fn jdk_setting(root: &Path, value: &str) -> Option<Result<crate::java::Jdk, PathBuf>> {
     let p = setting_path(root, value)?;
@@ -78,9 +184,27 @@ fn jdk_setting(root: &Path, value: &str) -> Option<Result<crate::java::Jdk, Path
 /// The project JDK (`languages.java.jdk`), else the JDK the project pins for mise / asdf.
 pub fn project_jdk(root: &Path, s: &Settings) -> Option<crate::java::Jdk> {
     match jdk_setting(root, &s.languages.java.jdk) {
-        Some(jdk) => jdk.inspect_err(|p| tracing::warn!("project JDK {} is not a JDK home", p.display())).ok(),
+        Some(jdk) => jdk.inspect_err(|p| tracing::warn!("project JDK {}", not_a_jdk(p))).ok(),
         None => pinned::pinned_install(root, Tool::Java).and_then(|(dir, _)| pinned::jdk_in_install(&dir)),
     }
+}
+
+/// Module-specific JDK from `projectStructure.modules`, falling back to [`project_jdk`].
+pub fn module_jdk(root: &Path, module: &Path, s: &Settings) -> Option<crate::java::Jdk> {
+    let module_cfg = s.project_structure.module_settings(root, module);
+    if let Some(cfg) = module_cfg
+        && let Some(jdk) = jdk_setting(root, &cfg.jdk)
+    {
+        return jdk.inspect_err(|p| tracing::warn!("module JDK {}", not_a_jdk(p))).ok();
+    }
+    project_jdk(root, s)
+}
+
+/// Effective Java language level (`8`, `11`, `17`, `21`, `25`) for `module`, checking
+/// `projectStructure.modules` first, then `languages.java.languageLevel`.
+pub fn effective_java_language_level<'a>(root: &Path, module: &Path, s: &'a Settings) -> Option<&'a str> {
+    let module_level = s.project_structure.module_settings(root, module).and_then(|m| non_empty(&m.language_level));
+    module_level.or_else(|| non_empty(&s.languages.java.language_level))
 }
 
 /// The JDK chosen to run jdtls (`languages.java.jdtlsJdk`): `Ok(None)` when not
@@ -88,18 +212,64 @@ pub fn project_jdk(root: &Path, s: &Settings) -> Option<crate::java::Jdk> {
 pub fn jdtls_jdk(root: &Path, s: &Settings) -> Result<Option<crate::java::Jdk>, String> {
     match jdk_setting(root, &s.languages.java.jdtls_jdk) {
         None => Ok(None),
-        Some(Ok(jdk)) => Ok(Some(jdk)),
-        Some(Err(p)) => Err(format!(
-            "The language server JDK {} is not a JDK home (Settings › Languages & Frameworks › Java).",
-            p.display()
-        )),
+        Some(Ok(jdk)) if !ide_core::java_runtime::supports_java_bundles(&jdk.home) => {
+            Err(crate::java::server_jdk_incomplete_message(&jdk, jdk.major.max(crate::java::JDTLS_MIN_JAVA)))
+        }
+        Some(Ok(jdk)) => match crate::java::java_execution_error(&crate::java::java_executable(&jdk.home)) {
+            Some(error) => Err(error),
+            None => Ok(Some(jdk)),
+        },
+        Some(Err(p)) => {
+            Err(format!("The language server JDK {} (Settings › Languages & Frameworks › Java).", not_a_jdk(&p)))
+        }
     }
+}
+
+/// Why the configured JDK path `p` is not used: gone (e.g. a version manager removed
+/// it on upgrade) or not a JDK.
+fn not_a_jdk(p: &Path) -> String {
+    if p.exists() {
+        format!("{} is not a JDK home", p.display())
+    } else {
+        format!("{} does not exist; choose another JDK or clear the setting to detect one", p.display())
+    }
+}
+
+/// Maven runner JRE, falling back to the project JDK and then the POM's Java version.
+pub fn maven_jdk(root: &Path, s: &Settings, release: Option<u32>) -> Option<crate::java::Jdk> {
+    match jdk_setting(root, &s.languages.java.maven.runner_jre) {
+        Some(jdk) => jdk.inspect_err(|p| tracing::warn!("Maven runner JRE {}", not_a_jdk(p))).ok(),
+        None => project_jdk(root, s).or_else(|| {
+            let installed = crate::java::installed_jdks();
+            release.and_then(|r| crate::java::pick_jdk(&installed, Some(r))).cloned()
+        }),
+    }
+}
+
+/// Default environment shared by Maven sync, builds and run configurations.
+pub fn maven_build_env(root: &Path, s: &Settings, release: Option<u32>) -> std::collections::BTreeMap<String, String> {
+    maven_jdk(root, s, release)
+        .map(|jdk| std::collections::BTreeMap::from([("JAVA_HOME".into(), jdk.home.to_string_lossy().into_owned())]))
+        .unwrap_or_default()
 }
 
 /// `mvn` of the configured Maven home (`languages.java.maven.home`): the
 /// executable itself, `<home>/bin/mvn` or `<bin>/mvn`; else of the Maven the project
-/// pins for mise / asdf when it has no Maven wrapper.
+/// pins for mise / asdf when it has no Maven wrapper. With `maven.daemon` on, the
+/// Maven Daemon (`mvnd`) replaces all of that — it embeds its own Maven — unless
+/// it is not installed or the runner JRE is older than the Java 17 its daemon
+/// needs, in which case the build stays on mvn (with a logged warning).
 pub fn maven_command(root: &Path, s: &Settings) -> Option<PathBuf> {
+    if s.languages.java.maven.daemon {
+        match mvnd_command(root, s) {
+            // Without a selected JDK, mvnd picks its own Java, which may still be new enough.
+            Some(mvnd) if maven_jdk(root, s, None).is_none_or(|j| j.major >= 17) => return Some(mvnd),
+            Some(_) => tracing::warn!(
+                "Maven daemon: the runner JRE is older than the Java 17 its daemon needs; building with mvn"
+            ),
+            None => tracing::warn!("Maven daemon is enabled but mvnd was not found; building with mvn"),
+        }
+    }
     let name = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
     let Some(p) = setting_path(root, &s.languages.java.maven.home) else {
         if root.join("mvnw").is_file() || root.join("mvnw.cmd").is_file() {
@@ -114,6 +284,41 @@ pub fn maven_command(root: &Path, s: &Settings) -> Option<PathBuf> {
         tracing::warn!("Maven home {} has no {name}", p.display());
     }
     found
+}
+
+/// The `mvnd` executable when the Maven Daemon is enabled: the configured home
+/// (`languages.java.maven.mvndHome`, the executable itself or `<home>/bin/mvnd`),
+/// else `$MVND_HOME`, else `mvnd` on `PATH`, else the common Homebrew / sdkman
+/// locations. `None` = not found; the caller falls back to `mvn`.
+pub fn mvnd_command(root: &Path, s: &Settings) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "mvnd.cmd" } else { "mvnd" };
+    if let Some(p) = setting_path(root, &s.languages.java.maven.mvnd_home) {
+        let found = [p.clone(), p.join("bin").join(name), p.join(name)].into_iter().find(|c| c.is_file());
+        if found.is_none() {
+            tracing::warn!("Maven Daemon home {} has no {name}", p.display());
+        }
+        return found;
+    }
+    if let Some(home) = std::env::var_os("MVND_HOME").map(PathBuf::from) {
+        let found = [home.join("bin").join(name), home.join(name)].into_iter().find(|c| c.is_file());
+        if found.is_none() {
+            tracing::warn!("MVND_HOME {} has no {name}", home.display());
+        }
+        return found;
+    }
+    if let Some(found) = crate::exec::which(name) {
+        return Some(found);
+    }
+    if let Some(home) = crate::home_dir() {
+        let sdkman = home.join(".sdkman/candidates/mvnd/current");
+        let candidates = [
+            sdkman.join("bin").join(name),
+            PathBuf::from("/opt/homebrew/opt/mvnd").join("bin").join(name),
+            PathBuf::from("/usr/local/opt/mvnd").join("bin").join(name),
+        ];
+        return candidates.into_iter().find(|c| c.is_file());
+    }
+    None
 }
 
 /// Project launcher policy for sync and tool-window tasks.
@@ -131,11 +336,140 @@ fn resolve_gradle_command(root: &Path, build_dir: &Path, s: &Settings, use_wrapp
     }
     let wrapper = build_dir.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" });
     if use_wrapper && wrapper.is_file() {
+        // `gradlew` can't start without its jar, which `.gitignore`s with `*.jar` often leave
+        // out: run the distribution the wrapper already unpacked instead.
+        if build_dir.join("gradle/wrapper/gradle-wrapper.jar").is_file() {
+            return wrapper;
+        }
+        let home = setting_path(root, &g.user_home)
+            .or_else(|| std::env::var_os("GRADLE_USER_HOME").map(PathBuf::from))
+            .or_else(|| Some(crate::home_dir()?.join(".gradle")));
+        if let Some(gradle) = home.and_then(|home| unpacked_wrapper_distribution(build_dir, &home)) {
+            return gradle;
+        }
+        // Nothing to run instead: the wrapper's failure explains what is missing.
         return wrapper;
     }
     pinned::pinned_install(build_dir, Tool::Gradle)
         .map(|(home, _)| home.join("bin").join(name))
         .unwrap_or_else(|| name.into())
+}
+
+/// `bin/gradle` of the distribution `gradle/wrapper/gradle-wrapper.properties` names, once the
+/// wrapper has unpacked it in `<gradle_user_home>/wrapper/dists` (and marked it complete).
+fn unpacked_wrapper_distribution(build_dir: &Path, gradle_user_home: &Path) -> Option<PathBuf> {
+    let properties = std::fs::read_to_string(build_dir.join("gradle/wrapper/gradle-wrapper.properties")).ok()?;
+    let url = properties.lines().find_map(|line| line.trim().strip_prefix("distributionUrl="))?;
+    let zip = url.trim().replace("\\:", ":").rsplit('/').next()?.to_owned();
+    let name = zip.strip_suffix(".zip")?;
+    let gradle = if cfg!(windows) { "gradle.bat" } else { "gradle" };
+    // One directory per distribution URL hash, each holding the unpacked `gradle-<version>`.
+    let hashes = std::fs::read_dir(gradle_user_home.join("wrapper/dists").join(name)).ok()?;
+    hashes.flatten().map(|e| e.path()).filter(|dir| dir.join(format!("{zip}.ok")).is_file()).find_map(|dir| {
+        std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path().join("bin").join(gradle)).find(|p| p.is_file())
+    })
+}
+
+fn gradle_run_jdk<'a>(
+    release: Option<u32>,
+    configured: Option<&'a crate::java::Jdk>,
+    installed: &'a [crate::java::Jdk],
+    gradle: Option<(u32, u32)>,
+) -> Option<&'a crate::java::Jdk> {
+    configured.or_else(|| {
+        let release = release?;
+        // An unknown Gradle version cannot narrow the choice: the release alone decides.
+        let Some(gradle) = gradle else { return crate::java::pick_jdk(installed, Some(release)) };
+        let compatible: Vec<_> = installed.iter().filter(|jdk| gradle_supports_java(gradle, jdk.major)).collect();
+        compatible
+            .iter()
+            .copied()
+            .find(|jdk| jdk.major == release)
+            .or_else(|| compatible.iter().copied().filter(|jdk| jdk.major > release).min_by_key(|jdk| jdk.major))
+            .or_else(|| compatible.iter().copied().max_by_key(|jdk| jdk.major))
+    })
+}
+
+/// The newest installed JDK that Gradle `gradle` runs on.
+fn newest_gradle_jdk(gradle: (u32, u32), installed: &[crate::java::Jdk]) -> Option<&crate::java::Jdk> {
+    installed.iter().filter(|jdk| gradle_supports_java(gradle, jdk.major)).max_by_key(|jdk| jdk.major)
+}
+
+/// Default environment shared by Gradle model builds and Run configurations.
+pub fn gradle_build_env(
+    root: &Path,
+    build_dir: &Path,
+    command: &str,
+    settings: &Settings,
+    release: Option<u32>,
+) -> std::collections::BTreeMap<String, String> {
+    let configured = project_jdk(root, settings);
+    let installed = crate::java::installed_jdks();
+    let jdk = gradle_run_jdk(
+        release.or_else(|| crate::java::project_java_version(build_dir)),
+        configured.as_ref(),
+        &installed,
+        gradle_distribution_version(build_dir, command),
+    );
+    let env = jdk
+        .map(|jdk| std::collections::BTreeMap::from([("JAVA_HOME".into(), jdk.home.to_string_lossy().into_owned())]))
+        .unwrap_or_default();
+    gradle_env(root, settings, env)
+}
+
+fn gradle_supports_java(gradle: (u32, u32), java: u32) -> bool {
+    // https://docs.gradle.org/current/userguide/compatibility.html#java_runtime
+    let minimum = match java {
+        8 => (2, 0),
+        9 => (4, 3),
+        10 => (4, 7),
+        11 => (5, 0),
+        12 => (5, 4),
+        13 => (6, 0),
+        14 => (6, 3),
+        15 => (6, 7),
+        16 => (7, 0),
+        17 => (7, 3),
+        18 => (7, 5),
+        19 => (7, 6),
+        20 => (8, 3),
+        21 => (8, 5),
+        22 => (8, 8),
+        23 => (8, 10),
+        24 => (8, 14),
+        25 => (9, 1),
+        26 => (9, 4),
+        27 => (9, 8),
+        _ => return false,
+    };
+    gradle >= minimum && (java >= 17 || gradle < (9, 0))
+}
+
+fn gradle_distribution_version(build_dir: &Path, command: &str) -> Option<(u32, u32)> {
+    let version = |text: &str| {
+        let mut parts = text.split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    };
+    if Path::new(command).file_stem().is_some_and(|name| name == "gradlew") {
+        let properties = std::fs::read_to_string(build_dir.join("gradle/wrapper/gradle-wrapper.properties")).ok()?;
+        let url = properties.lines().find_map(|line| line.trim().strip_prefix("distributionUrl="))?;
+        return version(url.rsplit_once("gradle-")?.1.split('-').next()?);
+    }
+    let path = Path::new(command);
+    let path = if path.is_absolute() { path.to_path_buf() } else { crate::exec::which(command)? };
+    let path = dunce::canonicalize(path).ok()?;
+    let home = path.parent()?.parent()?;
+    for lib in [home.join("lib"), home.join("libexec/lib")] {
+        let Ok(entries) = std::fs::read_dir(lib) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(v) = name.strip_prefix("gradle-launcher-").and_then(|name| name.strip_suffix(".jar")) {
+                return version(v);
+            }
+        }
+    }
+    None
 }
 
 /// Gradle JVM overrides Project JDK; model callers supply the module's fallback environment.
@@ -153,18 +487,170 @@ pub fn gradle_env(
     env
 }
 
-/// Maven options from settings, placed before the goals: `-s <settings.xml>`
-/// and `-Dmaven.repo.local=<dir>`.
+/// Settings › Build Tools › Gradle → jdtls `java.import.gradle.*`: the Java import of the Gradle
+/// build in `build_dir` runs the same Gradle installation, user home and JVM as the IDE's own
+/// Gradle runs ([`gradle_build_env`]: Gradle JVM, else the Project JDK, else an installed JDK
+/// this Gradle version runs on). Without it a project that ships no wrapper is never imported,
+/// one whose caches live in a configured user home resolves no dependencies, and an older Gradle
+/// fails on the JDK jdtls itself runs on. The wrapper stays jdtls's default unless a local
+/// distribution is chosen.
+pub fn configure_gradle_runtime(cfg: &mut LanguageServerConfig, root: &Path, build_dir: &Path, s: &Settings) {
+    if cfg.name != "jdtls" {
+        return;
+    }
+    let g = &s.languages.java.gradle;
+    let mut gradle = serde_json::Map::new();
+    if g.distribution == ide_core::settings::GradleDistribution::Local
+        && let Some(home) = setting_path(root, &g.home)
+    {
+        gradle.insert("home".into(), json!(home.to_string_lossy()));
+        gradle.insert("wrapper".into(), json!({"enabled": false}));
+    }
+    let gradle_build = ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"]
+        .iter()
+        .any(|f| build_dir.join(f).is_file());
+    let env = if gradle_build {
+        let command = gradle_command(root, build_dir, s);
+        let command = command.to_string_lossy();
+        let mut env = gradle_build_env(root, build_dir, &command, s, None);
+        // No Project JDK and no Java version the build declares: jdtls would import on its own
+        // runtime, which an older Gradle cannot run on. Use an installed JDK this Gradle supports.
+        if !env.contains_key("JAVA_HOME")
+            && let Some(gradle) = gradle_distribution_version(build_dir, &command)
+            && let Some(jdk) = newest_gradle_jdk(gradle, &crate::java::installed_jdks())
+        {
+            env.insert("JAVA_HOME".into(), jdk.home.to_string_lossy().into_owned());
+        }
+        env
+    } else {
+        gradle_env(root, s, Default::default())
+    };
+    if let Some(home) = env.get("GRADLE_USER_HOME") {
+        gradle.insert("user".into(), json!({"home": home}));
+    }
+    if let Some(home) = env.get("JAVA_HOME") {
+        gradle.insert("java".into(), json!({"home": home}));
+    }
+    if gradle.is_empty() {
+        return;
+    }
+    merge(cfg.settings.get_or_insert_with(|| json!({})), json!({"java": {"import": {"gradle": gradle}}}));
+}
+
+/// Settings › Build Tools › Maven › Automatically download sources and Always update
+/// snapshots → jdtls `java.maven.downloadSources` / `java.maven.updateSnapshots`.
+pub fn configure_maven_sources(cfg: &mut LanguageServerConfig, s: &Settings) {
+    if cfg.name != "jdtls" {
+        return;
+    }
+    let m = &s.languages.java.maven;
+    merge(
+        cfg.settings.get_or_insert_with(|| json!({})),
+        json!({"java": {"maven": {"downloadSources": m.download_sources, "updateSnapshots": m.update_snapshots}}}),
+    );
+}
+
+/// Maven options from settings, placed before the goals: `-s <settings.xml>`,
+/// `-t <toolchains.xml>`, `-Dmaven.repo.local=<dir>`, `-T <count>`, `-P <profiles>` and `-U`.
 pub fn maven_options(root: &Path, s: &Settings) -> Vec<String> {
     let m = &s.languages.java.maven;
     let mut out = Vec::new();
     if let Some(file) = setting_path(root, &m.user_settings) {
         out.extend(["-s".to_owned(), file.to_string_lossy().into_owned()]);
     }
+    if let Some(file) = setting_path(root, &m.toolchains) {
+        out.extend(["-t".to_owned(), file.to_string_lossy().into_owned()]);
+    }
     if let Some(dir) = setting_path(root, &m.local_repository) {
         out.push(format!("-Dmaven.repo.local={}", dir.to_string_lossy()));
     }
+    if let Some(threads) = m.thread_count() {
+        out.extend(["-T".to_owned(), threads.to_owned()]);
+    }
+    if let Some(profiles) = non_empty(&m.active_profiles) {
+        out.extend(["-P".to_owned(), profiles.to_owned()]);
+    }
+    if m.update_snapshots {
+        out.push("-U".to_owned());
+    }
     out
+}
+
+fn maven_settings_prefixes(args: &[String]) -> Vec<usize> {
+    let mut prefixes = vec![0];
+    let mut i = 0;
+    while i < args.len() {
+        let Some(n) = maven_option_len(&args[i..]) else { break };
+        i += n;
+        prefixes.push(i);
+    }
+    prefixes
+}
+
+fn generated_maven_goal(config: &RunConfig) -> bool {
+    config.id.starts_with("maven:goal:") && config.extras.params.is_empty()
+}
+
+fn maven_goal_prefix(config: &RunConfig) -> Option<usize> {
+    let (_, goals) = config.id.split_once(".xml:")?;
+    maven_settings_prefixes(&config.args)
+        .into_iter()
+        .find(|&start| (start + 1..=config.args.len()).any(|end| config.args[start..end].join(" ") == goals))
+}
+
+/// Applies the current Maven settings at launch, including temporary configurations
+/// made before build-tool defaults stopped being stored in their command and arguments.
+pub fn prepare_maven_run(config: &mut RunConfig, root: &Path, s: &Settings) {
+    let mut detected = config.detected;
+    if generated_maven_goal(config) {
+        // The id records the user's original goals; only the settings prefix before them is derived.
+        if let Some(prefix) = maven_goal_prefix(config) {
+            config.args.drain(..prefix);
+        }
+        let name = config.command.rsplit(['/', '\\']).next().unwrap_or_default().to_ascii_lowercase();
+        if !matches!(name.as_str(), "mvnw" | "mvnw.cmd" | "mvnw.bat") {
+            config.command = "mvn".into();
+            if maven_command(root, s).is_none() {
+                let cwd = config.cwd.as_ref().map_or_else(|| root.to_path_buf(), |dir| root.join(dir.as_ref()));
+                for dir in cwd.ancestors().take_while(|dir| dir.starts_with(root)) {
+                    let wrapper = dir.join(if cfg!(windows) { "mvnw.cmd" } else { "mvnw" });
+                    if wrapper.is_file() {
+                        config.command = wrapper.to_string_lossy().into_owned();
+                        break;
+                    }
+                }
+            }
+        }
+    } else if config.detected || config.id.starts_with("context:") {
+        let saved = ide_run::load_user_configs(root).unwrap_or_default();
+        let id = config
+            .id
+            .strip_prefix("context:target:context:")
+            .or_else(|| config.id.strip_prefix("context:"))
+            .unwrap_or(&config.id);
+        let id = id.strip_prefix("workspace:").and_then(|id| id.split_once(':')).map_or(id, |(_, id)| id);
+        let source = ide_run::detect(root)
+            .into_iter()
+            .chain(saved.iter().cloned())
+            .filter(|base| base.kind == "maven" && (id == base.id || id.starts_with(&format!("{}:", base.id))))
+            .max_by_key(|base| base.id.len())
+            .filter(|base| !saved.iter().any(|user| user.id == base.id));
+        if let Some(base) = source.filter(|_| config.extras.params.is_empty()) {
+            if let Some(prefix) = maven_settings_prefixes(&config.args)
+                .into_iter()
+                .find(|&start| config.args[start..].starts_with(&base.args))
+            {
+                config.args.drain(..prefix);
+            }
+            config.command = base.command;
+        } else {
+            detected = false;
+        }
+    }
+    let original = config.detected;
+    config.detected = detected;
+    apply_to_run_configs(std::slice::from_mut(config), root, s);
+    config.detected = original;
 }
 
 /// The Maven local repository from settings: the configured one, else
@@ -172,12 +658,122 @@ pub fn maven_options(root: &Path, s: &Settings) -> Vec<String> {
 pub fn maven_local_repository(root: &Path, s: &Settings) -> Option<PathBuf> {
     let m = &s.languages.java.maven;
     setting_path(root, &m.local_repository).or_else(|| {
-        let text = std::fs::read_to_string(setting_path(root, &m.user_settings)?).ok()?;
-        let repo = crate::java::xml_value(&crate::lombok::strip_xml_comments(&text), "localRepository")?;
-        let home = crate::home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
-        let repo = repo.replace("${user.home}", &home);
-        (!repo.is_empty() && !repo.contains("${")).then(|| PathBuf::from(repo))
+        let home = crate::home_dir().unwrap_or_default();
+        settings_local_repository(&setting_path(root, &m.user_settings)?, &home)
     })
+}
+
+/// The local repository a plain `mvn` uses when nothing is configured: `<localRepository>` of
+/// `~/.m2/settings.xml`, else `~/.m2/repository`.
+pub fn default_maven_repository() -> Option<PathBuf> {
+    default_maven_repository_in(&crate::home_dir()?)
+}
+
+pub(crate) fn default_maven_repository_in(home: &Path) -> Option<PathBuf> {
+    let m2 = home.join(".m2");
+    Some(settings_local_repository(&m2.join("settings.xml"), home).unwrap_or_else(|| m2.join("repository")))
+}
+
+/// `<localRepository>` of a Maven `settings.xml`, with `${user.home}` expanded.
+fn settings_local_repository(file: &Path, home: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let repo = crate::java::xml_value(&crate::lombok::strip_xml_comments(&text), "localRepository")?;
+    let repo = repo.replace("${user.home}", &home.to_string_lossy());
+    (!repo.is_empty() && !repo.contains("${")).then(|| PathBuf::from(repo))
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// `settings_xml` with `<localRepository>` set to `repo`: an existing one is replaced, else
+/// one goes right after the `<settings>` open tag. `None` without a `<settings>` element.
+pub(crate) fn with_local_repository(settings_xml: &str, repo: &str) -> Option<String> {
+    use crate::maven_profiles::{find_tag, mask_comments};
+    let masked = mask_comments(settings_xml);
+    let element = format!("<localRepository>{}</localRepository>", xml_escape(repo));
+    if let Some(start) = find_tag(&masked, "<localRepository", 0) {
+        let open_end = start + masked[start..].find('>')?;
+        let end = if masked[..open_end].ends_with('/') {
+            open_end + 1
+        } else {
+            let close = open_end + masked[open_end..].find("</localRepository")?;
+            close + masked[close..].find('>')? + 1
+        };
+        return Some(format!("{}{element}{}", &settings_xml[..start], &settings_xml[end..]));
+    }
+    let start = find_tag(&masked, "<settings", 0)?;
+    let end = start + masked[start..].find('>')?;
+    if masked[..end].ends_with('/') {
+        return None;
+    }
+    Some(format!("{}{element}{}", &settings_xml[..=end], &settings_xml[end + 1..]))
+}
+
+/// The user settings m2e (the JDTLS Maven import) reads, as a file and its text: the
+/// configured `settings.xml`, else `~/.m2/settings.xml`, with the configured local
+/// repository as its `<localRepository>`. m2e reads mirrors, servers and the local
+/// repository from this file only, never from `-Dmaven.repo.local`, which is how the IDE's
+/// own `mvn` runs get the configured repository (#1739). The file is `None` when there is none.
+pub(crate) fn m2e_user_settings(root: &Path, s: &Settings, home: &Path) -> (Option<PathBuf>, String) {
+    let m = &s.languages.java.maven;
+    let file = setting_path(root, &m.user_settings)
+        .or_else(|| Some(home.join(".m2").join("settings.xml")).filter(|f| f.is_file()));
+    let text = file
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .unwrap_or_else(|| "<settings>\n</settings>\n".into());
+    match setting_path(root, &m.local_repository) {
+        Some(repo) => {
+            let merged = with_local_repository(&text, &repo.to_string_lossy());
+            (file, merged.unwrap_or(text))
+        }
+        None => (file, text),
+    }
+}
+
+fn write_m2e_settings(root: &Path, text: &str) -> Option<PathBuf> {
+    let file = ide_core::project_dir::path(root, "maven-settings.xml");
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    match std::fs::read_to_string(&file) {
+        Ok(existing) if existing == text => {}
+        _ => std::fs::write(&file, text).ok()?,
+    }
+    Some(file)
+}
+
+/// The user settings file m2e should read (see [`m2e_user_settings`]): the configured
+/// `settings.xml` as it is when no local repository is configured or it already names that
+/// one, else a derived copy under `<root>/.openidea/`. `None` = m2e's default applies.
+pub fn maven_user_settings_for_m2e(root: &Path, s: &Settings) -> Option<PathBuf> {
+    maven_user_settings_for_m2e_in(root, s, &crate::home_dir().unwrap_or_default())
+}
+
+pub(crate) fn maven_user_settings_for_m2e_in(root: &Path, s: &Settings, home: &Path) -> Option<PathBuf> {
+    let m = &s.languages.java.maven;
+    let configured = setting_path(root, &m.user_settings);
+    setting_path(root, &m.local_repository)?;
+    let (file, text) = m2e_user_settings(root, s, home);
+    if file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|original| original == text) {
+        return file;
+    }
+    write_m2e_settings(root, &text).or(configured)
+}
+
+/// `conf/settings.xml` of the Maven installation the IDE's `mvn` runs use (Settings ›
+/// Maven home, a version manager's pin, else `mvn` on `PATH`; none with a project wrapper):
+/// `mvn` reads its mirrors and repositories as global settings, m2e only when told to.
+pub fn maven_global_settings(root: &Path, s: &Settings) -> Option<PathBuf> {
+    let mvn = match maven_command(root, s) {
+        Some(mvn) => mvn,
+        None if root.join("mvnw").is_file() || root.join("mvnw.cmd").is_file() => return None,
+        None => crate::exec::which("mvn")?,
+    };
+    let mvn = dunce::canonicalize(&mvn).unwrap_or(mvn);
+    let file = mvn.parent()?.parent()?.join("conf").join("settings.xml");
+    file.is_file().then_some(file)
 }
 
 /// TypeScript `lib` directory for the selected version; `None` = the server's bundled one.
@@ -192,9 +788,20 @@ pub fn tsdk(root: &Path, s: &Settings) -> Option<PathBuf> {
     }
 }
 
-const PYTHON_SERVERS: [&str; 6] = ["basedpyright", "pyright", "ty", "pylsp", "jedi-language-server", "ruff"];
+/// TypeScript 7's native executable when the selected TypeScript is one (see
+/// [`native_typescript`]); `None` for the bundled one and TypeScript 6 and older.
+pub fn native_tsdk(root: &Path, s: &Settings) -> Option<PathBuf> {
+    match s.languages.typescript.version.trim() {
+        "" | "bundled" => None,
+        "workspace" => native_typescript(&root.join("node_modules/typescript")),
+        custom => native_typescript(&setting_path(root, custom)?),
+    }
+}
 
-fn merge(base: &mut Value, layer: Value) {
+const PYTHON_SERVERS: [&str; 8] =
+    ["basedpyright", "pyright", "ty", "pyrefly", "pylsp", "jedi-language-server", "ruff", "djlsp"];
+
+pub(crate) fn merge(base: &mut Value, layer: Value) {
     match (base, layer) {
         (Value::Object(base), Value::Object(layer)) => {
             for (k, v) in layer {
@@ -211,7 +818,14 @@ fn merge(base: &mut Value, layer: Value) {
 }
 
 /// Excludes project-relative Maven POM paths from JDTLS import, preserving user exclusions.
-pub fn configure_maven_import(cfg: &mut LanguageServerConfig, root: &Path, excluded_poms: &[PathBuf]) {
+/// `build_files` (`file:` URIs), when given, are the only build files jdtls imports: the
+/// exclusions cannot leave out a module of a reactor jdtls imports.
+pub fn configure_maven_import(
+    cfg: &mut LanguageServerConfig,
+    root: &Path,
+    excluded_poms: &[PathBuf],
+    build_files: Option<&[String]>,
+) {
     if cfg.name != "jdtls" {
         return;
     }
@@ -243,6 +857,9 @@ pub fn configure_maven_import(cfg: &mut LanguageServerConfig, root: &Path, exclu
     }
     if !excluded_poms.is_empty() {
         merge_init_options(cfg, json!({"settings": {"java": {"import": {"exclusions": exclusions}}}}));
+        if let Some(files) = build_files {
+            merge_init_options(cfg, json!({"projectConfigurations": files}));
+        }
         if let Some(settings) = &mut cfg.settings {
             merge(
                 settings,
@@ -264,6 +881,36 @@ pub fn configure_maven_import(cfg: &mut LanguageServerConfig, root: &Path, exclu
     }
 }
 
+/// Explicit Gradle links constrain discovery and isolate JDT's persisted import state.
+pub fn configure_gradle_import(
+    cfg: &mut LanguageServerConfig,
+    linked: Option<&[String]>,
+    build_files: Option<&[String]>,
+) {
+    let Some(linked) = linked.filter(|_| cfg.name == "jdtls") else { return };
+    merge_init_options(
+        cfg,
+        json!({
+            "settings": {"java": {"import": {"gradle": {"enabled": !linked.is_empty()}}}},
+            "projectConfigurations": build_files.unwrap_or_default()
+        }),
+    );
+    if let Some(settings) = &mut cfg.settings {
+        merge(settings, json!({"java": {"import": {"gradle": {"enabled": !linked.is_empty()}}}}));
+    }
+    if let Some(index) = cfg.args.iter().position(|arg| arg == "-data")
+        && let Some(workspace) = cfg.args.get_mut(index + 1)
+    {
+        let mut hash = 0xcbf29ce484222325u64;
+        for dir in linked {
+            for byte in dir.bytes().chain([0]) {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        *workspace = format!("{workspace}-gradle-{hash:016x}");
+    }
+}
+
 pub(crate) fn merge_init_options(cfg: &mut LanguageServerConfig, layer: Value) {
     let mut current =
         cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok()).unwrap_or_else(|| json!({}));
@@ -277,15 +924,133 @@ pub(crate) fn merge_init_options(cfg: &mut LanguageServerConfig, layer: Value) {
     }
 }
 
+/// The settings section a Python type checker reads its analysis settings from:
+/// basedpyright uses its own section, Pyright the `python` one. `None` for servers
+/// that have no `analysis.extraPaths` (ty, pyrefly, Ruff, pylsp, …).
+fn python_analysis_section(name: &str) -> Option<&'static str> {
+    match name {
+        "basedpyright" => Some("basedpyright"),
+        "pyright" => Some("python"),
+        _ => None,
+    }
+}
+
+/// Adds attached dependency roots to basedpyright/Pyright's `analysis.extraPaths`, so
+/// imports into projects configured in Project Structure › Dependencies resolve in the
+/// editor too — not just in the IDE's own index/navigation.
+///
+/// Existing paths (from the user's `pyrightconfig.json` / `[tool.basedpyright]`, or a
+/// container run target) are kept first and de-duplicated: `merge` replaces arrays
+/// wholesale, so it cannot be used here. Paths are IPC-style (`/`-separated) to match
+/// the container snapshot's `extraPaths`.
+pub fn configure_python_extra_paths(cfg: &mut LanguageServerConfig, roots: &[PathBuf]) {
+    let Some(section) = python_analysis_section(&cfg.name) else { return };
+    if roots.is_empty() {
+        return;
+    }
+    let mut current =
+        cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok()).unwrap_or_else(|| json!({}));
+    let mut node = &mut current;
+    for key in ["settings", section, "analysis"] {
+        node = object_entry(node, key);
+    }
+    let analysis = node.as_object_mut().expect("made an object above").entry("extraPaths").or_insert_with(|| json!([]));
+    let mut paths: Vec<String> = analysis
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    for root in roots {
+        let path = ide_core::ipc_path::to_ipc(root);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    *analysis = json!(paths);
+    match toml::Value::try_from(current) {
+        Ok(v) => cfg.initialization_options = Some(v),
+        Err(e) => tracing::warn!("{}: cannot add extraPaths to initialization options: {e}", cfg.name),
+    }
+}
+
+/// `value[key]`, made an empty object when it is missing or not an object; `value` too.
+fn object_entry<'a>(value: &'a mut Value, key: &str) -> &'a mut Value {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let entry = value.as_object_mut().expect("made an object above").entry(key).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    entry
+}
+
+/// Editor › Inspections › Java: "Serializable class without 'serialVersionUID'" (off by default,
+/// as in IntelliJ IDEA). ECJ reports it, so it is a compiler option rather than a filter.
+pub const SERIAL_VERSION_INSPECTION: &str = "java:missing-serial-version";
+
+/// ECJ's level for a missing `serialVersionUID`, from the inspection profile in effect.
+fn missing_serial_version(inspections: &InspectionSettings) -> Option<&'static str> {
+    let o = inspections.active().get(SERIAL_VERSION_INSPECTION)?;
+    if o.enabled != Some(true) {
+        return None;
+    }
+    Some(match o.severity {
+        Some(InspectionLevel::Error) => "error",
+        None | Some(InspectionLevel::Warning) => "warning",
+        Some(_) => "info",
+    })
+}
+
 /// Workspace compiler defaults; Eclipse project preferences still take precedence.
-pub(crate) fn configure_java_compiler(cfg: &mut LanguageServerConfig, data_dir: &Path) {
-    let file = data_dir.join("lsp/jdtls/compiler-defaults.prefs");
+/// Each variant has its own file, so changing an inspection restarts the server with it.
+pub fn configure_java_compiler(cfg: &mut LanguageServerConfig, data_dir: &Path, inspections: &InspectionSettings) {
+    configure_java_compiler_with_level(cfg, data_dir, inspections, None);
+}
+
+/// A Java language level as (file-name tag, JDT compliance value): `6` / `1.6` → `("6", "1.6")`,
+/// `17` → `("17", "17")`. Levels 5–8 use JDT's `1.x` spelling; unknown values are ignored.
+fn java_compliance(level: &str) -> Option<(String, String)> {
+    let level = level.trim();
+    let major: u32 = level.strip_prefix("1.").unwrap_or(level).parse().ok()?;
+    match major {
+        5..=8 => Some((major.to_string(), format!("1.{major}"))),
+        9..=99 if !level.starts_with("1.") => Some((major.to_string(), major.to_string())),
+        _ => None,
+    }
+}
+
+/// Like [`configure_java_compiler`], also applying the Project Structure Java language level
+/// (`source`, `compliance`, `codegen.targetPlatform`) when configured.
+pub fn configure_java_compiler_with_level(
+    cfg: &mut LanguageServerConfig,
+    data_dir: &Path,
+    inspections: &InspectionSettings,
+    language_level: Option<&str>,
+) {
     const DEFAULTS: &str = "org.eclipse.jdt.core.compiler.problem.forbiddenReference=warning\n\
 org.eclipse.jdt.core.compiler.problem.discouragedReference=warning\n";
+    let serial = missing_serial_version(inspections);
+    let normalized_level = language_level.and_then(java_compliance);
+    let mut stem = "compiler-defaults".to_owned();
+    let mut content = DEFAULTS.to_owned();
+    if let Some(level) = serial {
+        stem.push_str(&format!("-serial-{level}"));
+        content.push_str(&format!("org.eclipse.jdt.core.compiler.problem.missingSerialVersion={level}\n"));
+    }
+    if let Some((tag, jdt_ver)) = normalized_level {
+        stem.push_str(&format!("-level-{tag}"));
+        content.push_str(&format!(
+            "org.eclipse.jdt.core.compiler.source={jdt_ver}\n\
+org.eclipse.jdt.core.compiler.compliance={jdt_ver}\n\
+org.eclipse.jdt.core.compiler.codegen.targetPlatform={jdt_ver}\n"
+        ));
+    }
+    let name = format!("{stem}.prefs");
+    let file = data_dir.join("lsp/jdtls").join(name);
     let write = || -> ide_core::IdeResult<()> {
         std::fs::create_dir_all(file.parent().expect("compiler preferences directory"))?;
-        if std::fs::read_to_string(&file).ok().as_deref() != Some(DEFAULTS) {
-            ide_vfs::write_atomic(&file, DEFAULTS.as_bytes())?;
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(content.as_str()) {
+            ide_vfs::write_atomic(&file, content.as_bytes())?;
         }
         Ok(())
     };
@@ -293,9 +1058,10 @@ org.eclipse.jdt.core.compiler.problem.discouragedReference=warning\n";
         tracing::warn!("jdtls: cannot write compiler defaults: {e}");
         return;
     }
-    // jdtls accepts absolute filesystem paths as well as URLs (including paths
-    // containing spaces and Windows backslashes). Explicit server settings win later.
-    let defaults = json!({"settings": {"java": {"settings": {"url": file.to_string_lossy()}}}});
+    // A `file:` URI: jdtls parses the setting as a URI when matching watched-file
+    // changes, which fails on a bare path with spaces. Explicit server settings win later.
+    let url = url::Url::from_file_path(&file).map_or_else(|()| file.to_string_lossy().into_owned(), String::from);
+    let defaults = json!({"settings": {"java": {"settings": {"url": url}}}});
     let existing = cfg.initialization_options.clone();
     merge_init_options(cfg, defaults);
     if let Some(existing) = existing {
@@ -327,11 +1093,33 @@ pub fn resolve_run_command(config: &mut RunConfig, root: &Path, s: &Settings) {
     }
 }
 
+/// The environment folder holding `python` (`<env>/bin/python`, `<env>/Scripts/python.exe`):
+/// a virtualenv, or a conda or pixi environment.
+fn environment_of(python: &Path) -> Option<PathBuf> {
+    venv_of(python).or_else(|| {
+        let bin = python.parent()?;
+        let env = bin.parent()?;
+        matches!(bin.file_name()?.to_str()?, "bin" | "Scripts").then(|| env.to_path_buf())
+    })
+}
+
 pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root: &Path, s: &Settings) {
+    let mut path_dirs: Vec<PathBuf> = Vec::new();
     if let Some(custom) = tool_command(root, s, &cfg.command) {
+        // An executable chosen from a Node.js installation (`~/.nvm/versions/node/v26/bin/tsc`,
+        // its `npx`) runs on that Node: its `#!/usr/bin/env node` finds the `node` beside it.
+        if let Some(bin) = custom.parent().filter(|bin| bin.join(exe("node")).is_file()) {
+            path_dirs.push(bin.to_path_buf());
+        }
         cfg.command = custom.to_string_lossy().into_owned();
     }
-    let mut path_dirs: Vec<PathBuf> = Vec::new();
+    // `java -jar` servers run on the project JDK when there is one, like JAR Application runs.
+    if cfg.command == "java"
+        && let Some(java) =
+            project_jdk(root, s).map(|jdk| crate::java::java_executable(&jdk.home)).filter(|j| j.is_file())
+    {
+        cfg.command = java.to_string_lossy().into_owned();
+    }
     let name = cfg.name.clone();
     let name = name.as_str();
 
@@ -345,6 +1133,13 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
                 "basedpyright" | "pyright" => merge_init_options(cfg, json!({ "python": { "pythonPath": p } })),
                 "pylsp" => merge_init_options(cfg, json!({ "pylsp": { "plugins": { "jedi": { "environment": p } } } })),
                 "jedi-language-server" => merge_init_options(cfg, json!({ "workspace": { "environmentPath": p } })),
+                // Django's template tags, filters and template folders are read by running a script
+                // with the interpreter in one of these environment folders.
+                "djlsp" => {
+                    if let Some(env) = environment_of(&python) {
+                        merge_init_options(cfg, json!({ "env_directories": [env.to_string_lossy()] }));
+                    }
+                }
                 _ => {}
             }
             if let Some(venv) = venv_of(&python) {
@@ -352,6 +1147,59 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
                 path_dirs.push(venv.join(bin_dir()));
             }
         }
+    }
+
+    if name == "ruff" {
+        match ruff_configuration(root, &s.languages.ruff.configuration_directory) {
+            Ok(Some(path)) => {
+                let mut settings = cfg.settings.take().filter(Value::is_object).unwrap_or_else(|| json!({}));
+                settings["configuration"] = json!(path.to_string_lossy());
+                cfg.settings = Some(settings);
+            }
+            Ok(None) => {}
+            Err(e) => cfg.launch_error = Some(e.message),
+        }
+    }
+
+    if name == "yaml-language-server" && !s.files.compose_file_overrides.is_empty() {
+        let mut settings = cfg.settings.take().filter(Value::is_object).unwrap_or_else(|| json!({}));
+        let mut kept = Vec::new();
+        let mut excluded = Vec::new();
+        for (path, status) in &s.files.compose_file_overrides {
+            let p = Path::new(path);
+            let abs = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+            let normalized = abs.to_string_lossy().replace('\\', "/");
+            match status {
+                ide_core::settings::ComposeFileOverride::Kept => kept.push(normalized),
+                ide_core::settings::ComposeFileOverride::Excluded => excluded.push(normalized),
+            }
+        }
+        let yaml = settings
+            .as_object_mut()
+            .expect("object")
+            .entry("yaml")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("object");
+        let schemas = yaml.entry("schemas").or_insert_with(|| json!({})).as_object_mut().expect("object");
+        let entry = schemas.entry(ide_language::COMPOSE_SCHEMA_URL).or_insert_with(|| json!([]));
+        if let Value::String(single) = entry {
+            *entry = json!([single.clone()]);
+        }
+        if let Some(list) = entry.as_array_mut() {
+            for p in kept {
+                if !list.iter().any(|v| v.as_str() == Some(&p)) {
+                    list.push(Value::String(p));
+                }
+            }
+            for p in &excluded {
+                let neg = format!("!{p}");
+                if !list.iter().any(|v| v.as_str() == Some(&neg)) {
+                    list.push(Value::String(neg));
+                }
+            }
+        }
+        cfg.settings = Some(settings);
     }
 
     if name == "rust-analyzer" {
@@ -389,13 +1237,19 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
         for (key, value) in module_env {
             build["env"][key] = json!(value);
         }
+        if s.languages.go.gofumpt {
+            build["gofumpt"] = json!(true);
+        }
         let mut settings = cfg.settings.take().unwrap_or_else(|| json!({}));
         // gopls retains omitted keys on reconfiguration. Explicit empty values
         // restore defaults when the last project constraint is cleared.
+        // Settings › Language Servers options are merged later, so look at them too.
         let init = cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok());
-        for (key, default) in [("buildFlags", json!([])), ("env", json!({}))] {
+        let user_init = s.language_servers.get(&cfg.name).and_then(|ls| ls.initialization_options.as_ref());
+        for (key, default) in [("buildFlags", json!([])), ("env", json!({})), ("gofumpt", json!(false))] {
             if settings.get(key).is_none() {
-                settings[key] = init.as_ref().and_then(|v| v.get(key)).cloned().unwrap_or(default);
+                let explicit = user_init.and_then(|v| v.get(key)).or_else(|| init.as_ref()?.get(key));
+                settings[key] = explicit.cloned().unwrap_or(default);
             }
         }
         merge(&mut settings, build);
@@ -413,13 +1267,55 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
         // The jdtls launcher forwards `--jvm-arg=` values to the JVM it starts.
         let args = s.languages.java.jdtls_vm_args.split_whitespace().map(|a| format!("--jvm-arg={a}"));
         cfg.args.extend(args);
-        // m2e (the Maven import) reads mirrors, servers and `<localRepository>` from it.
-        if let Some(file) = setting_path(root, &s.languages.java.maven.user_settings) {
+        // m2e (the Maven import) reads mirrors, servers and `<localRepository>`
+        // from the settings file — never from `-Dmaven.repo.local`. The
+        // derived file carries the configured local repository so the import
+        // downloads where the IDE's own `mvn` runs do (#1739).
+        if let Some(file) =
+            maven_user_settings_for_m2e(root, s).or_else(|| setting_path(root, &s.languages.java.maven.user_settings))
+        {
             let file = file.to_string_lossy();
             merge_init_options(
                 cfg,
                 json!({ "settings": { "java": { "configuration": { "maven": { "userSettings": file } } } } }),
             );
+        }
+        if let Some(file) = maven_global_settings(root, s) {
+            let file = file.to_string_lossy();
+            merge_init_options(
+                cfg,
+                json!({ "settings": { "java": { "configuration": { "maven": { "globalSettings": file } } } } }),
+            );
+        }
+        // The JVM system property is still forwarded for JVM-level consumers,
+        // but it is the settings file above that m2e honors. A
+        // `-Dmaven.repo.local` the user put in their own jdtls VM options wins.
+        if let Some(repo) = maven_local_repository(root, s) {
+            let arg = format!("-Dmaven.repo.local={}", repo.to_string_lossy());
+            let taken = cfg.args.iter().enumerate().any(|(i, a)| {
+                let value = a
+                    .strip_prefix("--jvm-arg=")
+                    .or_else(|| (i > 0 && cfg.args[i - 1] == "--jvm-arg").then_some(a.as_str()));
+                value.is_some_and(|a| a.split('=').next() == Some("-Dmaven.repo.local"))
+            });
+            if !taken {
+                cfg.args.push(format!("--jvm-arg={arg}"));
+            }
+        }
+    }
+
+    if name == "java-analyzer" {
+        // Unset, java-analyzer finds a JDK and the Maven local repository the way Maven does;
+        // the server's own `initializationOptions` in settings are merged later and win.
+        let mut layer = serde_json::Map::new();
+        if let Some(jdk) = project_jdk(root, s) {
+            layer.insert("jdkHome".into(), json!(jdk.home.to_string_lossy()));
+        }
+        if let Some(repo) = maven_local_repository(root, s) {
+            layer.insert("maven".into(), json!({ "localRepository": repo.to_string_lossy() }));
+        }
+        if !layer.is_empty() {
+            merge_init_options(cfg, Value::Object(layer));
         }
     }
 
@@ -433,6 +1329,21 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
             _ => {}
         }
     }
+    // TypeScript 7 serves LSP itself: it replaces the tsserver-based server.
+    if matches!(name, "vtsls" | "typescript-language-server")
+        && let Some(native) = native_tsdk(server_root, s).or_else(|| native_tsdk(root, s))
+    {
+        cfg.command = native.to_string_lossy().into_owned();
+        cfg.args = vec!["--lsp".into(), "--stdio".into()];
+        cfg.display_name = Some("TypeScript 7".into());
+        cfg.initialization_options = None;
+        // Completing a JSX prop adds `=""` or `={}` by its type, as vtsls does by default;
+        // TypeScript 7 adds no value unless asked.
+        let jsx = json!({ "preferences": { "jsxAttributeCompletionStyle": "auto" } });
+        merge_init_options(cfg, json!({ "typescript": jsx, "javascript": jsx }));
+        cfg.tsserver_project = false;
+        return;
+    }
     let vue_command = s.tool_path(vue::SERVER).and_then(|p| setting_path(root, p));
     let vue_command = vue_command.as_deref().map_or(vue::SERVER.into(), Path::to_string_lossy);
     if name == "vtsls"
@@ -440,14 +1351,65 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
     {
         let plugin = vue::tsserver_plugin(&vue);
         merge_init_options(cfg, json!({ "vtsls": { "tsserver": { "globalPlugins": [plugin] } } }));
+        cfg.tsserver_project_extras.extensions = vec![vue::EXTENSION.into()];
+        // Hybrid mode: one program holds every .vue's virtual TypeScript, so the
+        // heap must clear it (vtsls' default 3072 dies in a GC death spiral), and
+        // the syntax tsserver duplicates the plugin and its file watching.
+        merge_init_options(
+            cfg,
+            json!({ "typescript": { "tsserver": { "useSyntaxServer": "never", "maxTsServerMemory": 8192 } } }),
+        );
+        // A configured project resolves its own types; the typings installer only
+        // serves inferred projects and keeps scanning npm in the background.
+        if server_root.ancestors().any(|d| d.join("tsconfig.json").is_file() || d.join("jsconfig.json").is_file()) {
+            merge_init_options(cfg, json!({ "typescript": { "disableAutomaticTypeAcquisition": true } }));
+        }
+    }
+    let memory = s.languages.typescript.tsserver_max_memory;
+    if name == "vtsls" && memory > 0 {
+        merge_init_options(cfg, json!({ "typescript": { "tsserver": { "maxTsServerMemory": memory } } }));
+    }
+    if name == "vtsls"
+        && cfg.tsserver_project
+        && !server_root.ancestors().any(|d| d.join("tsconfig.json").is_file() || d.join("jsconfig.json").is_file())
+    {
+        let node = node_dir(root, s).map(|d| d.join(exe("node"))).filter(|p| p.is_file()).or_else(|| which("node"));
+        cfg.tsserver_project_extras.paths = vue::cli_paths(server_root, node.as_deref());
     }
     if name == vue::SERVER {
         configure_vue_typescript(cfg, root, server_root, s);
     }
 
+    // Intelephense reads it as `intelephense.environment.phpVersion` (`workspace/configuration`).
+    if name == "intelephense"
+        && let Some(level) = crate::php::language_level(root, s)
+    {
+        merge_init_options(cfg, json!({ "environment": { "phpVersion": level.version } }));
+    }
+    if name == "intelephense" {
+        if let Some(stubs) = crate::php::intelephense_stubs(root, s) {
+            merge_init_options(cfg, json!({ "stubs": stubs }));
+        }
+        let include_paths = crate::php::include_paths(root, s);
+        if !include_paths.is_empty() {
+            merge_init_options(cfg, json!({ "environment": { "includePaths": include_paths } }));
+        }
+    }
+
     // Node-based servers (`#!/usr/bin/env node`) run on the selected Node.js.
     if let Some(dir) = node_dir(root, s) {
         path_dirs.push(dir);
+    }
+    // PHP servers (phpactor, `php intelephense`-style wrappers) on the selected PHP.
+    if let Some(dir) = php_dir(root, s) {
+        path_dirs.push(dir);
+    }
+
+    // Gems install to the Ruby's bindir, which is not always on `PATH` (Homebrew).
+    if name == "ruby-lsp"
+        && let Some(ruby) = ruby_interpreter(root, s)
+    {
+        path_dirs.extend(crate::ruby::gem_bin_dirs(&ruby, server_root));
     }
 
     if !path_dirs.is_empty() {
@@ -459,6 +1421,46 @@ pub fn configure_server(cfg: &mut LanguageServerConfig, root: &Path, server_root
     if name == angular::SERVER {
         configure_angular(cfg, root, server_root, s);
     }
+    if name == astro::SERVER {
+        astro::configure(cfg, root, server_root, s);
+    }
+    if name == crate::arduino::SERVER {
+        crate::arduino::configure(cfg, root, server_root, s);
+    }
+}
+
+/// Registers the companion module-resolution plugin for the Vue hybrid mode's tsserver.
+/// The Vue plugin only resolves imports that name the
+/// `.vue` file: a directory `index.js` re-exporting a sibling `.vue`
+/// (`import ChildButton from './ChildButton'`) leaves the component `any`, and with it every
+/// `@event="method"` handler type in the project's templates (#3728; VS Code patches tsserver
+/// itself for this). The companion plugin retries only what tsserver and the Vue plugin left
+/// unresolved, so it is registered after theirs. No-op without it (no Vue language server).
+pub fn configure_vue_module_resolution(cfg: &mut LanguageServerConfig, data_dir: &Path) -> bool {
+    let Some(vue_at) = cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok()).and_then(|v| {
+        v.pointer("/vtsls/tsserver/globalPlugins")
+            .and_then(Value::as_array)
+            .and_then(|plugins| plugins.iter().position(|p| p.get("name").and_then(Value::as_str) == Some(vue::PLUGIN)))
+    }) else {
+        return false;
+    };
+    let Some(plugin) = vue::module_resolution_plugin(data_dir) else {
+        return false;
+    };
+    let mut current =
+        cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok()).unwrap_or_else(|| json!({}));
+    let Some(plugins) = current.pointer_mut("/vtsls/tsserver/globalPlugins").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    match plugins.iter().position(|p| p.get("name").and_then(Value::as_str) == Some(vue::MODULE_RESOLUTION_PLUGIN)) {
+        Some(at) => plugins[at] = plugin,
+        None => plugins.insert(vue_at + 1, plugin),
+    }
+    match toml::Value::try_from(current) {
+        Ok(v) => cfg.initialization_options = Some(v),
+        Err(e) => tracing::warn!("{}: cannot apply settings to initialization options: {e}", cfg.name),
+    }
+    true
 }
 
 /// The servers `language` uses after Settings › Language Servers: the
@@ -471,7 +1473,29 @@ pub fn language_servers(language: &str, defined: &[LanguageServerConfig], s: &Se
             out.push(custom_server(name, ls));
         }
     }
+    if non_empty(&s.languages.ruff.configuration_directory).is_some() {
+        for cfg in out.iter_mut().filter(|cfg| cfg.name == "ruff") {
+            cfg.require_root_marker = false;
+        }
+    }
     out
+}
+
+/// Built-in servers given an executable path in Settings › Language Servers, as
+/// (definition's command, path): they run that executable (see [`server_launch_overrides`]).
+pub fn server_command_paths<'a>(
+    servers: impl IntoIterator<Item = &'a LanguageServerConfig>,
+    root: &Path,
+    s: &Settings,
+) -> Vec<(String, PathBuf)> {
+    servers
+        .into_iter()
+        .filter_map(|server| {
+            let command = s.language_servers.get(&server.name)?.command.trim();
+            let path = command.contains(['/', '\\']).then(|| setting_path(root, command))??;
+            Some((server.command.clone(), path))
+        })
+        .collect()
 }
 
 /// Adds the servers defined in settings to the languages they serve (to list
@@ -492,6 +1516,7 @@ fn custom_server(name: &str, ls: &LanguageServerSettings) -> LanguageServerConfi
         command: ls.command.trim().to_owned(),
         args: Vec::new(),
         env: Default::default(),
+        requires_env: Vec::new(),
         root_markers: ls.root_markers.clone(),
         require_root_marker: false,
         initialization_options: None,
@@ -502,9 +1527,16 @@ fn custom_server(name: &str, ls: &LanguageServerSettings) -> LanguageServerConfi
         }),
         connect: None,
         fallback: false,
+        replaces: Vec::new(),
+        features: Vec::new(),
+        code_action_kinds: Vec::new(),
         max_java: None,
         launch_error: None,
         tsserver_project: false,
+        tsserver_project_extras: Default::default(),
+        resync_on_configuration: false,
+        display_name: None,
+        pinned: None,
     }
 }
 
@@ -514,19 +1546,39 @@ pub fn server_launch_overrides(cfg: &mut LanguageServerConfig, s: &Settings) {
     let Some(ls) = s.language_servers.get(&cfg.name) else { return };
     if let Some(command) = non_empty(ls.command.trim()) {
         cfg.command = command.to_owned();
+        // The user's own program, not the one approved for a plugin.
+        cfg.pinned = None;
     }
     if let Some(args) = &ls.args {
         cfg.args = args.clone();
     }
+    // A server shipped as a runnable jar (groovy-language-server-all.jar) runs on `java -jar`;
+    // `configure_server` then picks the project JDK's `java`.
+    if Path::new(&cfg.command).extension().is_some_and(|e| e.eq_ignore_ascii_case("jar")) {
+        let jar = std::mem::replace(&mut cfg.command, "java".to_owned());
+        cfg.args.splice(0..0, ["-jar".to_owned(), jar]);
+    }
 }
 
-/// Environment, `initializationOptions` and `workspace/configuration` settings
-/// from Settings › Language Servers; applied last so they win over derived values.
+/// Environment, features, `initializationOptions` and `workspace/configuration`
+/// settings from Settings › Language Servers; applied last so they win over derived values.
 pub fn server_protocol_overrides(cfg: &mut LanguageServerConfig, s: &Settings) {
     let Some(ls) = s.language_servers.get(&cfg.name) else { return };
     cfg.env.extend(ls.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if let Some(features) = &ls.features {
+        cfg.features = features.clone();
+    }
+    if let Some(kinds) = &ls.code_action_kinds {
+        cfg.code_action_kinds = kinds.clone();
+    }
     if let Some(options) = &ls.initialization_options {
+        let astro_tsdk = (cfg.name == astro::SERVER)
+            .then(|| cfg.initialization_options.as_ref()?.get("typescript")?.get("tsdk")?.as_str().map(str::to_owned))
+            .flatten();
         merge_init_options(cfg, options.clone());
+        if let Some(tsdk) = astro_tsdk {
+            merge_init_options(cfg, json!({ "typescript": { "tsdk": tsdk } }));
+        }
     }
     if let Some(settings) = &ls.settings {
         let mut current = cfg.settings.take().filter(Value::is_object).unwrap_or_else(|| json!({}));
@@ -539,10 +1591,10 @@ pub fn server_protocol_overrides(cfg: &mut LanguageServerConfig, s: &Settings) {
 /// `require('typescript')`): the selected version, else its own, else the
 /// project's — whichever still has the language-service API.
 fn configure_vue_typescript(cfg: &mut LanguageServerConfig, root: &Path, server_root: &Path, s: &Settings) {
-    let selected = tsdk(server_root, s).or_else(|| tsdk(root, s)).filter(|l| vue::has_ts_api(l));
+    let selected = tsdk(server_root, s).or_else(|| tsdk(root, s)).filter(|l| has_ts_api(l));
     let package = vue::server_package(&cfg.command, &search_path());
-    let own = package.as_deref().and_then(vue::own_typescript);
-    let workspace = || workspace_tsdk(server_root).or_else(|| workspace_tsdk(root)).filter(|l| vue::has_ts_api(l));
+    let own = package.as_deref().and_then(own_typescript);
+    let workspace = || workspace_tsdk(server_root).or_else(|| workspace_tsdk(root)).filter(|l| has_ts_api(l));
     let lib = match selected {
         Some(lib) => Some(lib),
         None if own.is_some() => None,
@@ -597,30 +1649,215 @@ fn is_python_command(cmd: &str) -> bool {
 
 const PY_RUNNERS: [&str; 3] = ["uv", "poetry", "pdm"];
 
+fn maven_option_flag(arg: &str) -> Option<&'static str> {
+    for (short, long) in
+        [("-s", "--settings"), ("-t", "--toolchains"), ("-T", "--threads"), ("-P", "--activate-profiles")]
+    {
+        if arg.starts_with(short) || arg == long || arg.starts_with(&format!("{long}=")) {
+            return Some(short);
+        }
+    }
+    if arg == "-U" || arg == "--update-snapshots" {
+        return Some("-U");
+    }
+    arg.starts_with("-Dmaven.repo.local=").then_some("-Dmaven.repo.local")
+}
+
+fn maven_option_len(args: &[String]) -> Option<usize> {
+    let arg = args.first()?;
+    maven_option_flag(arg)?;
+    let separate = matches!(
+        arg.as_str(),
+        "-s" | "--settings" | "-t" | "--toolchains" | "-T" | "--threads" | "-P" | "--activate-profiles"
+    );
+    Some(if separate { 2.min(args.len()) } else { 1 })
+}
+
+/// [`maven_options`] grouped with each option's value.
+fn maven_option_groups(options: &[String]) -> Vec<&[String]> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < options.len() {
+        let n = maven_option_len(&options[i..]).unwrap_or(1);
+        groups.push(&options[i..i + n]);
+        i += n;
+    }
+    groups
+}
+
+/// Whether the configuration sets the same option, including attached and long forms.
+fn sets_maven_option(args: &[String], group: &[String]) -> bool {
+    let Some(flag) = group.first().and_then(|a| maven_option_flag(a)) else { return true };
+    args.iter().any(|a| maven_option_flag(a) == Some(flag))
+        || (flag == "-Dmaven.repo.local"
+            && args.windows(2).any(|a| a[0] == "-D" && a[1].starts_with("maven.repo.local=")))
+}
+
+/// Settings options precede the goals. Tool-window checkbox profiles are additive;
+/// profiles explicitly typed in the configuration replace the Settings profiles.
+fn add_maven_options(args: &mut Vec<String>, options: &[String], additive_profiles: bool) {
+    let missing: Vec<String> = maven_option_groups(options)
+        .into_iter()
+        .filter(|g| {
+            if additive_profiles && g[0] == "-P" {
+                !args.windows(g.len()).any(|w| w == *g)
+            } else {
+                !sets_maven_option(args, g)
+            }
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    args.splice(0..0, missing);
+}
+
+/// The interpreter target or project default; an explicit local choice returns an empty id.
+pub fn run_target<'a>(config: &RunConfig, settings: &'a Settings) -> Option<&'a str> {
+    let name = ide_run::wrap::program_name(&config.command);
+    let target = if matches!(name.as_str(), "php" | "composer" | "phpunit" | "pest")
+        || matches!(config.kind.as_str(), "php" | "composer" | "phpunit")
+    {
+        &settings.languages.php.run_target
+    } else if matches!(name.as_str(), "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun")
+        || matches!(config.kind.as_str(), "node" | "npm" | "vitest" | "jest" | "mocha")
+    {
+        &settings.languages.node.run_target
+    } else if let Some(target) = settings.languages.python.run_target().filter(|_| is_python_config(config, &name)) {
+        // The project interpreter is a run target's: Python runs there.
+        return Some(target);
+    } else {
+        return non_empty(&settings.run.default_target);
+    };
+    if target == "local" {
+        Some("")
+    } else if target.is_empty() {
+        non_empty(&settings.run.default_target)
+    } else {
+        Some(target)
+    }
+}
+
+fn is_python_config(config: &RunConfig, program: &str) -> bool {
+    matches!(config.kind.as_str(), "python" | "pytest" | "django-test") || is_python_command(program)
+}
+
+/// Whether the configuration's `JAVA_HOME` is the one Settings choose (the Maven runner JRE,
+/// the Gradle JVM) rather than a choice of its own: an IDE-generated build-tool configuration —
+/// a Maven goal or Gradle task from the tool window — carries the model's `JAVA_HOME`, which
+/// Settings derived when the model was built (IDEA has no JRE field on such a task either).
+/// Such a value is derived: Settings win, and [`without_derived`] drops it, so a corrected JDK
+/// applies to the next run, also across a restart (#2433). Every other configuration keeps its
+/// own `JAVA_HOME`, even one this build cannot parse.
+fn java_home_is_derived(c: &RunConfig) -> bool {
+    generated_maven_goal(c) || (c.id.starts_with("gradle:task:") && c.extras.params.is_empty())
+}
+
+/// Applies the `JAVA_HOME` of `env` (the one Settings resolved) to `c`. A derived value is
+/// replaced, also when Settings resolve none (a dead path must not outlive the setting it came
+/// from); an explicit `JAVA_HOME` of the configuration still wins.
+fn apply_java_home(c: &mut RunConfig, env: &std::collections::BTreeMap<String, String>, derived: bool) {
+    match env.get("JAVA_HOME") {
+        Some(value) if derived => {
+            c.env.insert("JAVA_HOME".into(), value.clone());
+        }
+        Some(value) => {
+            c.env.entry("JAVA_HOME".into()).or_insert_with(|| value.clone());
+        }
+        None if derived => {
+            c.env.remove("JAVA_HOME");
+        }
+        None => {}
+    }
+}
+
+/// The Maven environment from Settings (the runner JRE), applied to `c`: a derived `JAVA_HOME`
+/// is replaced, an explicit one stays (see [`apply_java_home`]).
+pub fn apply_maven_env(c: &mut RunConfig, root: &Path, s: &Settings) {
+    let env = maven_build_env(root, s, None);
+    apply_java_home(c, &env, java_home_is_derived(c));
+    for (key, value) in env {
+        c.env.entry(key).or_insert(value);
+    }
+}
+
 /// Points run configurations at the selected toolchains: Python configs use the
 /// project interpreter, npm scripts the chosen package manager and Node.js,
-/// cargo / go configs the selected toolchain, Maven / Gradle the project JDK
+/// cargo / go configs the selected toolchain, Maven / Gradle their runner JDK
 /// (and Maven the configured home and options).
 pub fn apply_to_run_configs(configs: &mut [RunConfig], root: &Path, s: &Settings) {
-    let explicit_python = setting_path(root, &s.languages.python.interpreter);
-    let python = python_interpreter(root, s);
+    apply_to_run_configs_in(configs, root, None, s)
+}
+
+/// [`apply_to_run_configs`] with an inherited fallback project: a workspace member
+/// (`root`) with no Python of its own (no interpreter setting, virtualenv or pin)
+/// runs on the primary project's (`fallback`) — the module SDK a member without its
+/// own inherits in IDEA. `None` keeps the configuration's own project.
+pub fn apply_to_run_configs_in(configs: &mut [RunConfig], root: &Path, fallback: Option<&Path>, s: &Settings) {
+    let inherited = fallback.filter(|f| *f != root);
+    // An interpreter whose executable is gone is skipped (like PyCharm's "Invalid"
+    // SDKs): the run configuration uses the venv / fallback instead of a dead path.
+    let explicit_python = setting_path(root, &s.languages.python.interpreter).filter(|p| p.is_file());
+    let inherited_python = inherited
+        .and_then(|f| setting_path(f, &s.languages.python.interpreter))
+        .filter(|p| p.is_file())
+        .filter(|_| explicit_python.is_none());
     let pm = non_empty(&s.languages.node.package_manager);
-    let node = node_dir(root, s);
+    let php = setting_path(root, &s.languages.php.interpreter);
     let rust = rust_bin(root, s);
-    let go = goroot(root, s);
     let gopath = setting_path(root, &s.languages.go.gopath);
     let jdk = project_jdk(root, s);
     let mvn = maven_command(root, s);
     let mvn_options = maven_options(root, s);
 
+    // Module-local toolchains, looked up once per owning module and only for the kinds using them.
+    let mut toolchains: HashMap<(&'static str, PathBuf), Option<PathBuf>> = HashMap::new();
+    let mut toolchain = |tool: &'static str, owner: &Path| {
+        toolchains
+            .entry((tool, owner.to_path_buf()))
+            .or_insert_with(|| {
+                // A module outside the project (an external linked build) keeps the project's choices.
+                let near = if owner.starts_with(root) { owner } else { root };
+                match tool {
+                    // A member with no Python of its own runs on the primary project's.
+                    "python" => python_interpreter_near(root, Some(near), s)
+                        .or_else(|| inherited.and_then(|f| python_interpreter_near(f, Some(f), s))),
+                    "node" if non_empty(&s.languages.node.interpreter).is_none() => {
+                        node_dir(near, s).or_else(|| node_dir(root, s))
+                    }
+                    "node" => node_dir(root, s),
+                    "go" if non_empty(&s.languages.go.goroot).is_none() => goroot(near, s).or_else(|| goroot(root, s)),
+                    "go" => goroot(root, s),
+                    _ => setting_path(root, &s.languages.ruby.interpreter).or_else(|| ruby_interpreter(near, s)),
+                }
+            })
+            .clone()
+    };
+
     for c in configs.iter_mut() {
+        if let Some(pm) = pm
+            && c.kind == "npm"
+            && c.detected
+            && matches!(c.command.as_str(), "npm" | "pnpm" | "yarn" | "bun")
+        {
+            c.command = pm.to_owned();
+        }
+        if c.extras.target.is_none() {
+            c.extras.target = run_target(c, s).map(str::to_owned);
+        }
+        if c.extras.target.as_deref().is_some_and(|t| t.starts_with("plugin-target:")) {
+            continue;
+        }
+        let owner = ide_run::scope::owner(root, c);
         resolve_run_command(c, root, s);
         let mut path_dirs: Vec<PathBuf> = Vec::new();
         match c.kind.as_str() {
-            "python" | "pytest" => {
-                if let Some(py) = &explicit_python {
+            "python" | "pytest" | "django-test" => {
+                let python = toolchain("python", &owner);
+                // The member's explicit interpreter, else the inherited one, else the
+                // member's own venv / pin.
+                if let Some(py) = explicit_python.as_ref().or(inherited_python.as_ref()).or(python.as_ref()) {
                     let runner = PY_RUNNERS.contains(&c.command.as_str());
-                    if c.kind == "python" && (runner || is_python_command(&c.command)) {
+                    if (c.kind == "python" || c.kind == "django-test") && (runner || is_python_command(&c.command)) {
                         if runner && c.args.first().map(String::as_str) == Some("run") {
                             // `uv run python …` → `<interpreter> …`
                             let skip = if c.args.get(1).is_some_and(|a| is_python_command(a)) { 2 } else { 1 };
@@ -644,15 +1881,21 @@ pub fn apply_to_run_configs(configs: &mut [RunConfig], root: &Path, s: &Settings
                     path_dirs.push(venv.join(bin_dir()));
                 }
             }
-            "npm" => {
-                if let Some(pm) = pm
-                    && c.detected
-                    && matches!(c.command.as_str(), "npm" | "pnpm" | "yarn" | "bun")
+            "npm" | "node" | "deno" | "bun" => {
+                // The configuration's own Node interpreter, else the project's.
+                let own = c.extras.params.get("nodeInterpreter").and_then(|p| setting_path(root, p));
+                if let Some(dir) =
+                    own.and_then(|p| p.parent().map(Path::to_path_buf)).or_else(|| toolchain("node", &owner))
                 {
-                    c.command = pm.to_owned();
+                    path_dirs.push(dir);
                 }
-                if let Some(dir) = &node {
-                    path_dirs.push(dir.clone());
+            }
+            "php" | "phpunit" | "composer" => {
+                if let Some(php) = &php {
+                    if c.kind == "php" && c.detected && c.command == "php" {
+                        c.command = php.to_string_lossy().into_owned();
+                    }
+                    path_dirs.extend(php.parent().map(Path::to_path_buf));
                 }
             }
             "cargo" => {
@@ -670,7 +1913,7 @@ pub fn apply_to_run_configs(configs: &mut [RunConfig], root: &Path, s: &Settings
                 for (key, value) in crate::go::module_environment(root, &s.languages.go.modules) {
                     c.env.entry(key).or_insert(value);
                 }
-                if let Some(goroot) = &go {
+                if let Some(goroot) = &toolchain("go", &owner) {
                     let bin = goroot.join("bin");
                     if c.command == "go" && bin.join(exe("go")).is_file() {
                         c.command = bin.join(exe("go")).to_string_lossy().into_owned();
@@ -687,39 +1930,80 @@ pub fn apply_to_run_configs(configs: &mut [RunConfig], root: &Path, s: &Settings
                 if matches!(c.command.as_str(), "gradle" | "gradle.bat") {
                     c.command = resolve_gradle_command(root, &build_dir, s, false).to_string_lossy().into_owned();
                 }
-                let defaults = jdk
-                    .as_ref()
-                    .map(|j| {
-                        std::collections::BTreeMap::from([("JAVA_HOME".into(), j.home.to_string_lossy().into_owned())])
-                    })
-                    .unwrap_or_default();
-                for (key, value) in gradle_env(root, s, defaults) {
+                let env = gradle_build_env(root, &build_dir, &c.command, s, None);
+                apply_java_home(c, &env, java_home_is_derived(c));
+                for (key, value) in env {
                     c.env.entry(key).or_insert(value);
                 }
             }
-            "maven" | "tomcat" => {
+            "ruby" | "rake" | "rspec" => {
+                if let Some(ruby) = &toolchain("ruby", &owner)
+                    && let Some(bin) = crate::ruby::bin_dir_of(ruby)
+                {
+                    // `ruby`, `bundle`, `rake`, `rspec` of the chosen interpreter when installed
+                    // alongside it; the rest (a project `bin/rspec` binstub) stays as is.
+                    let name = Path::new(&c.command).file_name().map(|n| n.to_string_lossy().into_owned());
+                    if let Some(name) = name
+                        && matches!(name.as_str(), "ruby" | "bundle" | "rake" | "rspec" | "gem" | "irb")
+                        && !c.command.contains('/')
+                        && !c.command.contains('\\')
+                    {
+                        let exe = bin.join(exe(&name));
+                        if exe.is_file() {
+                            c.command = exe.to_string_lossy().into_owned();
+                        }
+                    }
+                    path_dirs.push(bin);
+                }
+            }
+            // JAR Application's default JRE is the project JDK; a chosen JRE is an absolute `java`.
+            "jar-application" => {
+                if let Some(jdk) = &jdk
+                    && c.command == "java"
+                {
+                    let java = crate::java::java_executable(&jdk.home);
+                    if java.is_file() {
+                        c.command = java.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            "tomcat" => {
                 if let Some(jdk) = &jdk {
                     c.env.entry("JAVA_HOME".into()).or_insert_with(|| jdk.home.to_string_lossy().into_owned());
                 }
-                if c.kind == "maven" && c.detected {
-                    if let Some(mvn) = &mvn {
-                        c.command = mvn.to_string_lossy().into_owned();
+            }
+            // A JUnit configuration runs the module's own Maven or Gradle command line: it needs
+            // that build's environment (its JDK), not another launcher or extra options.
+            "junit" => {
+                let name = Path::new(&c.command).file_name().map(|n| n.to_string_lossy().to_ascii_lowercase());
+                match name.as_deref() {
+                    Some(n) if n.starts_with("mvn") => apply_maven_env(c, root, s),
+                    Some(n) if n.starts_with("gradle") => {
+                        let build_dir =
+                            c.cwd.as_ref().map(|p| root.join(p.as_ref())).unwrap_or_else(|| root.to_path_buf());
+                        let env = gradle_build_env(root, &build_dir, &c.command, s, None);
+                        apply_java_home(c, &env, java_home_is_derived(c));
+                        for (key, value) in env {
+                            c.env.entry(key).or_insert(value);
+                        }
                     }
-                    if !c.args.starts_with(&mvn_options) {
-                        c.args.splice(0..0, mvn_options.iter().cloned());
-                    }
-                } else if c.kind == "maven"
-                    && matches!(c.command.as_str(), "mvn" | "mvn.cmd" | "mvn.bat")
-                    && let Some(mvn) = &mvn
+                    _ => {}
+                }
+            }
+            "maven" => {
+                apply_maven_env(c, root, s);
+                if let Some(mvn) = &mvn
+                    && (c.detected
+                        || generated_maven_goal(c)
+                        || matches!(c.command.as_str(), "mvn" | "mvn.cmd" | "mvn.bat"))
                 {
-                    // A goal configuration saved from the tool window keeps the
-                    // literal `mvn` / `mvn.cmd` the launcher resolved to; without a
-                    // wrapper it cannot start when Maven lives on a version
-                    // manager's shims or a configured home (#328). Detected configs
-                    // take the Maven options too, but the saved ones already baked
-                    // them into `args`.
                     c.command = mvn.to_string_lossy().into_owned();
                 }
+                let additive_profiles = generated_maven_goal(c)
+                    && c.id.split_once(".xml:").is_some_and(|(_, goals)| {
+                        !goals.split_whitespace().any(|a| maven_option_flag(a) == Some("-P"))
+                    });
+                add_maven_options(&mut c.args, &mvn_options, additive_profiles);
             }
             _ => {}
         }
@@ -730,26 +2014,110 @@ pub fn apply_to_run_configs(configs: &mut [RunConfig], root: &Path, s: &Settings
     }
 }
 
+/// `config` as it should be saved: without what [`apply_to_run_configs`] derives from
+/// settings, so a configuration read from the run list, edited and saved keeps following
+/// Languages & Frameworks instead of freezing today's toolchain (and the IDE's whole
+/// `PATH`) into `run.toml`. A value counts as derived when applying settings to the
+/// configuration without it produces it again: an environment entry (`PATH`,
+/// `VIRTUAL_ENV`, `JAVA_HOME`, `GOROOT`, …) or an absolute command its bare name
+/// resolves to (the project interpreter, a toolchain's `cargo` / `go`, Maven's `mvn`).
+pub fn without_derived(config: &RunConfig, root: &Path, s: &Settings) -> RunConfig {
+    without_derived_in(config, root, None, s)
+}
+
+/// [`without_derived`] with the inherited fallback project the configuration runs with
+/// (see [`apply_to_run_configs_in`]): a derived command or environment entry is derived
+/// only when re-applying settings with the same fallback reproduces it.
+pub fn without_derived_in(config: &RunConfig, root: &Path, fallback: Option<&Path>, s: &Settings) -> RunConfig {
+    let applied = |c: &RunConfig| {
+        let mut c = c.clone();
+        apply_to_run_configs_in(std::slice::from_mut(&mut c), root, fallback, s);
+        c
+    };
+    let mut out = config.clone();
+    if out.extras.target.as_deref() == run_target(&out, s) {
+        out.extras.target = None;
+    }
+    // Until nothing changes: some entries are derived only once others are gone
+    // (the virtualenv's `PATH` is added only without `VIRTUAL_ENV`). An entry derived before
+    // the configuration's own choice (an npm script's Node interpreter) is derived too.
+    while let Some(key) = out
+        .env
+        .iter()
+        .find(|(key, value)| {
+            // Settings choose the `JAVA_HOME` of a generated build-tool configuration, also when
+            // a corrected setting no longer reproduces the value the model froze there (#2433).
+            if key.as_str() == "JAVA_HOME" && java_home_is_derived(&out) {
+                return true;
+            }
+            let mut probe = out.clone();
+            probe.env.remove(*key);
+            let mut plain = probe.clone();
+            plain.extras.params.clear();
+            applied(&probe).env.get(*key) == Some(*value) || applied(&plain).env.get(*key) == Some(*value)
+        })
+        .map(|(key, _)| key.clone())
+    {
+        out.env.remove(&key);
+    }
+    // Settings › Maven's options, which applying puts back ahead of the goals.
+    if out.kind == "maven" {
+        let options = maven_options(root, s);
+        let mut probe = out.clone();
+        let mut prefix = generated_maven_goal(&out).then(|| maven_goal_prefix(&out)).flatten();
+        for group in maven_option_groups(&options) {
+            if let Some(at) = probe.args.windows(group.len()).position(|w| w == group)
+                && prefix.is_none_or(|limit| at + group.len() <= limit)
+            {
+                probe.args.drain(at..at + group.len());
+                if let Some(limit) = &mut prefix {
+                    *limit -= group.len();
+                }
+            }
+        }
+        if applied(&probe).args == out.args {
+            out.args = probe.args;
+        }
+    }
+    let path = Path::new(&config.command);
+    if path.is_absolute()
+        && let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+    {
+        // Generated configurations name the bare program (`java`), also on Windows where the
+        // derived path ends in `java.exe`.
+        let bare =
+            name.len().checked_sub(4).filter(|&at| name[at..].eq_ignore_ascii_case(".exe")).map(|at| &name[..at]);
+        for candidate in bare.into_iter().chain([name.as_str()]) {
+            let mut probe = out.clone();
+            probe.command = candidate.to_owned();
+            if applied(&probe).command == config.command {
+                out.command = candidate.to_owned();
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Command typed into a new terminal to activate the project virtualenv
-/// (PyCharm's Tools › Terminal › "Activate virtualenv"), for the given shell.
-pub fn terminal_activation(root: &Path, s: &Settings, shell: Option<&str>) -> Option<String> {
+/// (Tools › Terminal › "Activate virtualenv"). `shell` must be the resolved PTY shell.
+pub fn terminal_activation(root: &Path, s: &Settings, shell: &str) -> Option<String> {
     if !s.languages.python.activate_virtualenv {
         return None;
     }
-    let venv = python_interpreter(root, s).as_deref().and_then(venv_of)?;
+    let python = python_interpreter(root, s)?;
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let name = Path::new(name).file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let Some(venv) = venv_of(&python) else {
+        return conda_activation(&python, &name, std::env::var_os("CONDA_EXE").map(PathBuf::from), which("conda"));
+    };
     if std::env::var_os("VIRTUAL_ENV").is_some_and(|v| Path::new(&v) == venv) {
         return None;
     }
-    let shell = shell
-        .map(str::to_owned)
-        .or_else(|| std::env::var("SHELL").ok())
-        .or_else(|| std::env::var("COMSPEC").ok())
-        .unwrap_or_default();
-    let name = Path::new(&shell).file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let script = |file: &str| venv.join(bin_dir()).join(file);
     let line = match name.as_str() {
         "fish" => format!("source {}", sh_quote(&script("activate.fish").to_string_lossy())),
@@ -774,6 +2142,64 @@ pub fn terminal_activation(root: &Path, s: &Settings, shell: Option<&str>) -> Op
     script(target).is_file().then_some(line)
 }
 
+/// `conda activate <prefix>` for a conda interpreter, as PyCharm does for a Conda project
+/// interpreter: conda envs have no activate script of their own, and the shells' conda hook
+/// comes from the installation (the env itself for `base`, the parent of `envs/`, else
+/// `CONDA_EXE` or the `conda` on PATH). `name` is the shell's lowercased file stem.
+fn conda_activation(python: &Path, name: &str, conda_exe: Option<PathBuf>, on_path: Option<PathBuf>) -> Option<String> {
+    let env = crate::discover::conda_env_home(python).filter(|env| env.join("conda-meta").is_dir())?;
+    if std::env::var_os("CONDA_PREFIX").is_some_and(|p| Path::new(&p) == env) {
+        return None;
+    }
+    let is_base = |dir: &Path| dir.join("condabin").is_dir();
+    // `<base>/bin/conda`, `<base>/condabin/conda[.bat]`, `<base>\Scripts\conda.exe`.
+    let base_of = |exe: PathBuf| exe.parent()?.parent().map(Path::to_path_buf).filter(|b| is_base(b));
+    let base = Some(env.clone())
+        .filter(|e| is_base(e))
+        .or_else(|| {
+            env.parent()
+                .filter(|p| p.file_name().is_some_and(|n| n == "envs"))?
+                .parent()
+                .map(Path::to_path_buf)
+                .filter(|b| is_base(b))
+        })
+        .or_else(|| conda_exe.and_then(base_of))
+        .or_else(|| on_path.and_then(base_of))?;
+    let prefix = env.to_string_lossy();
+    let conda = if cfg!(windows) { base.join("Scripts").join("conda.exe") } else { base.join("bin").join("conda") };
+    let posix = |hook: &str| {
+        conda.is_file().then(|| {
+            format!(
+                "eval \"$({} shell.{hook} hook)\" && conda activate {}",
+                sh_quote(&conda.to_string_lossy()),
+                sh_quote(&prefix)
+            )
+        })
+    };
+    match name {
+        "cmd" => {
+            let bat = base.join("condabin").join("conda.bat");
+            bat.is_file().then(|| format!("call \"{}\" activate \"{prefix}\"", bat.display()))
+        }
+        "pwsh" | "powershell" => {
+            let hook = base.join("shell").join("condabin").join("conda-hook.ps1");
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+            hook.is_file().then(|| format!("& {}; conda activate {}", quote(&hook.to_string_lossy()), quote(&prefix)))
+        }
+        "bash" => posix("bash"),
+        "zsh" => posix("zsh"),
+        "sh" | "dash" | "ksh" | "mksh" | "ash" => posix("posix"),
+        "fish" => conda.is_file().then(|| {
+            format!(
+                "{} shell.fish hook | source; and conda activate {}",
+                sh_quote(&conda.to_string_lossy()),
+                sh_quote(&prefix)
+            )
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod java_compiler_tests {
     use super::*;
@@ -782,15 +2208,59 @@ mod java_compiler_tests {
         serde_json::to_value(cfg.initialization_options.as_ref().unwrap()).unwrap()
     }
 
+    fn prefs_path(options: &Value) -> PathBuf {
+        let url = options.pointer("/settings/java/settings/url").unwrap().as_str().unwrap();
+        url::Url::parse(url).unwrap().to_file_path().unwrap()
+    }
+
+    #[test]
+    fn serial_version_inspection_sets_the_compiler_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = |inspections: &InspectionSettings| {
+            let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+            configure_java_compiler(&mut cfg, tmp.path(), inspections);
+            prefs_path(&options(&cfg))
+        };
+        let set = |o: ide_core::settings::InspectionOverride| {
+            let mut s = InspectionSettings::default();
+            s.default.insert(SERIAL_VERSION_INSPECTION.into(), o);
+            s
+        };
+        let off = url(&InspectionSettings::default());
+        assert!(!std::fs::read_to_string(&off).unwrap().contains("missingSerialVersion"));
+        let on = url(&set(ide_core::settings::InspectionOverride { enabled: Some(true), ..Default::default() }));
+        assert_ne!(on, off, "a new file, so the server restarts with it");
+        assert!(std::fs::read_to_string(&on).unwrap().ends_with("compiler.problem.missingSerialVersion=warning\n"));
+        let error = url(&set(ide_core::settings::InspectionOverride {
+            enabled: Some(true),
+            severity: Some(InspectionLevel::Error),
+            ..Default::default()
+        }));
+        assert!(std::fs::read_to_string(error).unwrap().ends_with("missingSerialVersion=error\n"));
+        let weak = url(&set(ide_core::settings::InspectionOverride {
+            enabled: Some(true),
+            severity: Some(InspectionLevel::WeakWarning),
+            ..Default::default()
+        }));
+        assert!(std::fs::read_to_string(weak).unwrap().ends_with("missingSerialVersion=info\n"));
+        let severity_only = url(&set(ide_core::settings::InspectionOverride {
+            severity: Some(InspectionLevel::Error),
+            ..Default::default()
+        }));
+        assert_eq!(severity_only, off, "off by default");
+    }
+
     #[test]
     fn compiler_defaults_live_in_the_cache_and_preserve_other_options() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache with spaces 测试");
         let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
         merge_init_options(&mut cfg, json!({"settings": {"java": {"format": {"tabSize": 4}}}}));
-        configure_java_compiler(&mut cfg, &cache);
+        configure_java_compiler(&mut cfg, &cache, &InspectionSettings::default());
         let options = options(&cfg);
-        let path = PathBuf::from(options.pointer("/settings/java/settings/url").unwrap().as_str().unwrap());
+        let url = options.pointer("/settings/java/settings/url").unwrap().as_str().unwrap();
+        assert!(url.starts_with("file://") && !url.contains(' '), "{url}");
+        let path = prefs_path(&options);
         assert!(path.starts_with(&cache));
         let prefs = std::fs::read_to_string(&path).unwrap();
         assert_eq!(prefs.lines().count(), 2);
@@ -799,7 +2269,7 @@ mod java_compiler_tests {
         }
         assert_eq!(options.pointer("/settings/java/format/tabSize"), Some(&json!(4)));
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        configure_java_compiler(&mut cfg, &cache);
+        configure_java_compiler(&mut cfg, &cache, &InspectionSettings::default());
         assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), modified);
         assert_eq!(self::options(&cfg), options);
     }
@@ -809,7 +2279,7 @@ mod java_compiler_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
         merge_init_options(&mut cfg, json!({"settings": {"java": {"settings": {"url": "own.prefs"}}}}));
-        configure_java_compiler(&mut cfg, tmp.path());
+        configure_java_compiler(&mut cfg, tmp.path(), &InspectionSettings::default());
         assert_eq!(options(&cfg).pointer("/settings/java/settings/url"), Some(&json!("own.prefs")));
 
         for settings in [
@@ -839,8 +2309,264 @@ mod java_compiler_tests {
 }
 
 #[cfg(test)]
+mod gradle_runtime_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn gradle_runs_use_the_builds_toolchain_without_overriding_user_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed =
+            [25, 21, 17, 11, 8].map(|major| crate::java::Jdk { major, home: temp.path().join(format!("jdk{major}")) });
+        for (name, script, expected) in [
+            ("kotlin", "kotlin { jvmToolchain(21) }", Some(21)),
+            ("java", "java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }", Some(17)),
+            ("unspecified", "plugins { id 'java' }", None),
+        ] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("build.gradle.kts"), script).unwrap();
+            let picked = gradle_run_jdk(crate::java::project_java_version(&dir), None, &installed, Some((9, 0)));
+            assert_eq!(picked.map(|jdk| jdk.major), expected);
+            assert_eq!(gradle_run_jdk(expected, Some(&installed[0]), &installed, Some((9, 0))), Some(&installed[0]));
+            let mut settings = Settings::default();
+            settings.languages.java.gradle.jvm = "custom-gradle-jdk".into();
+            let env = gradle_env(temp.path(), &settings, BTreeMap::from([("JAVA_HOME".into(), "/fallback".into())]));
+            assert_eq!(env["JAVA_HOME"], temp.path().join("custom-gradle-jdk").to_string_lossy());
+        }
+        let dir = temp.path().join("kotlin");
+        for (gradle, target, expected) in
+            [((9, 0), 8, 17), ((8, 4), 21, 17), ((8, 5), 21, 21), ((7, 2), 21, 11), ((9, 0), 25, 21), ((9, 1), 25, 25)]
+        {
+            std::fs::write(dir.join("build.gradle.kts"), format!("kotlin {{ jvmToolchain({target}) }}")).unwrap();
+            assert_eq!(gradle_run_jdk(Some(target), None, &installed, Some(gradle)).unwrap().major, expected);
+        }
+        assert_eq!(gradle_run_jdk(Some(21), None, &installed, None).unwrap().major, 21);
+        assert_eq!(gradle_run_jdk(Some(19), None, &installed, None).unwrap().major, 21);
+        assert!(gradle_run_jdk(None, None, &installed, None).is_none());
+        // The Java import of a build that declares no Java version still needs a JVM its Gradle runs on.
+        assert_eq!(newest_gradle_jdk((8, 4), &installed).unwrap().major, 17);
+        assert_eq!(newest_gradle_jdk((7, 2), &installed).unwrap().major, 11);
+        assert_eq!(newest_gradle_jdk((9, 1), &installed).unwrap().major, 25);
+        assert!(newest_gradle_jdk((9, 0), &installed[4..]).is_none());
+    }
+
+    #[test]
+    fn reads_wrapper_and_local_gradle_versions_without_running_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("gradle/wrapper")).unwrap();
+        std::fs::write(
+            root.join("gradle/wrapper/gradle-wrapper.properties"),
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.4.0-bin.zip\n",
+        )
+        .unwrap();
+        for command in ["./gradlew", "gradlew.bat"] {
+            assert_eq!(gradle_distribution_version(root, command), Some((8, 4)));
+        }
+        for layout in ["lib", "libexec/lib"] {
+            let home = root.join(layout.replace('/', "-"));
+            std::fs::create_dir_all(home.join("bin")).unwrap();
+            std::fs::create_dir_all(home.join(layout)).unwrap();
+            let command = home.join("bin/gradle");
+            std::fs::write(&command, "").unwrap();
+            std::fs::write(home.join(layout).join("gradle-launcher-9.0.0.jar"), "").unwrap();
+            assert_eq!(gradle_distribution_version(root, &command.to_string_lossy()), Some((9, 0)));
+        }
+    }
+}
+
+#[cfg(test)]
 mod maven_linkage_tests {
     use super::*;
+
+    #[test]
+    fn hybrid_vtsls_gets_one_server_a_full_heap_and_no_type_acquisition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // The Vue package the hybrid block finds through the command's package dir.
+        let bin = root.join("tools/node_modules/.bin/vue-language-server");
+        let pkg = root.join("tools/node_modules/@vue/language-server/package.json");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(pkg.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::write(&pkg, "{}").unwrap();
+        let mut s = Settings::default();
+        s.tools
+            .insert(vue::SERVER.into(), ide_core::settings::ToolSettings { path: bin.to_string_lossy().into_owned() });
+        std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+        let mut cfg = custom_server("vtsls", &LanguageServerSettings::default());
+        configure_server(&mut cfg, root, root, &s);
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert_eq!(options.pointer("/typescript/tsserver/useSyntaxServer"), Some(&json!("never")));
+        assert_eq!(options.pointer("/typescript/tsserver/maxTsServerMemory"), Some(&json!(8192)));
+        assert_eq!(options.pointer("/typescript/disableAutomaticTypeAcquisition"), Some(&json!(true)));
+        // A user-set limit wins over the automatic one.
+        s.languages.typescript.tsserver_max_memory = 6144;
+        let mut cfg = custom_server("vtsls", &LanguageServerSettings::default());
+        configure_server(&mut cfg, root, root, &s);
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert_eq!(options.pointer("/typescript/tsserver/maxTsServerMemory"), Some(&json!(6144)));
+    }
+
+    #[test]
+    fn hybrid_without_a_config_keeps_type_acquisition_and_plain_vtsls_stays_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin = root.join("tools/node_modules/.bin/vue-language-server");
+        let pkg = root.join("tools/node_modules/@vue/language-server/package.json");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(pkg.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::write(&pkg, "{}").unwrap();
+        let mut s = Settings::default();
+        s.tools
+            .insert(vue::SERVER.into(), ide_core::settings::ToolSettings { path: bin.to_string_lossy().into_owned() });
+        // No tsconfig/jsconfig anywhere: inferred projects still want the typings installer.
+        let mut cfg = custom_server("vtsls", &LanguageServerSettings::default());
+        configure_server(&mut cfg, root, root, &s);
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert!(options.pointer("/typescript/disableAutomaticTypeAcquisition").is_none());
+        assert_eq!(options.pointer("/typescript/tsserver/maxTsServerMemory"), Some(&json!(8192)));
+        // Without the Vue package there is no hybrid mode: nothing is injected. The
+        // command points at a bare binary, so the package lookup finds nothing
+        // (a bare name would resolve on the host's PATH and break the test).
+        std::fs::write(root.join("bare-vue-language-server"), "#!/bin/sh\n").unwrap();
+        s.tools
+            .insert(vue::SERVER.into(), ide_core::settings::ToolSettings { path: "bare-vue-language-server".into() });
+        let mut cfg = custom_server("vtsls", &LanguageServerSettings::default());
+        configure_server(&mut cfg, root, root, &s);
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert!(options.pointer("/typescript/tsserver/useSyntaxServer").is_none());
+        assert!(options.pointer("/typescript/tsserver/maxTsServerMemory").is_none());
+        // A user-set limit applies to plain TypeScript projects too.
+        s.languages.typescript.tsserver_max_memory = 12288;
+        let mut cfg = custom_server("vtsls", &LanguageServerSettings::default());
+        configure_server(&mut cfg, root, root, &s);
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert_eq!(options.pointer("/typescript/tsserver/maxTsServerMemory"), Some(&json!(12288)));
+        assert!(options.pointer("/typescript/tsserver/useSyntaxServer").is_none());
+    }
+
+    #[test]
+    fn default_maven_repository_reads_the_user_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(default_maven_repository_in(home), Some(home.join(".m2/repository")));
+        std::fs::create_dir_all(home.join(".m2")).unwrap();
+        let settings = home.join(".m2/settings.xml");
+        std::fs::write(
+            &settings,
+            "<settings><!-- <localRepository>/old</localRepository> --><localRepository>/repo</localRepository></settings>",
+        )
+        .unwrap();
+        assert_eq!(default_maven_repository_in(home), Some(PathBuf::from("/repo")));
+        std::fs::write(&settings, "<settings><localRepository>${user.home}/m2repo</localRepository></settings>")
+            .unwrap();
+        assert_eq!(default_maven_repository_in(home), Some(home.join("m2repo")));
+        std::fs::write(&settings, "<settings><localRepository>${env.REPO}</localRepository></settings>").unwrap();
+        assert_eq!(default_maven_repository_in(home), Some(home.join(".m2/repository")));
+    }
+
+    #[test]
+    fn maven_sources_download_follows_the_setting() {
+        let mut settings = Settings::default();
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        cfg.settings = Some(json!({"java": {"maven": {"downloadSources": true, "updateSnapshots": false}}}));
+        configure_maven_sources(&mut cfg, &settings);
+        assert_eq!(
+            cfg.settings,
+            Some(json!({"java": {"maven": {"downloadSources": false, "updateSnapshots": false}}}))
+        );
+        settings.languages.java.maven.download_sources = true;
+        settings.languages.java.maven.update_snapshots = true;
+        configure_maven_sources(&mut cfg, &settings);
+        assert_eq!(cfg.settings.unwrap()["java"]["maven"], json!({"downloadSources": true, "updateSnapshots": true}));
+
+        let mut other = custom_server("kotlin", &LanguageServerSettings::default());
+        configure_maven_sources(&mut other, &settings);
+        assert_eq!(other.settings, None);
+    }
+
+    #[test]
+    fn gradle_import_runs_the_gradle_the_ide_builds_with() {
+        let root = Path::new("/p");
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        cfg.settings = Some(json!({"java": {"import": {"gradle": {"enabled": true}}}}));
+        let initial = cfg.clone();
+        let mut settings = Settings::default();
+        configure_gradle_runtime(&mut cfg, root, root, &settings);
+        assert_eq!(cfg, initial, "no Gradle settings: jdtls keeps its own defaults and the wrapper");
+
+        let g = &mut settings.languages.java.gradle;
+        g.distribution = ide_core::settings::GradleDistribution::Local;
+        g.home = "tools/gradle-5.2.1".into();
+        g.user_home = "/caches/gradle".into();
+        g.jvm = "/jdk/8".into();
+        configure_gradle_runtime(&mut cfg, root, root, &settings);
+        let gradle = &cfg.settings.as_ref().unwrap()["java"]["import"]["gradle"];
+        assert_eq!(gradle["enabled"], json!(true), "merged, not replaced");
+        let resolved = |s: &str| json!(setting_path(root, s).unwrap().to_string_lossy());
+        assert_eq!(gradle["home"], json!(root.join("tools/gradle-5.2.1").to_string_lossy()));
+        assert_eq!(gradle["wrapper"]["enabled"], json!(false));
+        assert_eq!(gradle["user"]["home"], resolved("/caches/gradle"));
+        assert_eq!(gradle["java"]["home"], resolved("/jdk/8"));
+
+        // The wrapper distribution keeps the wrapper even with a home left over.
+        let mut cfg = initial.clone();
+        settings.languages.java.gradle.distribution = ide_core::settings::GradleDistribution::Wrapper;
+        configure_gradle_runtime(&mut cfg, root, root, &settings);
+        let gradle = &cfg.settings.as_ref().unwrap()["java"]["import"]["gradle"];
+        assert!(gradle.get("home").is_none() && gradle.get("wrapper").is_none());
+        assert_eq!(gradle["user"]["home"], resolved("/caches/gradle"));
+    }
+
+    #[test]
+    fn gradle_import_of_a_gradle_build_runs_on_the_project_jdk_like_the_ides_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("build.gradle"), "plugins { id 'java' }").unwrap();
+        let jdk = root.join("jdk11");
+        std::fs::create_dir_all(jdk.join("bin")).unwrap();
+        std::fs::write(jdk.join("bin").join(crate::exe("java")), "").unwrap();
+        std::fs::write(jdk.join("release"), "JAVA_VERSION=\"11.0.2\"\n").unwrap();
+        let mut settings = Settings::default();
+        settings.languages.java.jdk = jdk.to_string_lossy().into_owned();
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        configure_gradle_runtime(&mut cfg, root, root, &settings);
+        let gradle = &cfg.settings.as_ref().unwrap()["java"]["import"]["gradle"];
+        let expected =
+            gradle_build_env(root, root, &gradle_command(root, root, &settings).to_string_lossy(), &settings, None);
+        assert_eq!(gradle["java"]["home"], json!(expected["JAVA_HOME"]));
+        assert!(expected["JAVA_HOME"].ends_with("jdk11"));
+        assert!(gradle.get("wrapper").is_none(), "the wrapper stays on");
+
+        // An explicit Gradle JVM wins over the Project JDK.
+        settings.languages.java.gradle.jvm = "/gradle-jdk".into();
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        configure_gradle_runtime(&mut cfg, root, root, &settings);
+        let gradle = &cfg.settings.as_ref().unwrap()["java"]["import"]["gradle"];
+        assert_eq!(gradle["java"]["home"], json!(setting_path(root, "/gradle-jdk").unwrap().to_string_lossy()));
+    }
+
+    #[test]
+    fn explicit_gradle_links_scope_jdt_import_and_unlink_all_disables_gradle() {
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        cfg.args = vec!["-data".into(), "/cache/jdtls".into()];
+        let files = ["file:///p/a/settings.gradle".to_owned(), "file:///p/maven/pom.xml".to_owned()];
+        configure_gradle_import(&mut cfg, Some(&["a".into()]), Some(&files));
+        let options = serde_json::to_value(&cfg.initialization_options).unwrap();
+        assert_eq!(options["projectConfigurations"], json!(files));
+        assert_eq!(options.pointer("/settings/java/import/gradle/enabled"), Some(&json!(true)));
+        assert!(cfg.args[1].starts_with("/cache/jdtls-gradle-"));
+        let linked_cache = cfg.args[1].clone();
+        cfg.args[1] = "/cache/jdtls".into();
+        configure_gradle_import(&mut cfg, Some(&[]), Some(&files[1..]));
+        let options = serde_json::to_value(&cfg.initialization_options).unwrap();
+        assert_eq!(options["projectConfigurations"], json!(&files[1..]));
+        assert_eq!(options.pointer("/settings/java/import/gradle/enabled"), Some(&json!(false)));
+        assert_ne!(linked_cache, cfg.args[1]);
+    }
 
     #[test]
     fn import_excludes_unlinked_modules_and_changes_persistent_workspace() {
@@ -852,12 +2578,168 @@ mod maven_linkage_tests {
         let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
         cfg.args = vec!["-data".into(), "/cache/jdtls".into()];
         merge_init_options(&mut cfg, json!({"settings":{"java":{"import":{"exclusions":["**/custom"]}}}}));
-        configure_maven_import(&mut cfg, tmp.path(), &["a/child/pom.xml".into(), "a/pom.xml".into()]);
+        configure_maven_import(&mut cfg, tmp.path(), &["a/child/pom.xml".into(), "a/pom.xml".into()], None);
         let options = serde_json::to_value(cfg.initialization_options).unwrap();
         let exclusions = options.pointer("/settings/java/import/exclusions").unwrap().as_array().unwrap();
         assert!(exclusions.contains(&json!("**/custom")));
         assert!(exclusions.contains(&json!(tmp.path().join("a").to_string_lossy().replace('\\', "/"))));
         assert!(exclusions.contains(&json!(tmp.path().join("a/child").to_string_lossy().replace('\\', "/"))));
         assert!(cfg.args[1].starts_with("/cache/jdtls-maven-"));
+        assert!(options.get("projectConfigurations").is_none());
+    }
+
+    #[test]
+    fn import_lists_the_build_files_when_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        let files = ["file:///p/r/x/pom.xml".to_owned(), "file:///p/build.gradle".to_owned()];
+        configure_maven_import(&mut cfg, tmp.path(), &["r/y/pom.xml".into()], Some(&files));
+        let options = serde_json::to_value(cfg.initialization_options).unwrap();
+        assert_eq!(options["projectConfigurations"], json!(files));
+        // Nothing unlinked: jdtls finds the build files itself.
+        let mut cfg = custom_server("jdtls", &LanguageServerSettings::default());
+        configure_maven_import(&mut cfg, tmp.path(), &[], Some(&files));
+        assert!(serde_json::to_value(cfg.initialization_options).unwrap().get("projectConfigurations").is_none());
+    }
+
+    #[test]
+    fn compose_file_overrides_populate_yaml_schemas_and_typed_exclusions() {
+        let root = Path::new("/work");
+        let mut s = Settings::default();
+        s.files.compose_file_overrides.insert("custom-stack.yml".into(), ide_core::settings::ComposeFileOverride::Kept);
+        s.files
+            .compose_file_overrides
+            .insert("/work/docker/playground-compose.yml".into(), ide_core::settings::ComposeFileOverride::Excluded);
+        let mut cfg = custom_server("yaml-language-server", &LanguageServerSettings::default());
+        cfg.settings = Some(json!({
+            "yaml": {
+                "schemas": {
+                    ide_language::COMPOSE_SCHEMA_URL: ["compose.yml", "*-compose.yml"]
+                }
+            }
+        }));
+        configure_server(&mut cfg, root, root, &s);
+        let yaml = &cfg.settings.as_ref().unwrap()["yaml"];
+        assert!(yaml.get("disableSchemaDetection").is_none());
+        let list = yaml["schemas"][ide_language::COMPOSE_SCHEMA_URL]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(list.contains(&"compose.yml"));
+        assert!(list.contains(&"/work/custom-stack.yml"));
+        assert!(list.contains(&"!/work/docker/playground-compose.yml"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ruby_lsp_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ruby_lsp_is_found_in_the_rubys_gem_bindir_when_that_is_off_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bindir = tmp.path().join("gems/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        // Homebrew's Ruby: `Gem.bindir` is not on `PATH`.
+        let ruby = tmp.path().join("ruby");
+        std::fs::write(&ruby, format!("#!/bin/sh\necho '{}'\necho '/nonexistent/user/bin'\n", bindir.display()))
+            .unwrap();
+        std::fs::set_permissions(&ruby, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut s = Settings::default();
+        s.languages.ruby.interpreter = ruby.to_string_lossy().into_owned();
+        let mut cfg = custom_server("ruby-lsp", &LanguageServerSettings::default());
+        configure_server(&mut cfg, tmp.path(), tmp.path(), &s);
+        let path = cfg.env.get("PATH").expect("PATH set");
+        let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+        assert!(dirs.contains(&bindir), "{dirs:?}");
+        assert!(!dirs.iter().any(|d| d.starts_with("/nonexistent")), "{dirs:?}");
+    }
+}
+
+#[cfg(test)]
+mod java_compliance_tests {
+    #[test]
+    fn maps_every_java_language_level_to_jdt_compliance() {
+        let c = |l: &str| super::java_compliance(l);
+        assert_eq!(c("6"), Some(("6".into(), "1.6".into())));
+        assert_eq!(c("1.7"), Some(("7".into(), "1.7".into())));
+        assert_eq!(c("8"), Some(("8".into(), "1.8".into())));
+        assert_eq!(c(" 1.8 "), Some(("8".into(), "1.8".into())));
+        assert_eq!(c("14"), Some(("14".into(), "14".into())));
+        assert_eq!(c("25"), Some(("25".into(), "25".into())));
+        assert_eq!(c("1.14"), None);
+        assert_eq!(c("4"), None);
+        assert_eq!(c(""), None);
+        assert_eq!(c("latest"), None);
+    }
+}
+
+#[cfg(test)]
+mod conda_activation_tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    /// A conda prefix with its interpreter where conda puts it on this OS.
+    fn prefix(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir.join("conda-meta")).unwrap();
+        let python = if cfg!(windows) { dir.join("python.exe") } else { dir.join("bin").join("python") };
+        touch(&python);
+        python
+    }
+
+    #[test]
+    fn conda_envs_activate_through_the_installations_shell_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("miniconda3");
+        let base_python = prefix(&base);
+        std::fs::create_dir_all(base.join("condabin")).unwrap();
+        let conda = if cfg!(windows) { base.join("Scripts").join("conda.exe") } else { base.join("bin").join("conda") };
+        touch(&conda);
+        let bat = base.join("condabin").join("conda.bat");
+        touch(&bat);
+        let hook = base.join("shell").join("condabin").join("conda-hook.ps1");
+        touch(&hook);
+        let env = base.join("envs").join("agent-gateway");
+        let python = prefix(&env);
+        let q = |p: &Path| sh_quote(&p.to_string_lossy());
+
+        assert_eq!(
+            conda_activation(&python, "zsh", None, None).unwrap(),
+            format!("eval \"$({} shell.zsh hook)\" && conda activate {}", q(&conda), q(&env))
+        );
+        assert_eq!(
+            conda_activation(&python, "cmd", None, None).unwrap(),
+            format!("call \"{}\" activate \"{}\"", bat.display(), env.display())
+        );
+        assert_eq!(
+            conda_activation(&python, "powershell", None, None).unwrap(),
+            format!("& '{}'; conda activate '{}'", hook.display(), env.display())
+        );
+        assert_eq!(
+            conda_activation(&python, "fish", None, None).unwrap(),
+            format!("{} shell.fish hook | source; and conda activate {}", q(&conda), q(&env))
+        );
+        assert_eq!(conda_activation(&python, "nu", None, None), None, "no conda hook for this shell");
+        assert!(conda_activation(&base_python, "bash", None, None).unwrap().ends_with(&q(&base)), "base itself");
+
+        // A `--prefix` env elsewhere finds the installation through CONDA_EXE or PATH.
+        let elsewhere = tmp.path().join("project").join(".conda");
+        let python = prefix(&elsewhere);
+        assert_eq!(conda_activation(&python, "bash", None, None), None);
+        let line = conda_activation(&python, "bash", Some(conda.clone()), None).unwrap();
+        assert!(line.ends_with(&format!("conda activate {}", q(&elsewhere))), "{line}");
+        assert!(conda_activation(&python, "cmd", None, Some(bat.clone())).is_some());
+
+        // Not a conda prefix.
+        let plain = tmp.path().join("python");
+        touch(&plain.join("bin").join("python"));
+        assert_eq!(conda_activation(&plain.join("bin").join("python"), "bash", Some(conda), None), None);
     }
 }

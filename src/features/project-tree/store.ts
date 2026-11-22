@@ -4,13 +4,22 @@
  * Kept outside React so actions (keyboard, Find Action, context menu) share it.
  */
 import { create } from "zustand";
-import type { FileEntry } from "@/bindings";
+import type { UnityProjectInfo } from "@/bindings";
+import { call } from "@/platform/ipc";
+import { commands, type FileEntry, type OutlineItem } from "@/bindings";
+import { withDocument } from "@/editor/lsp/files";
 import { IpcError } from "@/platform/ipc";
+import { libraryEntryPaths } from "@/platform/virtualDocs";
+import { isIgnoredName } from "@/platform/ignoredNames";
+import { tx, txPart } from "@/platform/i18n";
+import { notifications } from "@/workbench/contributions";
+import { ipcPath } from "@/platform/paths";
 import {
   DEFAULT_TREE_OPTIONS,
   GROUP_PREFIX,
   buildModel,
   buildPathsModel,
+  compareNames,
   extraFolders,
   isGroupKey,
   isLibKey,
@@ -23,17 +32,24 @@ import {
   mergeListing,
   planRefresh,
   visibleEntries,
+  unityPathVisible,
   type Placeholder,
   type ProjectNode,
   type TreeModel,
   type TreeOptions,
 } from "./model";
 import { projectFs } from "./fs";
-import { projectViewRoots, useProjectViewRoots, type ProjectViewRootContribution } from "@/workbench/contributions";
-import { ancestorsWithin, isSameOrInside, type PackageKind } from "./paths";
+import { PROJECT_TYPES, type ProjectType } from "@/ui/projectType";
+import {
+  projectViewRoots,
+  useProjectViewRoots,
+  type ProjectViewLead,
+  type ProjectViewRootContribution,
+} from "@/workbench/contributions";
+import { ancestorsWithin, isInside, isSameOrInside, nameOf, type PackageKind } from "./paths";
 
 export interface ViewOptions extends TreeOptions {
-  /** Select the active editor's file in the tree. */
+  /** Select the active editor's file in the tree (IDEA: Always Select Opened File). */
   autoscrollFromSource: boolean;
   /** Open the selected file while navigating the tree (preview, no focus change). */
   autoscrollToSource: boolean;
@@ -43,6 +59,12 @@ export interface ViewOptions extends TreeOptions {
   singleClickExpand: boolean;
   /** Single click shows files in the preview tab (IDEA's "Enable Preview Tab"). */
   previewTab: boolean;
+  /** Show a file's declarations as expandable rows below it. */
+  showMembers: boolean;
+  /** Show the location of each project root beside its name. */
+  showRootPaths: boolean;
+  /** Rows wider than the pane scroll sideways; off clips long names (VS Code's horizontal scrolling). */
+  horizontalScroll: boolean;
 }
 
 export const DEFAULT_VIEW_OPTIONS: ViewOptions = {
@@ -53,6 +75,9 @@ export const DEFAULT_VIEW_OPTIONS: ViewOptions = {
   singleClickExpand: false,
   // IDEA's "Enable Preview Tab" is off by default.
   previewTab: false,
+  showMembers: false,
+  showRootPaths: true,
+  horizontalScroll: true,
 };
 
 function storedOptions(): ViewOptions {
@@ -62,9 +87,10 @@ function storedOptions(): ViewOptions {
 }
 
 /** IDEA's Project view panes ("Project ▾" in the tool window header). */
-export type ViewMode = "project" | "projectFiles" | "openFiles" | "changedFiles" | "scratches";
+export type ViewMode = "unity" | "project" | "projectFiles" | "openFiles" | "changedFiles" | "scratches" | "scope";
 
 export const VIEW_MODES: ReadonlyArray<[ViewMode, string]> = [
+  ["unity", "Unity"],
   ["project", "Project"],
   ["projectFiles", "Project Files"],
   ["openFiles", "Open Files"],
@@ -73,7 +99,7 @@ export const VIEW_MODES: ReadonlyArray<[ViewMode, string]> = [
 ];
 
 /** Modes listing just some files (expanded as they appear). */
-export const isFilteredMode = (mode: ViewMode) => mode === "openFiles" || mode === "changedFiles";
+export const isFilteredMode = (mode: ViewMode) => mode === "openFiles" || mode === "changedFiles" || mode === "scope";
 
 export type Editing =
   | { kind: "new"; parent: string; nodeKind: "file" | "dir"; pkg?: PackageKind }
@@ -82,12 +108,18 @@ export type Editing =
 export interface Clipboard {
   paths: string[];
   cut: boolean;
+  /** Server paths cannot be represented by the client's OS file list. */
+  remote?: boolean;
+  /** Pending OS hand-off, so a read cannot invalidate this copy before its write finishes. */
+  osWrite?: Promise<boolean>;
 }
 
 interface ProjectTreeState {
+  unity: UnityProjectInfo | null;
   root: string | null;
   name: string;
   members: readonly string[] | null;
+  projectTypes: ReadonlyMap<string, ProjectType>;
   listings: ReadonlyMap<string, readonly FileEntry[]>;
   expanded: ReadonlySet<string>;
   selected: ReadonlySet<string>;
@@ -96,7 +128,8 @@ interface ProjectTreeState {
   editing: Editing | null;
   clipboard: Clipboard | null;
   /** A path to select (and scroll to) once its row is visible. */
-  revealRequest: { path: string; focus: boolean; seq: number } | null;
+  /** `explain`: say which view option hides the path when only an ancestor can be selected. */
+  revealRequest: { path: string; focus: boolean; seq: number; explain?: boolean } | null;
   /** Folder key highlighted as drop target. */
   dropTarget: string | null;
   mode: ViewMode;
@@ -104,10 +137,17 @@ interface ProjectTreeState {
   openFiles: readonly string[];
   /** Files with VCS changes (All Changed Files mode). */
   changedFiles: readonly string[];
+  /** The user scope a "scope" pane shows (Settings › Scopes), by name. */
+  scope: string | null;
+  /** The files of `scope`. */
+  scopeFiles: readonly string[];
+  /** Loaded document outlines per file path, for the "Show Members" rows (empty for unsupported files). */
+  outlines: ReadonlyMap<string, readonly OutlineItem[]>;
 }
 
 const OPTIONS_KEY = "openidea.projectTree.options";
 const MODE_KEY = "openidea.projectTree.mode";
+const SCOPE_KEY = "openidea.projectTree.scope";
 const expandedKey = (root: string) => `openidea.projectTree.expanded:${root}`;
 const MAX_PERSISTED = 3000;
 
@@ -129,9 +169,11 @@ function writeJson(key: string, value: unknown) {
 }
 
 export const useProjectTree = create<ProjectTreeState>(() => ({
+  unity: null,
   root: null,
   name: "",
   members: null,
+  projectTypes: new Map(),
   listings: new Map(),
   expanded: new Set(),
   selected: new Set(),
@@ -144,10 +186,14 @@ export const useProjectTree = create<ProjectTreeState>(() => ({
   mode: readMode(),
   openFiles: [],
   changedFiles: [],
+  scope: readJson<string>(SCOPE_KEY),
+  scopeFiles: [],
+  outlines: new Map(),
 }));
 
 function readMode(): ViewMode {
   const m = readJson<string>(MODE_KEY);
+  if (m === "scope" && readJson<string>(SCOPE_KEY)) return "scope";
   return VIEW_MODES.find(([id]) => id === m)?.[0] ?? "project";
 }
 
@@ -158,9 +204,11 @@ const set = (patch: Partial<ProjectTreeState>) => useProjectTree.setState(patch)
 // Derived model (memoised on its inputs so React and actions share one instance)
 
 let memo: {
+  unity: UnityProjectInfo | null;
   root: string | null;
   name: string;
   members: readonly string[] | null;
+  projectTypes: ProjectTreeState["projectTypes"];
   listings: ProjectTreeState["listings"];
   options: ViewOptions;
   editing: Editing | null;
@@ -173,15 +221,27 @@ let memo: {
 const EMPTY_MODEL: TreeModel = { roots: [], children: new Map(), byKey: new Map(), keyOfPath: new Map() };
 
 const filesOf = (s: ProjectTreeState) =>
-  s.mode === "openFiles" ? s.openFiles : s.mode === "changedFiles" ? s.changedFiles : null;
+  s.mode === "openFiles"
+    ? s.openFiles
+    : s.mode === "changedFiles"
+      ? s.changedFiles
+      : s.mode === "scope"
+        ? s.scopeFiles
+        : null;
+
+function treeOptions(s: ProjectTreeState): TreeOptions {
+  return s.mode === "unity" && s.unity && s.root ? { ...s.options, compact: false, unityRoot: s.root } : s.options;
+}
 
 export function selectModel(s: ProjectTreeState): TreeModel {
   const files = filesOf(s);
   if (
     memo &&
+    memo.unity === s.unity &&
     memo.root === s.root &&
     memo.name === s.name &&
     memo.members === s.members &&
+    memo.projectTypes === s.projectTypes &&
     memo.listings === s.listings &&
     memo.options === s.options &&
     memo.editing === s.editing &&
@@ -193,17 +253,31 @@ export function selectModel(s: ProjectTreeState): TreeModel {
   const placeholder: Placeholder | null =
     s.editing?.kind === "new" ? { parent: s.editing.parent, kind: s.editing.nodeKind } : null;
   const extras = useProjectViewRoots.getState().roots;
+  const options = treeOptions(s);
   const contributed = projectViewRoots(extras);
-  const memberRoots = s.members?.map((path) => ({
-    path,
-    label: path.slice(path.lastIndexOf("/") + 1),
-    icon: "",
-    detail: path,
-  }));
+  const memberRoots = s.members
+    ?.map((path) => ({ path, label: nameOf(path), icon: "" }))
+    .sort((a, b) => {
+      if (s.options.sortBy === "type") {
+        const aType = s.projectTypes.get(a.path);
+        const bType = s.projectTypes.get(b.path);
+        const typeOrder =
+          aType && bType
+            ? compareNames(PROJECT_TYPES[aType].name, PROJECT_TYPES[bType].name)
+            : aType
+              ? -1
+              : bType
+                ? 1
+                : 0;
+        if (typeOrder) return typeOrder;
+        return compareNames(a.label, b.label);
+      }
+      return a.path === s.root ? -1 : b.path === s.root ? 1 : compareNames(a.label, b.label);
+    });
   const project = () =>
     memberRoots
-      ? withExtraRoots(EMPTY_MODEL, memberRoots, s.listings, s.options, placeholder)
-      : buildModel({ path: s.root!, name: s.name }, s.listings, s.options, placeholder);
+      ? withExtraRoots(EMPTY_MODEL, memberRoots, s.listings, options, placeholder)
+      : buildModel({ path: s.root!, name: s.name }, s.listings, options, placeholder);
   let model = EMPTY_MODEL;
   if (s.root) {
     if (s.mode === "projectFiles") model = project();
@@ -221,16 +295,20 @@ export function selectModel(s: ProjectTreeState): TreeModel {
         files,
         s.options.foldersFirst,
       );
-    else model = withExtraRoots(project(), contributed, s.listings, s.options, placeholder);
+    else model = withExtraRoots(project(), contributed, s.listings, options, placeholder);
+    if (s.unity && s.mode === "unity" && model.roots[0])
+      model.roots[0].detail = s.unity.editorVersion ? `Unity ${s.unity.editorVersion}` : "Unity";
     const libraries = extraFolders(contributed).flatMap((r) =>
       r.readOnly && r.path !== undefined && isSameOrInside(r.path, s.root!) ? [r.path] : [],
     );
     model = withReadOnlyFolders(model, libraries);
   }
   memo = {
+    unity: s.unity,
     root: s.root,
     name: s.name,
     members: s.members,
+    projectTypes: s.projectTypes,
     listings: s.listings,
     options: s.options,
     editing: s.editing,
@@ -252,24 +330,46 @@ const inflight = new Map<string, Promise<void>>();
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Resets the view for a newly opened project, restoring its expansion state. */
-export function initProjectTree(root: string | null, name = "", members: readonly string[] | null = null) {
+export function initProjectTree(
+  root: string | null,
+  name = "",
+  members: readonly string[] | null = null,
+  unity: UnityProjectInfo | null = null,
+) {
   generation++;
   inflight.clear();
+  outlineInflight.clear();
   clearTimeout(persistTimer);
   modeExpanded.clear();
   autoExpanded.clear();
+  const previous = get();
+  const previousMode = previous.mode;
+  const mode =
+    unity && previousMode === "project" ? "unity" : !unity && previousMode === "unity" ? "project" : previousMode;
+  // Keep the remaining members' types visible while the workspace is rescanned.
+  const projectTypes = new Map<string, ProjectType>();
+  if (root === previous.root && members) {
+    for (const member of members) {
+      const type = previous.projectTypes.get(member);
+      if (type) projectTypes.set(member, type);
+    }
+  }
   set({
+    unity,
+    mode,
     root,
     name,
     members,
+    projectTypes,
     listings: new Map(),
-    expanded: initialExpanded(root, get().mode, members),
+    expanded: initialExpanded(root, mode, members),
     selected: new Set(),
     lead: null,
     editing: null,
     clipboard: null,
     revealRequest: null,
     dropTarget: null,
+    outlines: new Map(),
   });
 }
 
@@ -287,25 +387,28 @@ function initialExpanded(root: string | null, mode: ViewMode, members = get().me
         r.scope === "scratches" && r.path ? [r.path] : [],
       ),
     );
-  const persisted = mode === "project" ? (readJson<string[]>(expandedKey(root)) ?? []) : [];
-  const roots = members ?? [root];
-  const expanded = new Set(persisted.filter((p) => roots.some((r) => isSameOrInside(p, r))));
-  roots.forEach((r) => expanded.add(r));
-  return expanded;
+  // The tree as the user left it, like IDEA: a collapsed project root stays collapsed, and
+  // nodes outside it (content roots, contributed roots) stay open.
+  // Keys of nodes that no longer exist are inert. Only a first open expands the roots.
+  const persisted = mode === "project" || mode === "unity" ? readJson<string[]>(expandedKey(root)) : null;
+  if (persisted) return new Set(persisted);
+  return new Set(members ?? [root]);
 }
 
 function persistExpanded() {
-  if (get().mode !== "project") return;
+  if (get().mode !== "project" && get().mode !== "unity") return;
   clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     const { root, expanded, mode } = get();
-    if (root && mode === "project") writeJson(expandedKey(root), [...expanded].slice(0, MAX_PERSISTED));
+    if (root && (mode === "project" || mode === "unity"))
+      writeJson(expandedKey(root), [...expanded].slice(0, MAX_PERSISTED));
   }, 300);
 }
 
 /** Switches the pane ("Project ▾"), remembered across sessions. */
 export function setViewMode(mode: ViewMode) {
   const s = get();
+  if (mode === "unity" && !s.unity) return;
   if (s.mode === mode) return;
   modeExpanded.set(s.mode, s.expanded);
   autoExpanded.clear();
@@ -338,6 +441,25 @@ export function setOpenFiles(paths: readonly string[]) {
   if (prev.length !== paths.length || prev.some((p, i) => p !== paths[i])) set({ openFiles: [...paths] });
 }
 
+/** Shows the user scope `name` as a pane of the Project view (IDEA's scope views). */
+export function setScopeView(name: string) {
+  const s = get();
+  if (s.mode === "scope" && s.scope === name) return;
+  writeJson(SCOPE_KEY, name);
+  if (s.mode === "scope") {
+    autoExpanded.clear();
+    set({ scope: name, scopeFiles: [], expanded: new Set(), selected: new Set(), lead: null, editing: null });
+    return;
+  }
+  set({ scope: name, scopeFiles: [] });
+  setViewMode("scope");
+}
+
+export function setScopeFiles(paths: readonly string[]) {
+  const prev = get().scopeFiles;
+  if (prev.length !== paths.length || prev.some((p, i) => p !== paths[i])) set({ scopeFiles: [...paths] });
+}
+
 export function setChangedFiles(paths: readonly string[]) {
   const prev = get().changedFiles;
   if (prev.length !== paths.length || prev.some((p, i) => p !== paths[i])) set({ changedFiles: [...paths] });
@@ -361,6 +483,14 @@ export function toggleExpanded(node: Pick<ProjectNode, "key" | "chain">) {
 
 export function setSelection(selected: ReadonlySet<string>, lead: string | null) {
   set({ selected, lead });
+}
+
+/** The selection's lead node, in the shape the navigation bar shows (IDEA's bar follows the tree). */
+export function leadSelection(): ProjectViewLead | null {
+  const { lead, selected } = get();
+  const node = currentModel().byKey.get(lead ?? [...selected][0] ?? "");
+  if (!node || node.placeholder || node.group) return null;
+  return { path: node.path, dir: node.dir };
 }
 
 export function setViewOption<K extends keyof ViewOptions>(key: K, value: ViewOptions[K]) {
@@ -394,8 +524,8 @@ export function loadDir(path: string, force = false): Promise<void> {
       putListing(path, entries);
       // Compact Middle Packages needs to look one level down a single-folder chain.
       const s = get();
-      if (s.options.compact) {
-        const visible = visibleEntries(entries, s.options);
+      if (treeOptions(s).compact) {
+        const visible = visibleEntries(entries, treeOptions(s));
         const only = visible.length === 1 ? visible[0]! : null;
         if (only && isDirEntry(only) && !only.ignored && !s.listings.has(only.path)) void loadDir(only.path);
       }
@@ -421,7 +551,12 @@ export function loadDir(path: string, force = false): Promise<void> {
 }
 
 /** Applies a backend `fsChanged` event: reloads affected loaded folders only. */
-export async function applyFsChange(event: { created: string[]; modified: string[]; removed: string[] }) {
+export async function applyFsChange(event: {
+  created: string[];
+  modified: string[];
+  removed: string[];
+  ignoreRules?: string[];
+}) {
   const s = get();
   if (!s.root) return;
   const plan = planRefresh(event, new Set(s.listings.keys()));
@@ -449,12 +584,35 @@ export async function applyFsChange(event: { created: string[]; modified: string
     }
   }
   await Promise.all(plan.reload.map((p) => loadDir(p, true)));
+  // Member rows go stale when the file changes on disk: drop and refetch.
+  if (event.modified.length) dropOutlines(event.modified);
+  if (event.removed.length) {
+    const outlines = new Map(get().outlines);
+    let changed = false;
+    for (const p of event.removed)
+      for (const key of [...outlines.keys()])
+        if (isSameOrInside(key, p)) {
+          outlines.delete(key);
+          changed = true;
+        }
+    if (changed) set({ outlines });
+  }
 }
 
 /** Re-reads the folders among `dirs` the tree has loaded; the rest stay unread. */
 export async function reloadLoadedDirs(dirs: readonly string[]) {
   const { listings } = get();
   await Promise.all(dirs.filter((p) => listings.has(p)).map((p) => loadDir(p, true)));
+}
+
+/**
+ * Re-reads the loaded folders inside archives (`<archive>!…`): a build tool sync may have replaced
+ * a library jar in place (a SNAPSHOT installed again), which no file watcher reports.
+ */
+export async function reloadArchiveDirs() {
+  const { listings } = get();
+  const inArchive = (p: string) => p.endsWith("!") || p.includes("!/") || p.includes("!\\");
+  await Promise.all([...listings.keys()].filter(inArchive).map((p) => loadDir(p, true)));
 }
 
 /** Re-reads every loaded folder (View › Reload from Disk). */
@@ -464,16 +622,79 @@ export async function reloadAll() {
 }
 
 // ---------------------------------------------------------------------------
+// Members ("Show Members")
+
+const outlineInflight = new Map<string, { promise: Promise<void> }>();
+
+/**
+ * Loads a file's outline for its member rows; unsupported files (no language
+ * support, binary, …) cache an empty list so the chevron collapses away.
+ */
+export function loadOutline(path: string, force = false): Promise<void> {
+  const { outlines } = get();
+  if (!force && outlines.has(path)) return Promise.resolve();
+  const running = outlineInflight.get(path);
+  if (running) return running.promise;
+  const gen = generation;
+  const request = { promise: Promise.resolve() };
+  outlineInflight.set(path, request);
+  request.promise = (async () => {
+    try {
+      const items = await withDocument(path, (doc) => call(commands.docOutline(doc)));
+      if (gen !== generation || outlineInflight.get(path) !== request) return;
+      set({ outlines: new Map(get().outlines).set(path, items) });
+    } catch (e) {
+      if (gen !== generation || outlineInflight.get(path) !== request) return;
+      console.warn(`project view: cannot read members of ${path}`, e);
+      set({ outlines: new Map(get().outlines).set(path, []) });
+    } finally {
+      if (outlineInflight.get(path) === request) outlineInflight.delete(path);
+    }
+  })();
+  return request.promise;
+}
+
+/** Drops the cached outlines of `paths`; expanded files are re-read at once. */
+export function dropOutlines(paths: readonly string[]) {
+  const s = get();
+  const touched = [...new Set(paths)].filter((p) => s.outlines.has(p) || outlineInflight.has(p));
+  if (!touched.length) return;
+  const outlines = new Map(s.outlines);
+  for (const p of touched) {
+    outlines.delete(p);
+    outlineInflight.delete(p);
+  }
+  set({ outlines });
+  for (const p of touched)
+    if (s.options.showMembers && [...s.expanded].some((k) => pathOfKey(k) === p)) void loadOutline(p);
+}
+
+// ---------------------------------------------------------------------------
 // Reveal / expand
 
 let revealSeq = 0;
 
 /** Expands the ancestors of `path` and selects it once visible. */
-export function revealPath(path: string, focus = false) {
+export function revealPath(requested: string, focus = false, explain = false) {
   const { expanded } = get();
   const project = get().root;
-  const root = project && isSameOrInside(path, project) ? project : project ? extraRootOf(path) : null;
-  if (!root) return false;
+  if (!project) return false;
+  // Registered archive roots by their `/`-separated form, which candidate paths use.
+  const archiveRoots = new Map(
+    extraFolders(projectViewRoots(useProjectViewRoots.getState().roots)).flatMap((r) =>
+      r.path?.endsWith("!") ? [[ipcPath(r.path), r.path] as const] : [],
+    ),
+  );
+  const archives = [...archiveRoots.keys()];
+  const rootOf = (p: string) => {
+    const archive = p.indexOf("!/");
+    if (archive !== -1) return archiveRoots.get(ipcPath(p.slice(0, archive + 1))) ?? null;
+    return memberRootOf(p) ?? (isSameOrInside(p, project) ? project : extraRootOf(p));
+  };
+  // Library documents (`jdt://`, `jar:` URIs) are shown as entries of their archive under External Libraries.
+  const path = [requested, ...libraryEntryPaths(requested, archives)].find((p) => rootOf(p) !== null);
+  if (!path) return false;
+  const root = rootOf(path)!;
   // Library folders sit below group nodes (External Libraries › SDK), keyed in their own namespace.
   const model = currentModel();
   const rootKey = root === project ? root : (model.keyOfPath.get(root) ?? root);
@@ -487,9 +708,19 @@ export function revealPath(path: string, focus = false) {
       changed = true;
     }
   if (changed) setExpanded(next);
-  set({ revealRequest: { path, focus, seq: ++revealSeq } });
+  set({ revealRequest: { path, focus, seq: ++revealSeq, ...(explain ? { explain } : {}) } });
   for (const a of folders) void loadDir(a);
   return true;
+}
+
+/**
+ * The linked workspace project containing `path`, if any (the innermost one). A
+ * workspace's root is its own directory; its projects are separate top-level roots.
+ */
+function memberRootOf(path: string): string | null {
+  let found: string | null = null;
+  for (const m of get().members ?? []) if (isSameOrInside(path, m) && (!found || m.length > found.length)) found = m;
+  return found;
 }
 
 /** The contributed folder (scratches, a library root…) containing `path`, if any. */
@@ -499,21 +730,29 @@ export function extraRootOf(path: string): string | null {
   return null;
 }
 
-/** Whether the current pane can show `path` (Select In switches to "Project" otherwise). */
-export function modeShows(path: string): boolean {
-  const { mode, root } = get();
-  if (!root) return false;
+/** Whether a pane can show `path`. */
+export function modeShows(path: string, mode = get().mode): boolean {
+  const state = get();
+  if (!state.root) return false;
   switch (mode) {
+    case "unity":
+      return !!state.unity && unityPathVisible(path, treeOptions({ ...state, mode }));
     case "project":
       return true;
     case "projectFiles":
-      return isSameOrInside(path, root);
+      return memberRootOf(path) !== null || (!state.members && isSameOrInside(path, state.root));
     case "scratches":
       return projectViewRoots(useProjectViewRoots.getState().roots).some(
         (r) => r.scope === "scratches" && r.path !== undefined && isSameOrInside(path, r.path),
       );
-    default:
-      return currentModel().keyOfPath.has(path);
+    default: {
+      if (mode === state.mode) return currentModel().keyOfPath.has(path);
+      const pane = { ...state, mode };
+      const files = filesOf(pane);
+      if (files?.includes(path)) return true;
+      // Only a folder that contains a listed file needs a tree lookup.
+      return !!files?.some((file) => isInside(file, path)) && selectModel(pane).keyOfPath.has(path);
+    }
   }
 }
 
@@ -539,6 +778,45 @@ function groupAncestors(model: TreeModel, key: string): string[] {
     out.unshift(parent);
     child = parent;
   }
+}
+
+/**
+ * The view option that hides `path` below its shown ancestor `shown`: a hidden name
+ * (Show Hidden Files) or an ignored entry (Show Excluded Files). Null when no option does.
+ */
+export function hidingOption(path: string, shown: string): "showHidden" | "showExcluded" | null {
+  const { listings, options } = get();
+  if (!isSameOrInside(path, shown) || path === shown) return null;
+  let dir = shown;
+  for (const name of path.slice(shown.length + 1).split("/")) {
+    if (isIgnoredName(name)) return options.showHidden ? null : "showHidden";
+    if (listings.get(dir)?.find((e) => e.name === name)?.ignored) return options.showExcluded ? null : "showExcluded";
+    dir = `${dir}/${name}`;
+  }
+  return null;
+}
+
+const OPTION_TITLES = { showHidden: "Show Hidden Files", showExcluded: "Show Excluded Files" } as const;
+
+/** Select Opened File reached only `shown`: say which option hides `path`, offering to turn it on. */
+export function explainHiddenPath(path: string, shown: string) {
+  const option = hidingOption(path, shown);
+  if (!option) return;
+  const title = OPTION_TITLES[option];
+  notifications().notify({
+    level: "info",
+    key: "project.hiddenPath",
+    title: tx`${nameOf(path)} is hidden because ${txPart(title)} is off`,
+    actions: [
+      {
+        label: tx(title),
+        run: () => {
+          setViewOption(option, true);
+          revealPath(path, true);
+        },
+      },
+    ],
+  });
 }
 
 export function clearRevealRequest(seq: number) {
@@ -569,7 +847,7 @@ export async function expandAll(from?: string, limit = 400) {
     await loadDir(path);
     if (gen !== generation) return;
     const s = get();
-    for (const e of visibleEntries(s.listings.get(path) ?? [], s.options))
+    for (const e of visibleEntries(s.listings.get(path) ?? [], treeOptions(s)))
       if (isDirEntry(e) && !e.ignored && e.kind !== "symlink") queue.push(keyLike(dir, e.path));
   }
   setExpanded(toExpand);

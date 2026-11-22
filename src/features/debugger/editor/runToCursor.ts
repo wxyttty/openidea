@@ -3,10 +3,11 @@
  * line shows a small button left of its text that runs to that line (Resume on
  * the execution line itself). Settings › Debugger › "Show inlay Run to Cursor popup".
  */
+import { classFileBreakpointReason } from "@/platform/classFiles";
 import type { Extension } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { EditorDocContext } from "@/editor/api";
-import { iconNode } from "@/editor/lsp/iconMarkup";
+import { iconNode } from "@/ui/iconNode";
 import { executeAction } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
 import { workflowSettings } from "@/platform/workflowSettings";
@@ -30,7 +31,7 @@ export function hoveredLine(
 }
 
 export function runToCursorInlay(ctx: EditorDocContext): Extension {
-  if (ctx.virtual) return [];
+  if (classFileBreakpointReason(ctx.path) || (ctx.virtual && !ctx.path.startsWith("jdt:"))) return [];
   const path = ctx.path;
   return ViewPlugin.fromClass(
     class {

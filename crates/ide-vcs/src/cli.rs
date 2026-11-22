@@ -1,12 +1,17 @@
 //! Thin wrapper around the `git` executable used for every mutating operation.
 
+use ide_core::process::{own_group, terminate_tree};
 use ide_core::{CancellationToken, IdeError, IdeResult};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// How long a cancelled git's process group (remote helpers, `ssh`, credential helpers) gets
+/// to exit on `SIGTERM` before `SIGKILL`: git removes its `index.lock` on `SIGTERM`.
+const KILL_GRACE: Duration = Duration::from_millis(20);
 
 /// Explicit git executable from Settings › Version Control › Git (`None` = auto-detect).
 static CONFIGURED: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
@@ -200,6 +205,49 @@ pub(crate) fn run_paths(root: &Path, args: &[&str], paths: &[String]) -> IdeResu
     run_paths_env(root, args, paths, None, &[])
 }
 
+const RESTRICTED_CONFIG: [&str; 8] = [
+    "core.fsmonitor=false",
+    "core.hooksPath=",
+    // `git diff` writes the index back after refreshing it, and that write runs the hooks a
+    // config names for `post-index-change`, which `core.hooksPath` does not reach.
+    "diff.autoRefreshIndex=false",
+    "hook.post-index-change.enabled=false",
+    "diff.external=",
+    "core.attributesFile=",
+    "submodule.recurse=false",
+    "log.showSignature=false",
+];
+
+/// The keys that name a signature verifier; `gpg.openpgp.program` is an alias of `gpg.program`.
+const VERIFIER_KEYS: [&str; 4] = ["gpg.program", "gpg.openpgp.program", "gpg.ssh.program", "gpg.x509.program"];
+
+/// A program path git opens directly and cannot find, as nothing exists below a regular file.
+/// An empty name is not enough: Git for Windows looks it up on `PATH` and runs a file named `.exe`.
+fn no_program() -> &'static std::ffi::OsStr {
+    static PATH: OnceLock<std::ffi::OsString> = OnceLock::new();
+    PATH.get_or_init(|| match std::env::current_exe() {
+        Ok(exe) if exe.is_absolute() => exe.join("no-program").into_os_string(),
+        _ => Default::default(),
+    })
+}
+
+/// Keeps `cmd`, a git that reads a repository, from running what that repository's config names
+/// for a read: the fsmonitor hook, hooks, the external diff, a signature verifier and a lazy
+/// fetch. Call it before the subcommand is added. Clean and process filters have a key per
+/// driver ([`filter_overrides_from`] empties those); signing, transport and credential helpers
+/// are not covered.
+pub fn restrict(cmd: &mut Command) {
+    for setting in RESTRICTED_CONFIG {
+        cmd.arg("-c").arg(setting);
+    }
+    for key in VERIFIER_KEYS {
+        let mut setting = std::ffi::OsString::from(format!("{key}="));
+        setting.push(no_program());
+        cmd.arg("-c").arg(setting);
+    }
+    cmd.env_remove("GIT_EXTERNAL_DIFF").env("GIT_NO_LAZY_FETCH", "1");
+}
+
 /// Builds a `git` command with the environment every invocation needs.
 pub(crate) fn command(root: &Path) -> IdeResult<Command> {
     let restricted = !crate::execution_allowed();
@@ -210,16 +258,7 @@ pub(crate) fn command(root: &Path) -> IdeResult<Command> {
     };
     let mut cmd = Command::new(binary);
     if restricted {
-        for setting in [
-            "core.fsmonitor=false",
-            "core.hooksPath=",
-            "diff.external=",
-            "core.attributesFile=",
-            "submodule.recurse=false",
-        ] {
-            cmd.arg("-c").arg(setting);
-        }
-        cmd.env_remove("GIT_EXTERNAL_DIFF").env("GIT_NO_LAZY_FETCH", "1");
+        restrict(&mut cmd);
     }
     cmd.current_dir(root)
         .arg("-c")
@@ -267,7 +306,7 @@ pub(crate) fn run_raw_env(
     env: &[(&str, &std::ffi::OsStr)],
 ) -> IdeResult<Output> {
     let first = run_raw_env_once(root, args, stdin, env)?;
-    if !retryable_index_lock(args, &first) {
+    if !retryable_index_conflict(args, &first) {
         return Ok(first);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -281,13 +320,17 @@ pub(crate) fn run_raw_env(
             return Ok(first);
         }
         let out = run_raw_env_once(root, args, stdin, env)?;
-        if !retryable_index_lock(args, &out) {
+        if !retryable_index_conflict(args, &out) {
             return Ok(out);
         }
     }
 }
 
-fn retryable_index_lock(args: &[&str], out: &Output) -> bool {
+/// git reporting that it could not replace `.git/index`: on Windows the file cannot be
+/// renamed over while another process still has it open, which is no `index.lock` conflict.
+const INDEX_WRITE_BLOCKED: &str = "fatal: Could not write new index file.";
+
+fn retryable_index_conflict(args: &[&str], out: &Output) -> bool {
     // These builtins take the index lock before changing the index, worktree or refs.
     // switch folds post-checkout hook failures to exit 1, unlike checkout/restore
     // path operations, whose hooks can return 128 after files have already changed.
@@ -306,11 +349,24 @@ fn retryable_index_lock(args: &[&str], out: &Output) -> bool {
         return false;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let Some(path) = stderr.lines().next().and_then(|line| line.strip_prefix("fatal: Unable to create '")) else {
-        return false;
-    };
-    path.strip_suffix("': File exists.")
-        .is_some_and(|path| path.ends_with("/index.lock") || path.ends_with("\\index.lock"))
+    let Some(first) = stderr.lines().next() else { return false };
+    if let Some(path) = first.strip_prefix("fatal: Unable to create '") {
+        return path
+            .strip_suffix("': File exists.")
+            .is_some_and(|path| path.ends_with("/index.lock") || path.ends_with("\\index.lock"));
+    }
+    // `.git/index` keeps its previous entries when the new file could not replace it, so
+    // rerunning is safe for the builtins that take the lock before changing anything.
+    // switch may already have updated the worktree by then, and `rm` without `--cached`
+    // has deleted the files before it writes the index.
+    if first == INDEX_WRITE_BLOCKED {
+        return match *sub {
+            "switch" => false,
+            "rm" => options.contains(&"--cached"),
+            _ => true,
+        };
+    }
+    false
 }
 
 fn run_raw_env_once(
@@ -328,6 +384,7 @@ fn run_raw_env_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     tracing::debug!(?args, "git");
+    let refresh = IndexRefresh::before(root, args, env);
     let mut session = CommandSession::start(&mut cmd);
     let mut child = cmd.spawn().map_err(spawn_error)?;
     let writer = match (stdin, child.stdin.take()) {
@@ -345,7 +402,201 @@ fn run_raw_env_once(
         let _ = w.join();
     }
     session.finish(out.status.success(), &String::from_utf8_lossy(&out.stderr));
+    refresh.after();
     Ok(Output { stdout: out.stdout, stderr: out.stderr, code: out.status.code() })
+}
+
+/// `git diff` against the working tree rewrites the index when it meets files whose stat data
+/// is stale (`diff.autoRefreshIndex`), even under `--no-optional-locks`. Like status's
+/// write-back, that is a side effect of reading: recorded as ours, watchers don't report it as
+/// a repository change. Otherwise a view that re-reads on repository changes re-triggers itself,
+/// endlessly where git and gix disagree on stat data (Windows, #4792).
+struct IndexRefresh(Option<(PathBuf, crate::index_writes::Stamp)>);
+
+impl IndexRefresh {
+    fn before(root: &Path, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Self {
+        let reads_worktree = subcommand(args) == "diff"
+            && !args.iter().any(|a| matches!(*a, "--cached" | "--staged" | "--no-index"))
+            && !env.iter().any(|(k, _)| *k == "GIT_INDEX_FILE");
+        Self(reads_worktree.then(|| index_file(root)).flatten().map(|index| {
+            let stamp = crate::index_writes::stamp(&index);
+            (index, stamp)
+        }))
+    }
+
+    fn after(self) {
+        if let Some((index, stamp)) = self.0
+            && !stamp.still_holds(&index)
+        {
+            crate::index_writes::lock().record(&index);
+        }
+    }
+}
+
+/// The index of the working tree at `root`: `.git/index`, or a linked worktree's own index
+/// in the gitdir its `.git` file names.
+fn index_file(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("index"));
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let dir = Path::new(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(root.join(dir).join("index"))
+}
+
+/// Captures binary/NUL-delimited read output while allowing cancellation to kill git.
+pub(crate) fn run_cancellable(root: &Path, args: &[&str], cancel: &CancellationToken) -> IdeResult<Output> {
+    let out = run_cancellable_raw(root, args, cancel)?;
+    if out.code == Some(0) { Ok(out) } else { Err(failure(args, &out.stderr, &out.stdout, out.code)) }
+}
+
+/// Cancellable capture preserving exit codes for commands with documented non-error states.
+pub(crate) fn run_cancellable_raw(root: &Path, args: &[&str], cancel: &CancellationToken) -> IdeResult<Output> {
+    run_cancellable_raw_stdin(root, args, None, cancel)
+}
+
+/// Like `run_cancellable`, feeding `stdin` to git. Revisions and paths passed through
+/// `--stdin` are not bound by the command-line length limit (Windows: ~32K characters).
+pub(crate) fn run_cancellable_stdin(
+    root: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    cancel: &CancellationToken,
+) -> IdeResult<Output> {
+    let out = run_cancellable_raw_stdin(root, args, Some(stdin), cancel)?;
+    if out.code == Some(0) { Ok(out) } else { Err(failure(args, &out.stderr, &out.stdout, out.code)) }
+}
+
+fn run_cancellable_raw_stdin(
+    root: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    cancel: &CancellationToken,
+) -> IdeResult<Output> {
+    run_capture(root, args, stdin, cancel, usize::MAX)
+}
+
+/// Options for a `git diff` that reads the working tree in Restricted Mode: git asks a submodule
+/// with changes for its own status, and for its own diff when `diff.submodule` says so, and both
+/// run under the submodule's config.
+pub(crate) fn submodule_guards() -> &'static [&'static str] {
+    if crate::execution_allowed() { &[] } else { &["--ignore-submodules=dirty", "--submodule=short"] }
+}
+
+/// Neutralizes repository clean/process filters for a read of working-tree bytes.
+/// Git still applies them with --no-ext-diff and --no-textconv.
+pub(crate) fn filter_overrides(root: &Path, cancel: &CancellationToken) -> IdeResult<Vec<String>> {
+    if crate::execution_allowed() {
+        return Ok(Vec::new());
+    }
+    let config = run_bounded(root, &["config", "--null", "--list"], cancel, 4 << 20)?;
+    filter_overrides_from(&config.stdout)
+}
+
+/// `-c` arguments that empty every clean and process filter in `config`, the output of
+/// `git config --null --list`. Fails when one of them cannot be emptied this way: git splits
+/// `-c name=value` at the first `=`, and a name that is not UTF-8 does not reach git as it is
+/// on every platform.
+pub fn filter_overrides_from(config: &[u8]) -> IdeResult<Vec<String>> {
+    let mut overrides = Vec::new();
+    for record in config.split(|b| *b == 0) {
+        let key = record.split(|b| *b == b'\n').next().unwrap_or_default();
+        let required = key.ends_with(b".required");
+        if !key.starts_with(b"filter.") || !(key.ends_with(b".clean") || key.ends_with(b".process") || required) {
+            continue;
+        }
+        let Some(key) = std::str::from_utf8(key).ok().filter(|key| !key.contains('=')) else {
+            let key = String::from_utf8_lossy(key);
+            return Err(IdeError::invalid(format!("git cannot be told to skip the filter setting `{key}`")));
+        };
+        overrides.push("-c".into());
+        overrides.push(format!("{key}={}", if required { "false" } else { "" }));
+    }
+    Ok(overrides)
+}
+
+/// Cancellable capture with bounded stdout and stderr; stops git on overflow.
+pub(crate) fn run_bounded(root: &Path, args: &[&str], cancel: &CancellationToken, max: usize) -> IdeResult<Output> {
+    let out = run_capture(root, args, None, cancel, max)?;
+    if out.code == Some(0) { Ok(out) } else { Err(failure(args, &out.stderr, &out.stdout, out.code)) }
+}
+fn run_capture(
+    root: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    cancel: &CancellationToken,
+    max: usize,
+) -> IdeResult<Output> {
+    if cancel.is_cancelled() {
+        return Err(IdeError::cancelled());
+    }
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cmd = command(root)?;
+    cmd.args(args)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    own_group(&mut cmd);
+    let refresh = IndexRefresh::before(root, args, &[]);
+    let mut session = CommandSession::start(&mut cmd);
+    let mut child = cmd.spawn().map_err(spawn_error)?;
+    let writer = match (stdin, child.stdin.take()) {
+        (Some(data), Some(mut pipe)) => {
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                // A broken pipe just means git stopped reading early; its exit status tells the story.
+                let _ = pipe.write_all(&data);
+            }))
+        }
+        _ => None,
+    };
+    let capture = |mut pipe: Box<dyn Read + Send>| {
+        let overflow = overflow.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            (&mut pipe).take(max.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len() > max {
+                overflow.store(true, std::sync::atomic::Ordering::Release);
+                std::io::copy(&mut pipe, &mut std::io::sink())?;
+            }
+            Ok(bytes)
+        })
+    };
+    let stdout = capture(Box::new(child.stdout.take().expect("piped stdout")));
+    let stderr = capture(Box::new(child.stderr.take().expect("piped stderr")));
+    let status = loop {
+        if cancel.is_cancelled() || overflow.load(std::sync::atomic::Ordering::Acquire) {
+            terminate_tree(&mut child, KILL_GRACE);
+            let _ = stdout.join();
+            let _ = stderr.join();
+            if let Some(w) = writer {
+                let _ = w.join();
+            }
+            return Err(if cancel.is_cancelled() {
+                IdeError::cancelled()
+            } else {
+                IdeError::invalid(format!("git output exceeds {max} bytes"))
+            });
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let join = |thread: std::thread::JoinHandle<std::io::Result<Vec<u8>>>| {
+        thread.join().map_err(|_| IdeError::internal("git output reader panicked"))?.map_err(IdeError::from)
+    };
+    let out = Output { stdout: join(stdout)?, stderr: join(stderr)?, code: status.code() };
+    session.finish(status.success(), &String::from_utf8_lossy(&out.stderr));
+    refresh.after();
+    if out.stdout.len() > max || out.stderr.len() > max {
+        return Err(IdeError::invalid(format!("git output exceeds {max} bytes")));
+    }
+    Ok(out)
 }
 
 /// Runs git and maps a non-zero exit status to an error carrying git's message.
@@ -455,11 +706,7 @@ pub(crate) fn run_streaming_env(
         cmd.env(k, v);
     }
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    own_group(&mut cmd);
     tracing::debug!(?args, "git (streaming)");
     let mut session = CommandSession::start(&mut cmd);
     let mut child = cmd.spawn().map_err(spawn_error)?;
@@ -480,8 +727,7 @@ pub(crate) fn run_streaming_env(
     let mut open = readers.len();
     while open > 0 {
         if cancel.is_cancelled() {
-            kill(&mut child);
-            let _ = child.wait();
+            terminate_tree(&mut child, KILL_GRACE);
             for r in readers {
                 let _ = r.join();
             }
@@ -510,8 +756,7 @@ pub(crate) fn run_streaming_env(
             break status;
         }
         if cancel.is_cancelled() {
-            kill(&mut child);
-            let _ = child.wait();
+            terminate_tree(&mut child, KILL_GRACE);
             return Err(IdeError::cancelled());
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -595,22 +840,6 @@ fn spawn_reader(
     })
 }
 
-fn kill(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as libc::pid_t;
-        // SAFETY: plain syscall; the child was spawned as leader of its own process group.
-        unsafe {
-            libc::kill(-pid, libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-}
-
 #[cfg(test)]
 mod command_session_tests {
     use super::*;
@@ -641,6 +870,25 @@ mod command_session_tests {
         let events = events.lock().unwrap();
         let ours: Vec<_> = events.iter().filter(|(id, _, _)| *id == first_id || *id == second_id).cloned().collect();
         assert_eq!(ours, vec![(second_id, false, String::new()), (first_id, true, "done".into())]);
+    }
+}
+
+#[cfg(test)]
+mod restrict_tests {
+    use super::*;
+
+    #[test]
+    fn restrict_names_a_verifier_git_opens_directly_and_cannot_find() {
+        let mut cmd = Command::new("git");
+        restrict(&mut cmd);
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let programs: Vec<_> = args.iter().filter_map(|arg| arg.split_once(".program=")).collect();
+        assert_eq!(programs.len(), 4, "{args:?}");
+        for (key, program) in programs {
+            let program = Path::new(program);
+            assert!(program.is_absolute(), "{key}.program is {program:?}: git would look that name up on PATH");
+            assert!(!program.exists(), "{key}.program is {program:?}, which exists");
+        }
     }
 }
 
@@ -720,12 +968,10 @@ mod index_lock_tests {
         run(dir.path(), &["init", "-q", "-b", "main"], None).unwrap();
         std::fs::write(dir.path().join("file"), "main\n").unwrap();
         run(dir.path(), &["add", "file"], None).unwrap();
-        run(
-            dir.path(),
-            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"],
-            None,
-        )
-        .unwrap();
+        // git started outside an execution scope is restricted and has no signing program, so the
+        // user's `commit.gpgsign` must not reach this commit.
+        let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"];
+        run(dir.path(), &[&identity[..], &["commit", "-qm", "initial"]].concat(), None).unwrap();
         run(dir.path(), &["branch", "other"], None).unwrap();
         dir
     }
@@ -775,6 +1021,8 @@ mod index_lock_tests {
         )
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Hooks run only in a trusted repository.
+        let _scope = crate::ExecutionScope::enter(true);
         let out = run_raw(dir.path(), &["switch", "-q", "other"], None).unwrap();
         assert_eq!(out.code, Some(1));
         assert_eq!(std::fs::read_to_string(dir.path().join("hook-runs")).unwrap(), "ran\n");
@@ -789,15 +1037,15 @@ mod index_lock_tests {
             code: Some(128),
         };
         for args in [&["switch", "other"][..], &["--literal-pathspecs", "add", "-A", "--"], &["rm"], &["reset"]] {
-            assert!(retryable_index_lock(args, &out));
+            assert!(retryable_index_conflict(args, &out));
         }
         for sub in ["merge", "rebase", "stash", "commit", "update-index", "checkout", "restore", "pull", "status"] {
-            assert!(!retryable_index_lock(&[sub], &out));
+            assert!(!retryable_index_conflict(&[sub], &out));
         }
-        assert!(!retryable_index_lock(&["add", "--patch"], &out));
-        assert!(!retryable_index_lock(&["reset", "--soft"], &out));
+        assert!(!retryable_index_conflict(&["add", "--patch"], &out));
+        assert!(!retryable_index_conflict(&["reset", "--soft"], &out));
         out.code = Some(1); // switch's post-checkout hook can fail after the switch succeeded.
-        assert!(!retryable_index_lock(&["switch"], &out));
+        assert!(!retryable_index_conflict(&["switch"], &out));
         out.code = Some(128);
         for message in [
             "fatal: Unable to create '/repo/.git/HEAD.lock': File exists.",
@@ -806,7 +1054,37 @@ mod index_lock_tests {
             "warning: partial work\nfatal: Unable to create '/repo/.git/index.lock': File exists.",
         ] {
             out.stderr = message.as_bytes().to_vec();
-            assert!(!retryable_index_lock(&["switch"], &out));
+            assert!(!retryable_index_conflict(&["switch"], &out));
         }
+    }
+
+    #[test]
+    fn retries_an_index_the_worktree_scan_keeps_open_on_windows() {
+        // Windows cannot rename over `.git/index` while the IDE's own status scan has it
+        // open: git then reports a write failure instead of an index.lock conflict.
+        let mut out = Output { stdout: Vec::new(), stderr: INDEX_WRITE_BLOCKED.as_bytes().to_vec(), code: Some(128) };
+        for args in [
+            &["--literal-pathspecs", "reset", "-q", "HEAD", "--", "a.md"][..],
+            &["--literal-pathspecs", "add", "-A", "--"],
+            &["--literal-pathspecs", "rm", "--cached", "-r", "-q", "--ignore-unmatch", "--"],
+        ] {
+            assert!(retryable_index_conflict(args, &out), "{args:?}");
+        }
+        // The worktree may already be updated by switch, and `rm` deletes its files before
+        // it writes the index, so neither is repeated.
+        out.code = Some(128);
+        for args in [&["switch", "other"][..], &["rm"]] {
+            assert!(!retryable_index_conflict(args, &out), "{args:?}");
+        }
+        for sub in ["commit", "merge", "rebase", "update-index", "restore"] {
+            assert!(!retryable_index_conflict(&[sub], &out));
+        }
+        // The same failure with output on stdout is not this message alone; and a
+        // different exit code is not git's fatal.
+        out.stdout = b"partial".to_vec();
+        assert!(!retryable_index_conflict(&["reset"], &out));
+        out.stdout.clear();
+        out.code = Some(1);
+        assert!(!retryable_index_conflict(&["reset"], &out));
     }
 }

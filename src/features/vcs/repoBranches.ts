@@ -1,12 +1,13 @@
 /** Branches popup model for a project with several repositories (pure). */
 import type { Branch } from "@/bindings";
 import { tx } from "@/platform/i18n";
-import { fuzzyMatch } from "@/ui/match";
+import { fuzzyMatch, wordMatch } from "@/ui/match";
 import { rootOf } from "./model";
 import {
   actionRows,
   defaultFolderOpen,
   isFavoriteBranch,
+  preferredMatch,
   prefixTreeRows,
   recentLocal,
   sortLocal,
@@ -62,12 +63,28 @@ export function widgetShowsRepo(repos: readonly Pick<RepoEntry, "head">[]): bool
   return !first || repos.some((r) => r.head !== first);
 }
 
+export function branchRepositoryRoots(
+  roots: readonly string[],
+  branchRoots: Readonly<Record<string, string>>,
+  current?: string | null,
+): string[] {
+  const repositories = new Map<string, string>();
+  for (const root of roots) {
+    const group = branchRoots[root] ?? root;
+    const previous = repositories.get(group);
+    if (!previous || root === current || (root === group && previous !== current)) repositories.set(group, root);
+  }
+  return [...repositories.values()];
+}
+
 export interface CommonBranch {
   name: string;
   remote: boolean;
   /** Checked out in every repository. */
   current: boolean;
   favorite: boolean;
+  /** Tracks a remote branch in some repository. */
+  upstream: boolean;
 }
 
 /** Branches present in every repository (by name), local and remote, sorted like the single-repository lists. */
@@ -88,6 +105,7 @@ export function commonBranches(
           remote: b.remote,
           current: b.current && all.every((x) => x!.current),
           favorite: isFavoriteBranch(b, favorites),
+          upstream: !!b.upstream || all.some((x) => !!x!.upstream),
         },
       ];
     });
@@ -105,6 +123,8 @@ export type BranchGroupKind = "recent" | "local" | "remote";
 export type RepoRow =
   /** Section header; an empty label draws a separator. */
   | { type: "section"; key: string; label: string }
+  /** A warning above the branches (not selectable): the repositories are on different branches. */
+  | { type: "notice"; key: string; label: string; detail: string }
   | { type: "action"; key: string; action: PopupAction; matches: number[] | null }
   | { type: "repo"; key: string; repo: RepoEntry; color: number; matches: number[] | null }
   /** Collapsible group (common branches, or one of the current repository's lists) or prefix / remote folder. */
@@ -147,13 +167,15 @@ export interface MultiRepoInput extends Omit<BranchTreeOptions, "expanded"> {
   recent?: readonly string[];
   /** Tags of the current repository. */
   tags?: readonly string[];
+  /** Branch operations act on all repositories (the setting): the common branches are listed. */
+  sync: boolean;
 }
 
 /**
  * Rows of the Branches popup with several repositories: actions; the repositories,
- * each with its current branch and opening its own branches; then, when they are all
- * on the same branch, the branches common to all of them (acting on all of them),
- * otherwise the current repository's recent, local and remote branches and tags, in
+ * each with its current branch and opening its own branches; then, with `sync`, the
+ * branches common to all of them (acting on all of them; a notice when the repositories
+ * are on different branches), otherwise the current repository's recent, local and remote branches and tags, in
  * collapsible groups (Recent open, Local open only without Recent). A query filters
  * actions, repositories (by name) and branches, expands every group, and adds the
  * other repositories' matching branches.
@@ -171,9 +193,10 @@ export function buildMultiRepoRows({
   groupByPrefix = true,
   showRecent = true,
   showTags = true,
+  sync,
 }: MultiRepoInput): RepoRow[] {
   const q = query.trim();
-  const match = (text: string): number[] | null | false => (q ? (fuzzyMatch(text, q) ?? false) : null);
+  const match = (text: string): number[] | null | false => (q ? (wordMatch(text, q) ?? false) : null);
   const open = (key: string, byDefault: boolean) => !!q || (expanded.get(key) ?? byDefault);
   const blocks: RepoRow[][] = [];
 
@@ -181,7 +204,8 @@ export function buildMultiRepoRows({
 
   const repoRows: RepoRow[] = [];
   repos.forEach((repo, i) => {
-    const m = match(repo.name);
+    // Repository names keep the loose match: the list is short and abbreviations like `deps` help.
+    const m = q ? (fuzzyMatch(repo.name, q) ?? false) : null;
     if (m !== false)
       repoRows.push({ type: "repo", key: `repo:${repo.root}`, repo, color: repoColorIndex(i), matches: m });
   });
@@ -275,11 +299,17 @@ export function buildMultiRepoRows({
     );
   };
 
-  const shared = !widgetShowsRepo(repos);
   const groups: RepoRow[] = [];
+  if (sync && widgetShowsRepo(repos))
+    groups.push({
+      type: "notice",
+      key: "notice:diverged",
+      label: tx("Branches have diverged"),
+      detail: tx("Check out the same branch in all repositories to operate on them together."),
+    });
   let shown = new Set<string>();
   const currentRepo = repos.find((r) => r.root === current) ?? repos[0];
-  if (shared) {
+  if (sync) {
     const loaded = repos.every((r) => branches[r.root]);
     const common = loaded
       ? commonBranches(
@@ -325,7 +355,7 @@ export function buildMultiRepoRows({
 
   if (q) {
     for (const repo of repos) {
-      if (!shared && repo === currentRepo) continue;
+      if (!sync && repo === currentRepo) continue;
       const list = branches[repo.root] ?? [];
       const own = (l: Branch[]) => l.filter((b) => !shown.has(`${b.remote}:${b.name}`));
       const rows = [
@@ -344,4 +374,24 @@ export function buildMultiRepoRows({
     rows.push(...block);
   }
   return rows;
+}
+
+/** `preferredMatch` for the branches popup of several repositories: actions, repositories, common branches, then one repository's. */
+export function preferredRepoRow(rows: readonly RepoRow[], query: string): number {
+  return preferredMatch(rows, query, (r) => {
+    switch (r.type) {
+      case "action":
+        return { rank: 0, name: tx(r.action.label) };
+      case "repo":
+        return { rank: 1, name: r.repo.name };
+      case "common":
+        return { rank: r.branch.remote ? 3 : 2, name: r.branch.name };
+      case "branch":
+        return { rank: r.group === "remote" ? 5 : 4, name: r.branch.name };
+      case "tag":
+        return { rank: 6, name: r.tag };
+      default:
+        return null;
+    }
+  });
 }

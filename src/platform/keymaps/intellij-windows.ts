@@ -4,6 +4,8 @@
  * there stay unbound here.
  */
 export const intellijWindows: Record<string, string[]> = {
+  "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Ctrl+N"],
@@ -56,6 +58,7 @@ export const intellijWindows: Record<string, string[]> = {
   "navigate.nextEditLocation": [],
   "navigate.gotoTest": ["Ctrl+Shift+T"],
   "navigate.superMethod": ["Ctrl+U"],
+  "navigate.relatedSymbol": ["Ctrl+Alt+Home"],
   "navigate.nextMethod": ["Alt+Down"],
   "navigate.previousMethod": ["Alt+Up"],
   "navigate.nextOccurrence": ["Ctrl+Alt+Down"],
@@ -171,10 +174,14 @@ export const intellijWindows: Record<string, string[]> = {
   "refactor.inline": ["Ctrl+Alt+N"],
   "refactor.move": ["F6"],
   "refactor.safeDelete": ["Alt+Delete"],
+  "refactor.extractInterface": [],
+  "refactor.pullMembersUp": [],
+  "refactor.pushMembersDown": [],
 
   // File / editor tabs
   "file.save": ["Ctrl+S"],
   "file.settings": ["Ctrl+Alt+S"],
+  "file.projectStructure": ["Ctrl+Alt+Shift+S"],
   "file.openProject": [],
   "file.newScratchFile": ["Ctrl+Alt+Shift+Insert"],
   "editor.closeTab": ["Ctrl+F4"],
@@ -193,7 +200,8 @@ export const intellijWindows: Record<string, string[]> = {
   "window.previous": ["Ctrl+Alt+["],
   "file.reloadFromDisk": ["Ctrl+Alt+Y"],
   // Before the project view's Ctrl+Shift+C (Copy Absolute Path), which wins there.
-  "editor.copyPath": ["Ctrl+Shift+C"],
+  "editor.copyPath": [],
+  "editor.copyPathReference": ["Ctrl+Shift+C"],
 
   // Project view (when: projectViewFocus)
   "project.newFile": ["Alt+Insert"],
@@ -207,6 +215,7 @@ export const intellijWindows: Record<string, string[]> = {
   "project.paste": ["Ctrl+V", "Shift+Insert"],
   "project.copyAbsolutePath": ["Ctrl+Shift+C"],
   "project.open": ["F4"],
+  "project.openInRightSplit": ["Shift+Enter"],
   "project.findUsages": ["Alt+F7"],
   "project.reformatCode": ["Ctrl+Alt+L"],
   "project.optimizeImports": ["Ctrl+Alt+O"],
@@ -214,6 +223,9 @@ export const intellijWindows: Record<string, string[]> = {
   "project.reloadFromDisk": ["Ctrl+Alt+Y"],
   "project.expandAll": ["Ctrl+="],
   "project.collapseAll": ["Ctrl+-"],
+  // In the test results tree (keyWhen).
+  "run.expandAllTests": ["Ctrl+="],
+  "run.collapseAllTests": ["Ctrl+-"],
 
   // Tool windows
   "toolwindow.project": ["Alt+1"],
@@ -229,7 +241,8 @@ export const intellijWindows: Record<string, string[]> = {
   "toolwindow.terminal": ["Alt+F12"],
   "toolwindow.hideAll": ["Ctrl+Shift+F12"],
   "toolwindow.maximize": ["Ctrl+Shift+'"],
-  "layout.restoreDefault": ["Shift+F12"],
+  "layout.restoreCurrent": ["Shift+F12"],
+  "layout.restoreDefault": [],
   "toolwindow.jumpToLast": ["F12"],
   "toolwindow.hideActive": ["Shift+Escape"],
   "toolwindow.focusEditor": ["Escape"],
@@ -278,7 +291,7 @@ export const intellijWindows: Record<string, string[]> = {
   "debug.setValue": ["F2"],
   "debug.jumpToSource": ["F4"],
   "debug.evaluate": ["Alt+F8"],
-  "debug.quickEvaluate": ["Ctrl+Alt+F8"],
+  "debug.quickEvaluate": ["Ctrl+Alt+F8", "Alt+Button1"],
   "debug.browseConsoleHistory": ["Ctrl+Alt+E"],
 
   // VCS
@@ -290,7 +303,10 @@ export const intellijWindows: Record<string, string[]> = {
   "vcs.showMessageHistory": ["Ctrl+M"],
   "vcs.update": ["Ctrl+T"],
   "vcs.rollback": ["Ctrl+Alt+Z"],
+  "vcs.addToVcs": ["Ctrl+Alt+A"],
   "vcs.showDiff": ["Ctrl+D"],
+  "vcs.log.changes.showDiff": ["Ctrl+D"],
+  "vcs.showDiffInNewWindow": [],
   "vcs.nextChange": ["Ctrl+Alt+Shift+Down"],
   "vcs.prevChange": ["Ctrl+Alt+Shift+Up"],
   // After Next / Previous Change: these win the shared keys in a tool window.
@@ -306,6 +322,8 @@ export const intellijWindows: Record<string, string[]> = {
   "runAnything.show": ["Ctrl Ctrl"],
   "view.quickSwitchScheme": ["Ctrl+`"],
   "vcs.changelist.move": ["Alt+Shift+M"],
+  "vcs.shelveSilently": ["Ctrl+Shift+H"],
+  "vcs.unshelveSilently": ["Ctrl+Alt+U"],
   "vcs.changelist.edit": ["F2", "Shift+F6"],
   "vcs.log.copyRevision": ["Ctrl+Alt+Shift+C"],
   "vcs.log.goToRef": ["Ctrl+F"],
@@ -324,6 +342,7 @@ export const intellijWindows: Record<string, string[]> = {
   "diff.nextFile": ["Alt+Shift+Right"],
   "diff.prevFile": ["Alt+Shift+Left"],
   "diff.showSettings": ["Ctrl+Shift+D"],
+  "diff.focusOppositePane": ["Ctrl+Shift+Tab"],
   // After Show Diff: Ctrl+D is Compare With… in the project view.
   "project.compareWith": ["Ctrl+D"],
   // Editing extras, image viewer (keyWhen: image focused) and Markdown editor layouts
@@ -344,10 +363,37 @@ export const intellijWindows: Record<string, string[]> = {
   "markdown.previewOnly": [],
   // HTTP Client / Database console: run the request or statement at the caret.
   "http.runRequest": ["Ctrl+Enter"],
+  "graphql.runQuery": ["Ctrl+Enter"],
   "http.runAll": [],
+  "db.toggleBooleanCell": ["Space"],
+  "db.setCellNull": ["Ctrl+Backspace"],
+  "db.setCellDefault": ["Ctrl+Shift+Backspace"],
+  "db.reformatValue": ["Ctrl+Alt+L"],
+  "db.openValueWindow": [],
+  "db.findInValue": ["Ctrl+F"],
   "db.execute": ["Ctrl+Enter"],
+  "python.console.executeSelection": ["Alt+Shift+E"],
+  "db.nextResultTab": ["Alt+Right"],
+  "db.previousResultTab": ["Alt+Left"],
+  // Table editor with pending changes (after `vcs.rollback`, so Ctrl+Alt+Z reverts the table's edits there).
+  "db.goToColumn": ["Ctrl+F12"],
+  "db.submitChanges": ["Ctrl+Enter"],
+  "db.revertChanges": ["Ctrl+Alt+Z"],
+  // Data editor (table editor / result grid), IDEA's Console.TableResult.* defaults.
+  "db.reloadPage": ["Ctrl+F5"],
+  "db.firstPage": [],
+  "db.previousPage": ["Ctrl+Alt+Up"],
+  "db.nextPage": ["Ctrl+Alt+Down"],
+  "db.lastPage": [],
+  "db.addRow": ["Alt+Insert"],
+  "db.deleteRows": ["Ctrl+Y", "Alt+Delete"],
+  "db.restoreRows": [],
+  "db.exportData": [],
+  "db.editCell": [],
   "db.showToolWindow": [],
   "agents.newTask": ["Ctrl+Alt+Shift+I"],
+  "agents.focusInput": ["Ctrl+L"],
+  "agents.cycleEffort": ["Alt+T"],
   "agents.showToolWindow": [],
   "agents.sendToAgent": [],
   // Database tool window (when the tree has focus; `db.openConsole` anywhere).
@@ -381,6 +427,8 @@ export const intellijWindows: Record<string, string[]> = {
   "db.runSqlScript": [],
   "db.sqlScript": [],
   "db.goToReferencedTable": [],
+  "db.selectOpened": [],
+  "db.expandAll": [],
   "db.collapseAll": [],
   // Terminal (keyWhen: terminalFocus); after VCS Update / Go to Test so it wins there.
   "terminal.new": ["Ctrl+Shift+T"],
@@ -397,4 +445,6 @@ export const intellijWindows: Record<string, string[]> = {
   "find.openInWindow": ["Alt+F7"],
   "find.field.newLine": ["Ctrl+Shift+Enter"],
   "find.field.recentSearches": ["Alt+Down"],
+  "editor.pasteHistory.paste": ["Enter"],
+  "editor.pasteHistory.remove": ["Delete", "Backspace"],
 };

@@ -4,7 +4,7 @@ import { createMemoryBackend } from "./backend";
 import { findTab, initialTabsState, paneIds } from "./model/tabs";
 import { useDocMeta } from "./model/document";
 import { useProject } from "@/platform/project";
-import { ask } from "@/workbench/messages";
+import { ask, confirm } from "@/workbench/messages";
 import type * as Messages from "@/workbench/messages";
 import * as virtualDocs from "@/platform/virtualDocs";
 import type { VirtualDocument } from "@/platform/ipc";
@@ -18,6 +18,7 @@ import {
 vi.mock("@/workbench/messages", async (original) => ({
   ...(await original<typeof Messages>()),
   ask: vi.fn(),
+  confirm: vi.fn(),
 }));
 
 class TestDocument implements EditorDocumentLifecycle {
@@ -148,6 +149,9 @@ describe("custom editor document lifetime", () => {
         title: "Class",
         description: null,
         decompiled: true,
+        encoding: "utf-8",
+        hasBom: false,
+        canReloadEncoding: false,
       });
       await rejected;
       expect(findTab(useTabs.getState(), "virtual:jdt://old/Class")).toBeNull();
@@ -243,6 +247,57 @@ describe("custom editor document lifetime", () => {
     expect(doc.running).toBe(false);
     expect(doc.closed).toBe(true);
     expect(findTab(useTabs.getState(), input().key)).toBeNull();
+  });
+
+  it("keeps discarded changes when ending a busy tab's session is cancelled", async () => {
+    const busy = registerEditorKind({
+      kind: "busy-test",
+      component: () => null,
+      title: (i) => i.key,
+      isBusy: () => true,
+    });
+    try {
+      const doc = await open();
+      await ctrl.openInput({ kind: "busy-test", key: "busy:1" }, { focus: false });
+      vi.mocked(ask).mockResolvedValue({ button: "discard", checked: false });
+      vi.mocked(confirm).mockResolvedValue(false);
+      const pane = useTabs.getState().activePane;
+      expect(await ctrl.closeAll(pane)).toBe(false);
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(doc.text).toBe("edited");
+      expect(useTabs.getState().panes[pane]!.tabs.map((tab) => tab.input.key)).toEqual(["custom:a", "busy:1"]);
+    } finally {
+      busy();
+      vi.mocked(confirm).mockReset();
+    }
+  });
+
+  it("asks about a tab that becomes busy while changes are discarded", async () => {
+    let busyNow = false;
+    const busy = registerEditorKind({
+      kind: "busy-test",
+      component: () => null,
+      title: (i) => i.key,
+      isBusy: () => busyNow,
+    });
+    try {
+      const doc = await open();
+      doc.discard = async () => {
+        busyNow = true;
+        doc.pending = "";
+        doc.text = doc.saved;
+      };
+      await ctrl.openInput({ kind: "busy-test", key: "busy:1" }, { focus: false });
+      vi.mocked(ask).mockResolvedValue({ button: "discard", checked: false });
+      vi.mocked(confirm).mockResolvedValue(false);
+      const pane = useTabs.getState().activePane;
+      expect(await ctrl.closeAll(pane)).toBe(false);
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(useTabs.getState().panes[pane]!.tabs.map((tab) => tab.input.key)).toContain("busy:1");
+    } finally {
+      busy();
+      vi.mocked(confirm).mockReset();
+    }
   });
 
   it("discards without a removal-triggered autosave", async () => {
@@ -481,6 +536,24 @@ describe("custom editor document lifetime", () => {
     expect(findTab(useTabs.getState(), input().key)).toBeNull();
   });
 
+  it("autosaves when the application is deactivated while focus is in a frame", async () => {
+    ctrl.stop();
+    let deactivated = () => {};
+    ctrl = new EditorController({
+      ...createMemoryBackend(),
+      onApplicationDeactivated: (handler) => {
+        deactivated = handler;
+        return () => {};
+      },
+    });
+    ctrl.start();
+    const doc = await open();
+    useProject.setState({ settings: { files: { autoSave: true } } as never });
+    // Focus inside a plugin's frame: the window's own blur has already fired, before the edit.
+    deactivated();
+    await vi.waitFor(() => expect(doc.saved).toBe("edited"));
+  });
+
   it("does not prompt or blur-autosave a document until execution has drained", async () => {
     const doc = await open();
     useProject.setState({ settings: { files: { autoSave: true } } as never });
@@ -629,6 +702,30 @@ describe("custom editor document lifetime", () => {
     expect(a.saved).toBe("original");
     expect(a.text).toBe("edited");
     expect(b.saved).toBe("edited");
+  });
+
+  it("releases an authorized decision to leave when the project never changed", async () => {
+    const doc = await open();
+    const session = await ctrl.prepareClose();
+    session.commit();
+    expect(doc.frozen).toBe(true);
+    // The window stayed with its project: files open again, and it can be left again.
+    await open("b");
+    expect(findTab(useTabs.getState(), input("b").key)).not.toBeNull();
+    expect(doc.frozen).toBe(false);
+    const again = await ctrl.prepareClose();
+    expect(() => session.commit()).toThrow();
+    again.cancel();
+  });
+
+  it("keeps an authorized decision while the project it leaves for is opening", async () => {
+    await open();
+    const session = await ctrl.prepareClose();
+    session.commit();
+    useProject.setState({ opening: true });
+    await expect(open("b")).rejects.toThrow("The project is closing");
+    await expect(ctrl.prepareClose()).rejects.toThrow("already pending");
+    useProject.setState({ opening: false });
   });
 
   it("rejects authorization from a cancelled project close session", async () => {

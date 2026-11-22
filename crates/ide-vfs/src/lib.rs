@@ -2,12 +2,15 @@
 
 mod archive;
 mod bytes;
+mod compare;
 mod encoding;
 mod ops;
+mod private;
 mod rules;
 mod watch;
 
 use ide_core::{IdeError, IdeResult};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::cmp::Ordering;
@@ -19,12 +22,20 @@ pub use archive::{
     ARCHIVE_EXTENSIONS, archive_entry_path, archive_root, is_archive_file, is_archive_path, read_archive_dir,
     read_archive_entry, split_archive_path,
 };
-pub use bytes::{ByteRange, FileProbe, MAX_RANGE_LEN, base64, image_mime, probe, read_data_url, read_range};
+pub use bytes::{
+    ByteRange, FileProbe, MAX_RANGE_LEN, base64, content_path_allowed, image_mime, on_local_drive, probe,
+    read_data_url, read_range, same_share,
+};
+pub use compare::{
+    DirectoryCompareEntry, DirectoryCompareMode, DirectoryCompareProgress, DirectoryCompareStatus, DirectorySyncAction,
+    DirectorySyncFailure, DirectorySyncOperation, DirectorySyncProgress, compare_directories, copy_merge,
+};
 use encoding::SNIFF_LEN;
 pub use encoding::{
     LARGE_FILE_THRESHOLD, MAX_OPEN_SIZE, READ_ONLY_THRESHOLD, decode_properties_escapes, encode,
-    encode_properties_ascii, save_properties_text, write_atomic, write_atomic_strict,
+    encode_properties_ascii, save_properties_text, write_atomic, write_atomic_private, write_atomic_strict,
 };
+pub use private::create_private_dir;
 pub use rules::ExcludeMatcher;
 pub use watch::{WatchMode, Watcher};
 
@@ -120,55 +131,61 @@ pub fn read_dir(dir: &Path, excludes: &[String]) -> IdeResult<Vec<FileEntry>> {
     if !fs::metadata(dir)?.is_dir() {
         return Err(IdeError::invalid(format!("{} is not a directory", dir.display())));
     }
-    let gitignore = rules::GitignoreStack::new(dir);
+    let gitignore = rules::GitignoreStack::cached(dir);
     let base = gitignore.repo_root().unwrap_or(dir).to_path_buf();
     let excludes = ExcludeMatcher::new(excludes);
 
-    let mut entries: Vec<(bool, FileEntry)> = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = match entry {
-            Ok(e) => e,
+    let paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| match entry {
+            Ok(e) => Some(e.path()),
             Err(e) => {
                 tracing::debug!("read_dir {}: {e}", dir.display());
-                continue;
+                None
             }
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(lmeta) = fs::symlink_metadata(&path) else { continue };
-        let (kind, meta, target_kind) = if lmeta.file_type().is_symlink() {
-            match fs::metadata(&path) {
-                Ok(m) => {
-                    let target = if m.is_dir() { EntryKind::Dir } else { EntryKind::File };
-                    (EntryKind::Symlink, m, Some(target))
+        })
+        .collect();
+    // One stat per entry dominates a large folder (and every stat is a round trip on a network
+    // share): stat in parallel; small folders stay on this thread.
+    let mut entries: Vec<(bool, FileEntry)> = paths
+        .into_par_iter()
+        .with_min_len(256)
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let lmeta = fs::symlink_metadata(&path).ok()?;
+            let (kind, meta, target_kind) = if lmeta.file_type().is_symlink() {
+                match fs::metadata(&path) {
+                    Ok(m) => {
+                        let target = if m.is_dir() { EntryKind::Dir } else { EntryKind::File };
+                        (EntryKind::Symlink, m, Some(target))
+                    }
+                    Err(_) => (EntryKind::Symlink, lmeta, None),
                 }
-                Err(_) => (EntryKind::Symlink, lmeta, None),
-            }
-        } else if lmeta.is_dir() {
-            (EntryKind::Dir, lmeta, None)
-        } else {
-            (EntryKind::File, lmeta, None)
-        };
-        let is_dir = meta.is_dir();
-        let rel = path.strip_prefix(&base).unwrap_or(&path);
-        let excluded = excludes.is_excluded(rel);
-        let ignored = excluded || gitignore.is_ignored(&path, is_dir);
-        entries.push((
-            is_dir,
-            FileEntry {
-                hidden: name.starts_with('.'),
-                size: if is_dir { 0 } else { meta.len() },
-                mtime_ms: mtime_ms(&meta),
-                name,
-                path: path.into(),
-                kind,
-                ignored,
-                excluded,
-                target_kind,
-            },
-        ));
-    }
-    entries.sort_by(|(da, a), (db, b)| db.cmp(da).then_with(|| natural_cmp(&a.name, &b.name)));
+            } else if lmeta.is_dir() {
+                (EntryKind::Dir, lmeta, None)
+            } else {
+                (EntryKind::File, lmeta, None)
+            };
+            let is_dir = meta.is_dir();
+            let rel = path.strip_prefix(&base).unwrap_or(&path);
+            let excluded = excludes.is_excluded(rel);
+            let ignored = excluded || gitignore.is_ignored(&path, is_dir);
+            Some((
+                is_dir,
+                FileEntry {
+                    hidden: name.starts_with('.'),
+                    size: if is_dir { 0 } else { meta.len() },
+                    mtime_ms: mtime_ms(&meta),
+                    name,
+                    path: path.into(),
+                    kind,
+                    ignored,
+                    excluded,
+                    target_kind,
+                },
+            ))
+        })
+        .collect();
+    entries.par_sort_by(|(da, a), (db, b)| db.cmp(da).then_with(|| natural_cmp(&a.name, &b.name)));
     Ok(entries.into_iter().map(|(_, e)| e).collect())
 }
 
@@ -196,6 +213,11 @@ pub struct LoadedText {
 /// refused with `InvalidInput`.
 pub fn load_text(path: &Path) -> IdeResult<LoadedText> {
     encoding::load_text(path)
+}
+
+/// Loads a regular file with editor decoding, bounding both disk and decoded bytes.
+pub fn load_text_bounded(path: &Path, fallback: Option<&str>, max_bytes: usize) -> IdeResult<LoadedText> {
+    encoding::load_text_bounded(path, fallback, max_bytes)
 }
 
 /// Like [`load_text`], but text that is neither valid UTF-8 nor marked by a BOM
@@ -252,6 +274,11 @@ pub fn set_writable(path: &Path, writable: bool) -> IdeResult<()> {
 pub fn rename(from: &Path, to: &Path) -> IdeResult<()> {
     ops::rename(from, to)
 }
+/// Checks source existence and destination conflicts without mutation, using
+/// the same filesystem identity rules as [`rename`].
+pub fn validate_rename(from: &Path, to: &Path) -> IdeResult<()> {
+    ops::validate_rename(from, to)
+}
 /// Moves to the OS trash (recoverable), like IDEA's safe delete for files.
 /// Deletes permanently when the trash is unavailable.
 pub fn delete(path: &Path) -> IdeResult<()> {
@@ -270,13 +297,14 @@ pub fn copy(from: &Path, to: &Path) -> IdeResult<()> {
 /// honouring .gitignore, .ignore and `excludes`. Shared by index and search.
 ///
 /// Hidden files are included; `.git` is always skipped. `.gitignore` applies
-/// even outside a git repository. Symlinks to files are visited, symlinked
+/// even outside a git repository; inside one, a nested repository's root is a
+/// boundary for the outer repository's rules. Symlinks to files are visited, symlinked
 /// directories are not followed.
 pub fn walk_files(root: &Path, excludes: &[String], visit: impl Fn(&Path) + Send + Sync) {
     let excludes = Arc::new(ExcludeMatcher::new(excludes));
     let base = root.to_path_buf();
     let mut builder = ignore::WalkBuilder::new(root);
-    builder.hidden(false).require_git(false).follow_links(false);
+    builder.hidden(false).require_git(ide_core::ignored::inside_git_repo(root)).follow_links(false);
     builder.filter_entry(move |entry| {
         if entry.depth() > 0 && entry.file_name() == ".git" {
             return false;
@@ -320,6 +348,12 @@ pub struct FsBatch {
     /// Folders holding changes filtered out as excluded or ignored. Only a view already
     /// showing such a folder cares, so they don't count as worktree changes.
     pub excluded_dirs: Vec<PathBuf>,
+    /// Ignored files and directories changed, created or removed, including paths
+    /// below ignored folders. Kept apart from worktree changes (no Local History,
+    /// deployment or `fsChanged`): the index tracks their filenames, not contents.
+    pub ignored: Vec<PathBuf>,
+    /// Subtrees whose ignore rules changed (including repository-level rules).
+    pub ignore_rules: Vec<PathBuf>,
 }
 
 impl FsBatch {
@@ -329,6 +363,8 @@ impl FsBatch {
             && self.removed.is_empty()
             && self.vcs.is_empty()
             && self.excluded_dirs.is_empty()
+            && self.ignored.is_empty()
+            && self.ignore_rules.is_empty()
     }
 }
 
@@ -347,6 +383,34 @@ pub fn detect_encoding(bytes: &[u8], fallback: Option<&str>) -> &'static encodin
     }
 }
 
+/// Decodes file bytes with the same rules as files opened in the editor: BOM,
+/// UTF-8 and UTF-16 as detected, other text as `fallback` (else the detected
+/// encoding). `None` for binary content.
+pub fn decode_text(bytes: &[u8], fallback: Option<&str>) -> Option<String> {
+    let (text, detected, has_bom, binary) = encoding::decode(bytes);
+    if binary {
+        return None;
+    }
+    let fallback = fallback.and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()));
+    match fallback {
+        Some(enc)
+            if !has_bom
+                && enc != detected
+                && detected != encoding_rs::UTF_8
+                && detected != encoding_rs::UTF_16LE
+                && detected != encoding_rs::UTF_16BE =>
+        {
+            Some(enc.decode_without_bom_handling(bytes).0.into_owned())
+        }
+        _ => Some(text),
+    }
+}
+
+/// Whether a file's first bytes mark it as binary (NUL bytes that are not UTF-16 text).
+pub fn looks_binary(head: &[u8]) -> bool {
+    encoding::looks_binary(head)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +420,19 @@ mod tests {
         let mut names = vec!["file10", "File2", "file1", "b", "A", "file02", "a", "x9y", "x10y", "readme"];
         names.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(names, vec!["A", "a", "b", "file1", "File2", "file02", "file10", "readme", "x9y", "x10y"]);
+    }
+
+    #[test]
+    fn decodes_text_like_the_editor() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("// 中文搜索验证 Chinese");
+        assert_eq!(decode_text(&gbk, Some("gbk")).as_deref(), Some("// 中文搜索验证 Chinese"));
+        assert_eq!(decode_text(&gbk, Some("GB18030")).as_deref(), Some("// 中文搜索验证 Chinese"));
+        assert_eq!(decode_text("中文".as_bytes(), Some("gbk")).as_deref(), Some("中文"));
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("中文".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        assert_eq!(decode_text(&utf16, Some("gbk")).as_deref(), Some("中文"));
+        assert_eq!(decode_text(&[0x7F, b'E', b'L', b'F', 0, 0, 1, 0], None), None);
+        assert!(looks_binary(&[0x7F, b'E', b'L', b'F', 0, 0, 1, 0]));
+        assert!(!looks_binary(&utf16));
     }
 
     #[test]

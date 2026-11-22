@@ -17,11 +17,22 @@ import {
   type CompletionResult,
   type CompletionSource,
 } from "@codemirror/autocomplete";
-import { EditorState, Facet, Prec, RangeSet, StateEffect, StateField, type Extension } from "@codemirror/state";
+import {
+  Compartment,
+  EditorState,
+  Facet,
+  Prec,
+  RangeSet,
+  type Range,
+  StateEffect,
+  StateField,
+  type Extension,
+} from "@codemirror/state";
 import {
   Decoration,
   EditorView,
   GutterMarker,
+  ViewPlugin,
   WidgetType,
   gutter,
   showPanel,
@@ -29,41 +40,80 @@ import {
   type Panel,
   type Tooltip,
 } from "@codemirror/view";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { createRoot } from "react-dom/client";
 import type { EditorDocContext } from "@/editor/api";
-import { iconNode } from "@/editor/lsp/iconMarkup";
-import type { DbDriver, DbStatementOutcome } from "@/platform/ipc";
+import { iconNode, spinnerNode } from "@/ui/iconNode";
+import {
+  call,
+  commands,
+  type DbDriver,
+  type DbSessionContext,
+  type DbStatementOutcome,
+  type SqlStatement,
+} from "@/platform/ipc";
 import { shortcutLabel } from "@/platform/keymap";
-import { IconButton, Select } from "@/ui";
-import { sourceLabel, splitTarget, targetOf } from "./model";
+import { Icon, IconButton, Select, Toolbar, lazyComponent } from "@/ui";
+import { useProject } from "@/platform/project";
+import {
+  activeSchema,
+  parseSchemaTreeValue,
+  schemaSwitchable,
+  schemaTreeRows,
+  schemaTreeValue,
+  sourceIcon,
+  sourceLabel,
+  splitTarget,
+  targetOf,
+} from "./model";
+import { loadSavedCatalog, offerIntrospection } from "./introspection";
 import { analyze, templateContexts, valuesSlot } from "./sql/analyze";
-import { shouldAutoCompleteSql, sqlCandidates, type CandidateKind, type SqlCandidate } from "./sql/complete";
-import { sqlSupport } from "./sqlSupport";
+import {
+  shouldAutoCompleteSql,
+  sqlCandidates,
+  type CandidateKind,
+  type SqlCandidate,
+  type SqlCatalog,
+} from "./sql/complete";
+import { WHOLE_FILE, sqlSupport, type SqlText } from "./sqlSupport";
+import { snowflakeLanguage } from "./sql/snowflakeHighlight";
 import {
   bindConsole,
   cancelConsole,
+  closeInlineResults,
+  inEditorResults,
+  setInEditorResults,
+  consoleSchema,
   consoleSource,
   executeConsole,
   explainConsole,
   finishTransaction,
   openHistory,
   loadCompletion,
+  runSql,
   listsDatabases,
   loadDatabases,
+  loadSchemas,
   loadSources,
+  loadTables,
+  tablesKey,
+  setConsoleSchema,
   setManualCommit,
   sourceById,
-  targetLabel,
   useDatabase,
 } from "./store";
 import styles from "./Database.module.css";
 import { tx } from "@/platform/i18n";
+import { databaseRequest, projectRequest } from "./requests";
+import type { ResultTab } from "./store";
 
 /** `templates` feature's language-data key for finer template contexts. */
 const TEMPLATE_CONTEXT_KEY = "openideaTemplateContexts";
 
-export const SQL_LANGUAGE = "sql";
+import { formatElapsed } from "./resultView";
+import { SQL_LANGUAGE } from "./sqlLanguage";
+import { jdbcDialect } from "./vendors";
+export { SQL_LANGUAGE };
 const ROW_LIMITS = ["100", "500", "1000", "5000", "50000"];
 
 /** Statement outcomes of the last run, kept on the text (IDEA's gutter check / error and timing). */
@@ -76,19 +126,38 @@ interface RunMark {
   ms: number | null;
 }
 
+interface Executing {
+  /** Tells this run from a later one on the same console. */
+  token: number;
+  active: { index: number; startedAt: number } | null;
+  spans: readonly { from: number; to: number }[];
+}
+
+function activeSpan(ex: Executing | null) {
+  const span = ex?.active ? ex.spans[ex.active.index] : undefined;
+  return span && span.from < span.to ? span : undefined;
+}
+
 interface RunState {
   marks: readonly RunMark[];
   /** Message of the bottom error banner (`null`: hidden). */
   banner: string | null;
+  executing: Executing | null;
 }
 
 const setRun = StateEffect.define<RunState>();
 
 const runField = StateField.define<RunState>({
-  create: () => ({ marks: [], banner: null }),
+  create: () => ({ marks: [], banner: null, executing: null }),
   update(value, tr) {
     for (const e of tr.effects) if (e.is(setRun)) return e.value;
     if (!tr.docChanged) return value;
+    // The request runs the text it was sent; edits only move where that shows.
+    const ex = value.executing;
+    const executing = ex && {
+      ...ex,
+      spans: ex.spans.map((r) => ({ from: tr.changes.mapPos(r.from, 1), to: tr.changes.mapPos(r.to, -1) })),
+    };
     // Editing a statement drops its mark.
     const marks: RunMark[] = [];
     for (const m of value.marks) {
@@ -104,11 +173,20 @@ const runField = StateField.define<RunState>({
           timingAt: tr.changes.mapPos(m.timingAt),
         });
     }
-    return { ...value, marks };
+    return { ...value, marks, executing };
   },
   provide: (f) => [
-    EditorView.decorations.from(f, (st) => {
+    EditorView.decorations.compute([f], (state) => {
+      const st = state.field(f);
       const ranges = [];
+      const active = st.executing?.active;
+      const span = activeSpan(st.executing);
+      if (active && span) {
+        const end = state.sliceDoc(span.to, span.to + 1) === ";" ? span.to + 1 : span.to;
+        const at = Math.min(end, state.doc.lineAt(span.from).to);
+        ranges.push(Decoration.mark({ class: "cm-openidea-db-executing" }).range(span.from, span.to));
+        ranges.push(Decoration.widget({ widget: new ElapsedWidget(active.startedAt), side: 1 }).range(at));
+      }
       for (const m of st.marks) {
         if (m.error)
           ranges.push(
@@ -133,8 +211,44 @@ class TimingWidget extends WidgetType {
   toDOM() {
     const span = document.createElement("span");
     span.className = "cm-openidea-db-timing";
-    span.textContent = this.ms < 1000 ? `${Math.round(this.ms)} ms` : `${(this.ms / 1000).toFixed(1)} s`;
+    span.textContent = formatElapsed(this.ms);
     return span;
+  }
+}
+
+/** The running time of the request, ticking until it ends. */
+class ElapsedWidget extends WidgetType {
+  private timer: ReturnType<typeof setInterval> | undefined;
+  constructor(readonly startedAt: number) {
+    super();
+  }
+  eq(other: ElapsedWidget) {
+    return other.startedAt === this.startedAt;
+  }
+  toDOM() {
+    const span = document.createElement("span");
+    span.className = "cm-openidea-db-timing cm-openidea-db-elapsed";
+    const tick = () => {
+      const elapsed = formatElapsed(Date.now() - this.startedAt);
+      span.textContent = tx`Executing… ${elapsed}`;
+    };
+    tick();
+    this.timer = setInterval(tick, 100);
+    return span;
+  }
+  destroy() {
+    clearInterval(this.timer);
+  }
+}
+
+class ExecutingMarker extends GutterMarker {
+  eq(other: GutterMarker) {
+    return other instanceof ExecutingMarker;
+  }
+  toDOM() {
+    const el = spinnerNode(12, "cm-openidea-db-run-executing");
+    el.title = tx("Executing");
+    return el;
   }
 }
 
@@ -161,9 +275,12 @@ const runGutter = gutter({
   markers: (view) => {
     const st = view.state.field(runField);
     const doc = view.state.doc;
-    const ranges = st.marks
+    const active = activeSpan(st.executing);
+    const line = active ? doc.lineAt(active.from).from : undefined;
+    const ranges: Range<GutterMarker>[] = st.marks
       .filter((m) => m.from <= doc.length)
       .map((m) => new RunMarker(m.error).range(doc.lineAt(m.from).from));
+    if (line !== undefined) ranges.push(new ExecutingMarker().range(line));
     return RangeSet.of(ranges, true);
   },
 });
@@ -188,28 +305,66 @@ function errorBanner(message: string) {
   };
 }
 
-/** Marks the statements that ran: gutter check or error, timing, the error banner. */
-export function markOutcomes(view: EditorView, outcomes: readonly DbStatementOutcome[]) {
-  const len = view.state.doc.length;
-  const marks = outcomes
-    .filter((o) => o.statement.to <= len && o.statement.from < o.statement.to)
-    .map((o) => ({
-      from: o.statement.from,
-      to: o.statement.to,
-      timingAt: view.state.sliceDoc(o.statement.to, o.statement.to + 1) === ";" ? o.statement.to + 1 : o.statement.to,
-      error: o.error ?? null,
-      ms: o.result?.elapsedMs ?? null,
-    }));
-  const failed = outcomes.find((o) => o.error);
-  const name = failed ? (sourceById(consoleSource(view.state.facet(consolePath)))?.name ?? "") : "";
-  view.dispatch({ effects: setRun.of({ marks, banner: failed ? `[${name}] ${failed.error}` : null }) });
+let nextExecution = 0;
+
+/** Runs `from`–`to` of `view`, following each statement as it executes. */
+async function executeRange(view: EditorView, path: string, from: number, to: number) {
+  const token = ++nextExecution;
+  const sent = view.state.doc;
+  const start = (statements: readonly SqlStatement[]) => {
+    const st = view.state.field(runField, false);
+    // The offsets are into the text sent; an edit since (while asking for parameters) leaves them unplaced.
+    if (!st || view.state.doc !== sent) return;
+    const spans = statements.map((st) => ({ from: st.from, to: st.to }));
+    const first = spans[0]!;
+    const last = spans[spans.length - 1]!;
+    const marks = st.marks.filter((mark) => mark.to <= first.from || mark.from >= last.to);
+    view.dispatch({ effects: setRun.of({ marks, banner: null, executing: { token, spans, active: null } }) });
+  };
+  try {
+    await executeConsole(path, sent.toString(), from, to, start, (events) => {
+      const st = view.state.field(runField, false);
+      const ex = st?.executing;
+      if (!st || ex?.token !== token) return;
+      const last = events[events.length - 1]!;
+      const active = last.type === "started" ? { index: last.index, startedAt: Date.now() } : null;
+      const marks = [...st.marks];
+      let banner = st.banner;
+      const placed = new Map<number, DbStatementOutcome>();
+      for (const event of events) {
+        if (event.type === "started") continue;
+        const span = ex.spans[event.index];
+        if (!span || span.from >= span.to) continue;
+        const { from, to } = span;
+        const { error, result } = event.outcome;
+        marks.push({
+          from,
+          to,
+          timingAt: view.state.sliceDoc(to, to + 1) === ";" ? to + 1 : to,
+          error,
+          ms: result?.elapsedMs ?? null,
+        });
+        if (error) banner = `[${sourceById(consoleSource(path))?.name ?? ""}] ${error}`;
+        placed.set(event.index, { ...event.outcome, statement: { ...event.outcome.statement, ...span } });
+      }
+      view.dispatch({ effects: setRun.of({ marks, banner, executing: { ...ex, active } }) });
+      return placed;
+    });
+  } finally {
+    const st = view.state.field(runField, false);
+    if (st?.executing?.token === token) view.dispatch({ effects: setRun.of({ ...st, executing: null }) });
+  }
 }
 
 /** Runs the statement at the caret (or the selected ones) of `view`. */
 export async function executeInView(view: EditorView, path: string) {
   const sel = view.state.selection.main;
-  const outcomes = await executeConsole(path, view.state.doc.toString(), sel.from, sel.to);
-  if (outcomes.length) markOutcomes(view, outcomes);
+  await executeRange(view, path, sel.from, sel.to);
+}
+
+/** Runs every statement of `view`, in order (stops at the first that fails). */
+export async function executeScriptInView(view: EditorView, path: string) {
+  await executeRange(view, path, 0, view.state.doc.length);
 }
 
 /** Explain Plan of the statement at the caret (or the first selected one) of `view`. */
@@ -220,6 +375,213 @@ export async function explainInView(view: EditorView, path: string) {
 
 const consolePath = Facet.define<string, string>({ combine: (v) => v[0] ?? "" });
 
+/** An in-editor result and the statement it shows under (mapped through edits). */
+interface InlineAnchor {
+  id: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * Where each in-editor result's statement is now and how tall the result is, by result id:
+ * a console's view can be rebuilt (closed and reopened), and its results go back where they were.
+ */
+const anchors = new Map<number, { from: number; to: number }>();
+const heights = new Map<number, number>();
+const MAX_FIT_HEIGHT = 320;
+const MIN_HEIGHT = 96;
+
+/** Toolbar, notice, header row, the rows and room for the floating pager, up to `MAX_FIT_HEIGHT`. */
+function fitHeight(tab: ResultTab | undefined): number {
+  const rows = tab?.outcome.result?.rows.length ?? 0;
+  return Math.max(MIN_HEIGHT, Math.min(MAX_FIT_HEIGHT, 40 + 24 + 24 + Math.max(rows, 1) * 24 + 56));
+}
+
+const setInline = StateEffect.define<InlineAnchor[]>();
+/** An in-editor result was resized: its widget is redrawn so the editor measures it again. */
+const resized = StateEffect.define<null>();
+
+function anchorOf(tab: ResultTab): InlineAnchor {
+  return { id: tab.id, ...(anchors.get(tab.id) ?? { from: tab.outcome.statement.from, to: tab.outcome.statement.to }) };
+}
+
+const inlineField = StateField.define<readonly InlineAnchor[]>({
+  create: (state) => {
+    const path = state.facet(consolePath);
+    return useDatabase
+      .getState()
+      .inline.filter((t) => t.path === path)
+      .map(anchorOf)
+      .filter((a) => a.to <= state.doc.length);
+  },
+  update(value, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setInline)) value = e.value;
+      else if (e.is(resized)) value = [...value];
+    }
+    if (!tr.docChanged) return value;
+    const next: InlineAnchor[] = [];
+    for (const a of value) {
+      const from = tr.changes.mapPos(a.from, 1);
+      const to = tr.changes.mapPos(a.to, -1);
+      // The statement was deleted: so is its result (the store drops it in `syncInline`).
+      if (to <= from) continue;
+      anchors.set(a.id, { from, to });
+      next.push({ id: a.id, from, to });
+    }
+    return next;
+  },
+  // Under the statement's last line.
+  provide: (f) =>
+    EditorView.decorations.compute([f], (state) =>
+      Decoration.set(
+        state
+          .field(f)
+          .map((a) =>
+            Decoration.widget({ widget: new InlineResultWidget(a.id, heightOf(a.id)), block: true, side: 1 }).range(
+              state.doc.lineAt(a.to).to,
+            ),
+          ),
+        true,
+      ),
+    ),
+});
+
+/**
+ * Keeps the view's in-editor results in step with the store: a run's new results show under
+ * their statements (replacing what those statements showed before), closed ones go away.
+ */
+const syncInline = ViewPlugin.define((view) => {
+  const path = view.state.facet(consolePath);
+  let destroyed = false;
+  const sync = () => {
+    if (destroyed) return;
+    const current = view.state.field(inlineField);
+    const tabs = useDatabase.getState().inline.filter((t) => t.path === path);
+    const ids = new Set(tabs.map((t) => t.id));
+    const known = new Set(current.map((a) => a.id));
+    const len = view.state.doc.length;
+    const added = tabs
+      .filter((t) => !known.has(t.id))
+      .map(anchorOf)
+      .filter((a) => a.to <= len);
+    const overlaps = (a: InlineAnchor) => added.some((b) => b.from < a.to && a.from < b.to);
+    const replaced = current.filter((a) => ids.has(a.id) && overlaps(a)).map((a) => a.id);
+    const kept = current.filter((a) => ids.has(a.id) && !replaced.includes(a.id));
+    for (const a of current)
+      if (!ids.has(a.id)) {
+        anchors.delete(a.id);
+        heights.delete(a.id);
+      }
+    if (!added.length && kept.length === current.length) return;
+    for (const a of added) anchors.set(a.id, { from: a.from, to: a.to });
+    view.dispatch({ effects: setInline.of([...kept, ...added].sort((a, b) => a.to - b.to || a.id - b.id)) });
+    if (replaced.length) closeInlineResults(replaced);
+  };
+  let shown = view.state.field(inlineField);
+  const stop = useDatabase.subscribe((s, prev) => {
+    if (s.inline !== prev.inline) queueMicrotask(sync);
+  });
+  queueMicrotask(sync);
+  return {
+    // Results whose statements were deleted go too.
+    update(u) {
+      const next = u.state.field(inlineField);
+      if (next === shown) return;
+      const gone = shown.filter((a) => !next.some((b) => b.id === a.id)).map((a) => a.id);
+      shown = next;
+      if (gone.length && u.docChanged) queueMicrotask(() => closeInlineResults(gone));
+    },
+    destroy: () => {
+      destroyed = true;
+      stop();
+    },
+  };
+});
+
+function heightOf(id: number): number {
+  return heights.get(id) ?? fitHeight(useDatabase.getState().inline.find((r) => r.id === id));
+}
+
+const InlineGrid = lazyComponent(() => import("./ResultsView").then((m) => m.Result));
+
+function InlineResult({ id, view }: { id: number; view: EditorView }) {
+  const tab = useDatabase((s) => s.inline.find((r) => r.id === id));
+  const [height, setHeight] = useState(() => heightOf(id));
+  const drag = useRef<{ y: number; height: number } | null>(null);
+  const measured = useRef(height);
+  useEffect(() => {
+    if (measured.current === height) return;
+    measured.current = height;
+    view.dispatch({ effects: resized.of(null) });
+  }, [height, view]);
+  if (!tab) return null;
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    drag.current = { y: e.clientY, height };
+  };
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    const next = Math.max(MIN_HEIGHT, Math.round(drag.current.height + e.clientY - drag.current.y));
+    heights.set(id, next);
+    setHeight(next);
+  };
+  return (
+    <div className={styles.inlineResult} style={{ height }}>
+      <InlineGrid tab={tab} onClose={() => closeInlineResults([id])} />
+      <div
+        className={styles.inlineResize}
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label={tx("Resize")}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={() => (drag.current = null)}
+      />
+    </div>
+  );
+}
+
+const inlineRoots = new WeakMap<HTMLElement, ReturnType<typeof createRoot>>();
+
+class InlineResultWidget extends WidgetType {
+  constructor(
+    readonly id: number,
+    readonly height: number,
+  ) {
+    super();
+  }
+  eq(other: InlineResultWidget) {
+    return other.id === this.id && other.height === this.height;
+  }
+  /** A resized result keeps its DOM (and grid state); only the editor's measurement changes. */
+  updateDOM(dom: HTMLElement) {
+    return dom.dataset.result === String(this.id);
+  }
+  get estimatedHeight() {
+    return this.height + 12;
+  }
+  toDOM(view: EditorView) {
+    const dom = document.createElement("div");
+    dom.className = "cm-openidea-db-inline";
+    dom.contentEditable = "false";
+    dom.dataset.result = String(this.id);
+    const root = createRoot(dom);
+    inlineRoots.set(dom, root);
+    root.render(<InlineResult id={this.id} view={view} />);
+    return dom;
+  }
+  destroy(dom: HTMLElement) {
+    const root = inlineRoots.get(dom);
+    inlineRoots.delete(dom);
+    queueMicrotask(() => root?.unmount());
+  }
+  ignoreEvent() {
+    return true;
+  }
+}
+
 function ConsoleBar({ path, view }: { path: string; view: EditorView }) {
   const sources = useDatabase((s) => s.sources);
   const loaded = useDatabase((s) => s.loaded);
@@ -228,33 +590,49 @@ function ConsoleBar({ path, view }: { path: string; view: EditorView }) {
   const maxRows = useDatabase((s) => s.maxRows);
   const manual = useDatabase((s) => !!bound && s.manualCommit.has(bound));
   const pending = useDatabase((s) => !!bound && s.pendingTx.has(bound));
-  const databases = useDatabase((s) => s.databases);
+  const inEditor = useProject((s) => inEditorResults(s.settings));
+  // SQL resolution scopes in the settings can move the console to another data source.
+  useProject((s) => s.settings);
   const boundId = bound ? splitTarget(bound).id : null;
+  const driver = sources.find((s) => s.id === boundId)?.driver;
+  const jdbc = driver === "jdbc";
+  const supportsTransactions = driver !== "clickhouse" && !jdbc;
+  const switchable = schemaSwitchable(driver);
+  // The console's active schema: its pick, else the connection's default (`completion.defaultSchema`).
+  const pickedSchema = useDatabase((s) => s.consoleSchemas[path]);
+  const defaultSchema = useDatabase((s) => (bound ? s.completion[bound]?.defaultSchema : undefined));
+  const schemaList = useDatabase((s) => (bound ? s.schemas[bound] : undefined));
+  const schema = activeSchema(pickedSchema, defaultSchema);
   useEffect(() => {
     if (boundId && listsDatabases(sourceById(boundId)) && !useDatabase.getState().databases[boundId])
       void loadDatabases(boundId);
   }, [boundId]);
-  const targets = useMemo(() => {
-    const out: Array<{ value: string; label: string; detail?: string; icon: string }> = [];
-    for (const s of sources) {
-      const id = s.id ?? "";
-      const dbs = databases[id];
-      const host = sourceLabel(s).slice((s.name ?? "").length + 1);
-      if (listsDatabases(s) && dbs?.status === "ok") {
-        for (const name of dbs.value.names)
-          out.push({
-            value: targetOf(id, name, dbs.value.current),
-            label: `${s.name ?? ""}: ${name}`,
-            detail: host,
-            icon: "database",
-          });
-      } else out.push({ value: id, label: s.name ?? "", detail: host, icon: "db-schema" });
-    }
-    // A console bound to a database whose list is not loaded yet still shows it.
-    if (bound && !out.some((o) => o.value === bound))
-      out.push({ value: bound, label: targetLabel(bound), icon: "database" });
+  // Loads the list again after a refresh drops it.
+  const schemasMissing = !schemaList;
+  useEffect(() => {
+    if (bound && switchable && schemasMissing) void loadSchemas(bound);
+  }, [bound, switchable, schemasMissing]);
+  const schemaOptions = useMemo(() => {
+    if (!switchable) return [];
+    const names = schemaList?.status === "ok" ? schemaList.value : [];
+    const out = names.map((n) => ({ value: n, label: n, icon: "db-schema" }));
+    // The connection's default is offered even before its schema list loads.
+    if (defaultSchema && !names.includes(defaultSchema))
+      out.unshift({ value: defaultSchema, label: defaultSchema, icon: "db-schema" });
     return out;
-  }, [sources, databases, bound]);
+  }, [switchable, schemaList, defaultSchema]);
+  // IDEA's order: pick the data source, then a database and a schema in it.
+  const sourceOptions = useMemo(
+    () =>
+      sources.map((s) => ({
+        value: s.id ?? "",
+        label: s.name ?? "",
+        verbatim: true,
+        detail: sourceLabel(s).slice((s.name ?? "").length + 1),
+        icon: sourceIcon(s),
+      })),
+    [sources],
+  );
   useEffect(() => {
     if (!loaded) void loadSources();
   }, [loaded]);
@@ -262,7 +640,7 @@ function ConsoleBar({ path, view }: { path: string; view: EditorView }) {
     if (bound) void loadCompletion(bound);
   }, [bound]);
   return (
-    <div className={styles.consoleBar}>
+    <Toolbar className={styles.consoleBar} aria-label="Query Console">
       <IconButton
         icon="run"
         title="Execute"
@@ -271,38 +649,42 @@ function ConsoleBar({ path, view }: { path: string; view: EditorView }) {
         onClick={() => void executeInView(view, path)}
       />
       <IconButton
-        icon="db-plan"
-        title="Explain Plan"
+        icon="gutter-run-all"
+        title="Execute Script"
         disabled={!bound || running}
-        onClick={() => void explainInView(view, path)}
-      />
-      <IconButton
-        icon="stop"
-        title="Cancel Running Statement"
-        disabled={!running}
-        onClick={() => cancelConsole(path)}
+        onClick={() => void executeScriptInView(view, path)}
       />
       <span className={styles.toolbarSeparator} />
       <IconButton icon="history" title="Browse Query History" disabled={!bound} onClick={() => openHistory(path)} />
-      <span className={styles.toolbarSeparator} />
-      <Select
-        aria-label="Row limit"
-        value={String(maxRows)}
-        options={ROW_LIMITS.map((v) => ({ value: v, label: tx`${Number(v).toLocaleString("en")} rows` }))}
-        onChange={(v) => useDatabase.setState({ maxRows: Number(v) })}
+      {!jdbc && (
+        <IconButton
+          icon="db-plan"
+          title="Explain Plan"
+          disabled={!bound || running}
+          onClick={() => void explainInView(view, path)}
+        />
+      )}
+      <IconButton
+        icon="db-in-editor-results"
+        title="In-Editor Results"
+        aria-pressed={inEditor}
+        onClick={() => void setInEditorResults(!inEditor)}
       />
       <span className={styles.toolbarSeparator} />
-      <Select
-        aria-label="Transaction mode"
-        value={manual ? "manual" : "auto"}
-        options={[
-          { value: "auto", label: "Tx: Auto" },
-          { value: "manual", label: "Tx: Manual" },
-        ]}
-        onChange={(v) => bound && void setManualCommit(bound, v === "manual")}
-        disabled={!bound}
-      />
-      {manual && (
+      {supportsTransactions && (
+        <Select
+          variant="ghost"
+          aria-label="Transaction mode"
+          value={manual ? "manual" : "auto"}
+          options={[
+            { value: "auto", label: "Tx: Auto" },
+            { value: "manual", label: "Tx: Manual" },
+          ]}
+          onChange={(v) => bound && void setManualCommit(bound, v === "manual")}
+          disabled={!bound}
+        />
+      )}
+      {supportsTransactions && manual && (
         <>
           <IconButton
             icon="commit"
@@ -318,16 +700,199 @@ function ConsoleBar({ path, view }: { path: string; view: EditorView }) {
           />
         </>
       )}
-      <span className={styles.spacer} />
+      <IconButton
+        icon="stop"
+        title="Cancel Running Statement"
+        disabled={!running}
+        onClick={() => cancelConsole(path)}
+      />
+      <span className={styles.toolbarSeparator} />
       <Select
+        variant="ghost"
+        aria-label="Row limit"
+        value={String(maxRows)}
+        options={ROW_LIMITS.map((v) => ({ value: v, label: tx`${Number(v).toLocaleString("en")} rows` }))}
+        onChange={(v) => useDatabase.setState({ maxRows: Number(v) })}
+      />
+      <span className={styles.spacer} />
+      {bound && driver === "snowflake" && <SnowflakeSession target={bound} idle={!running} />}
+      <Select
+        variant="ghost"
         aria-label="Data source"
-        value={bound ?? null}
+        value={boundId}
         placeholder={sources.length ? "<data source>" : "None configured"}
-        options={targets}
-        onChange={(id) => bindConsole(path, id)}
+        options={sourceOptions}
+        searchable
+        onChange={(id) => id !== boundId && bindConsole(path, id)}
         disabled={!sources.length}
       />
-    </div>
+      {bound && boundId && switchable && listsDatabases(sourceById(boundId)) ? (
+        <DatabaseSchemaSwitcher path={path} bound={bound} sourceId={boundId} schema={schema} />
+      ) : (
+        switchable && (
+          <Select
+            variant="ghost"
+            aria-label="Schema"
+            value={schema || null}
+            placeholder="<schema>"
+            options={schemaOptions}
+            searchable
+            onChange={(v) => setConsoleSchema(path, v)}
+            disabled={!bound}
+          />
+        )
+      )}
+      {driver === "sqlite" && (
+        <span className={styles.consoleSchema} title={tx("Schema")}>
+          <Icon name="db-schema" size={14} />
+          {schema || "main"}
+        </span>
+      )}
+    </Toolbar>
+  );
+}
+
+/**
+ * The `database.schema` switcher of a data source that shows several databases (IDEA's): a tree of
+ * its databases, expanding to their schemas. Choosing a schema in another database moves the console there.
+ */
+function DatabaseSchemaSwitcher({
+  path,
+  bound,
+  sourceId,
+  schema,
+}: {
+  path: string;
+  bound: string;
+  sourceId: string;
+  schema: string;
+}) {
+  const listed = useDatabase((s) => s.databases[sourceId]);
+  const schemas = useDatabase((s) => s.schemas);
+  const read = useDatabase((s) => s.catalogs[sourceId]?.databases);
+  const current = listed?.status === "ok" ? listed.value.current : null;
+  const database = splitTarget(bound).database ?? current;
+  // The console's database starts expanded, again whenever the console moves to another one.
+  const [opened, setOpened] = useState<{ at: string | null; open: ReadonlySet<string> } | null>(null);
+  const expanded = useMemo(
+    () => (opened && opened.at === database ? opened.open : new Set(database ? [database] : [])),
+    [opened, database],
+  );
+  const targetFor = (name: string) => (name === database ? bound : targetOf(sourceId, name, current));
+  // Schemas of expanded databases that are not read yet, or were dropped by a refresh.
+  const missing = [...expanded]
+    .filter((name) => !read?.[name] && !schemas[targetFor(name)])
+    .map(targetFor)
+    .join("\n");
+  useEffect(() => {
+    for (const target of missing ? missing.split("\n") : []) void loadSchemas(target);
+  }, [missing]);
+  const rows = useMemo(() => {
+    const names = listed?.status === "ok" ? [...listed.value.names] : [];
+    // The console's database is offered even before the list loads.
+    if (database && !names.includes(database)) names.unshift(database);
+    return schemaTreeRows(names, expanded, (name) => {
+      const target = name === database ? bound : targetOf(sourceId, name, current);
+      const list = schemas[target];
+      if (list?.status === "ok") return list.value;
+      if (read?.[name]) return read[name].map((s) => s.name);
+      return list?.status === "error" ? { error: list.message } : undefined;
+    });
+  }, [listed, database, expanded, schemas, read, bound, sourceId, current]);
+  const value = database && schema ? schemaTreeValue(database, schema) : null;
+  return (
+    <Select
+      variant="ghost"
+      aria-label="Database and schema"
+      value={value}
+      placeholder="<schema>"
+      options={rows}
+      searchable
+      renderValue={() => (database ? (schema ? `${database}.${schema}` : database) : tx("<schema>"))}
+      keepOpen={(v) => parseSchemaTreeValue(v).schema === null}
+      onChange={(v) => {
+        const pick = parseSchemaTreeValue(v);
+        if (pick.schema === null) {
+          const next = new Set(expanded);
+          if (!next.delete(pick.database)) {
+            next.add(pick.database);
+            // Expanding again retries a database whose schemas could not be read.
+            const target = targetFor(pick.database);
+            if (useDatabase.getState().schemas[target]?.status === "error") void loadSchemas(target);
+          }
+          setOpened({ at: database, open: next });
+          return;
+        }
+        const target = targetFor(pick.database);
+        if (target !== bound) bindConsole(path, target);
+        setConsoleSchema(path, pick.schema);
+      }}
+    />
+  );
+}
+
+const quoted = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
+/**
+ * Warehouse and role of a Snowflake data source's session (its consoles share them). Read
+ * once connected and after each run, since `USE WAREHOUSE` / `USE ROLE` in a console moves them too.
+ */
+function SnowflakeSession({ target, idle }: { target: string; idle: boolean }) {
+  const connected = useDatabase((s) => s.connected.has(target));
+  const [state, setState] = useState<DbSessionContext>({
+    warehouse: "",
+    role: "",
+    warehouses: [],
+    roles: [],
+  });
+  useEffect(() => {
+    // Completion has the saved catalog before the first connect; a stale one is read again after it.
+    void loadSavedCatalog(target);
+    if (connected) void offerIntrospection(target);
+  }, [connected, target]);
+  useEffect(() => {
+    if (!connected || !idle) return;
+    let stale = false;
+    call(commands.dbSessionContext(target))
+      .then((context) => {
+        if (!stale) setState(context);
+      })
+      // Not connected any more, or no privilege: the pickers keep what they showed.
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [target, connected, idle]);
+  if (!connected) return null;
+  const use = async (what: "WAREHOUSE" | "ROLE", name: string) => {
+    if (await runSql(target, [`USE ${what} ${quoted(name)}`]))
+      setState((s) => (what === "WAREHOUSE" ? { ...s, warehouse: name } : { ...s, role: name }));
+  };
+  const options = (names: string[], current: string) =>
+    [...new Set(current ? [current, ...names] : names)].map((n) => ({ value: n, label: n }));
+  return (
+    <>
+      <Select
+        variant="ghost"
+        aria-label="Warehouse"
+        value={state.warehouse || null}
+        placeholder="<warehouse>"
+        options={options(state.warehouses, state.warehouse)}
+        searchable={state.warehouses.length > 10}
+        onChange={(v) => void use("WAREHOUSE", v)}
+        disabled={!idle}
+      />
+      <Select
+        variant="ghost"
+        aria-label="Role"
+        value={state.role || null}
+        placeholder="<role>"
+        options={options(state.roles, state.role)}
+        searchable={state.roles.length > 10}
+        onChange={(v) => void use("ROLE", v)}
+        disabled={!idle}
+      />
+    </>
   );
 }
 
@@ -365,7 +930,7 @@ function docNode(text: string): Node {
   return pre;
 }
 
-function applyCandidate(c: SqlCandidate, driver: DbDriver) {
+function applyCandidate(c: SqlCandidate, driver: DbDriver, sql: SqlText) {
   return (view: EditorView, completion: Completion, from: number, to: number) => {
     // A selected template placeholder is replaced, as CodeMirror's own string completions do.
     const sel = view.state.selection.main;
@@ -388,7 +953,7 @@ function applyCandidate(c: SqlCandidate, driver: DbDriver) {
     }
     const changes: Array<{ from: number; to?: number; insert: string }> = [{ from, to, insert: text }];
     // Re-read the statement as it is now: the user may have typed on since the popup opened.
-    const a = analyze(view.state.doc.toString(), to, driver);
+    const a = analyze(sql.text(view.state), to, driver);
     if (a.fromInsert !== null) {
       const clause = ` ${a.lowerKeywords ? "from" : "FROM"} ${c.addFrom}`;
       if (a.fromInsert <= to) changes[0]!.insert += clause;
@@ -413,22 +978,119 @@ function finishTemplateField(view: EditorView) {
  * Context-aware SQL completion against the bound data source's schema (see
  * `sql/analyze` and `sql/complete`); keywords and functions without one.
  */
-function completionSource(path: string): CompletionSource {
-  return (ctx: CompletionContext): CompletionResult | null => {
+/**
+ * The databases of Snowflake data source `id` with their loaded schemas and tables, so
+ * completion can follow `database.schema.table` beyond the console's own database.
+ */
+function catalogOf(id: string): SqlCatalog | undefined {
+  const st = useDatabase.getState();
+  const { id: sourceId, database: bound } = splitTarget(id);
+  const listed = st.databases[sourceId];
+  const dbs = listed?.status === "ok" ? listed.value : null;
+  // What introspection read comes first (it is there before connecting); a database it has not
+  // reached falls back to what the tree loaded.
+  const read = st.catalogs[sourceId]?.databases ?? {};
+  if (!dbs && !Object.keys(read).length) return undefined;
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  const target = (database: string) => (dbs ? targetOf(sourceId, database, dbs.current) : null);
+  const schemas = (database: string) => {
+    if (read[database]) return read[database].map((s) => s.name);
+    const at = target(database);
+    const list = at ? st.schemas[at] : undefined;
+    return list?.status === "ok" ? list.value : null;
+  };
+  const current = bound ?? dbs?.current ?? "";
+  return {
+    databases: dbs?.names ?? Object.keys(read),
+    schemas,
+    tables: (database, schema) => {
+      const known = read[database]?.find((s) => same(s.name, schema));
+      if (known) return known.tables.map((t) => ({ name: t.name, view: t.kind !== "table" }));
+      const exact = schemas(database)?.find((s) => same(s, schema));
+      const at = target(database);
+      const list = exact && at ? st.tables[tablesKey(at, exact)] : undefined;
+      return list?.status === "ok" ? list.value.map((t) => ({ name: t.name, view: t.kind !== "table" })) : null;
+    },
+    search: (prefix, limit) => {
+      const wanted = prefix.toLowerCase();
+      const found: Array<{ database: string; schema: string; name: string; view: boolean }> = [];
+      for (const [database, list] of Object.entries(read)) {
+        // The console's own database is in the schema model already.
+        if (same(database, current)) continue;
+        for (const schema of list)
+          for (const t of schema.tables) {
+            if (!t.name.toLowerCase().startsWith(wanted)) continue;
+            found.push({ database, schema: schema.name, name: t.name, view: t.kind !== "table" });
+            if (found.length >= limit) return found;
+          }
+      }
+      return found;
+    },
+  };
+}
+
+/** Loads what `database.` / `database.schema.` at the caret needs before it is completed. */
+async function loadQualified(id: string, qualifier: readonly string[]): Promise<void> {
+  const current = databaseRequest(id);
+  const sourceId = splitTarget(id).id;
+  // Introspection has it: nothing to load (and no reason to connect for it).
+  const wanted = (qualifier[0] ?? "").toLowerCase();
+  const read = useDatabase.getState().catalogs[sourceId]?.databases ?? {};
+  if (Object.keys(read).some((d) => d.toLowerCase() === wanted)) return;
+  if (!useDatabase.getState().databases[sourceId]) await loadDatabases(sourceId);
+  if (!current()) return;
+  const dbs = useDatabase.getState().databases[sourceId];
+  if (dbs?.status !== "ok") return;
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  const database = dbs.value.names.find((d) => same(d, qualifier[0] ?? ""));
+  if (!database) return;
+  if (useDatabase.getState().catalogs[sourceId]?.databases[database]) return;
+  const target = targetOf(sourceId, database, dbs.value.current);
+  if (!useDatabase.getState().schemas[target]) await loadSchemas(target);
+  if (!current()) return;
+  if (qualifier.length < 2) return;
+  const list = useDatabase.getState().schemas[target];
+  const schema = list?.status === "ok" ? list.value.find((s) => same(s, qualifier[1]!)) : undefined;
+  if (schema && !useDatabase.getState().tables[tablesKey(target, schema)]) await loadTables(target, schema);
+}
+
+/** SQL completion in `path`, where `sql` says the SQL is (the whole file, or a mapper's statements). */
+export function completionSource(path: string, sql: SqlText = WHOLE_FILE): CompletionSource {
+  return async (ctx: CompletionContext): Promise<CompletionResult | null> => {
+    if (sql.at && !sql.at(ctx.state, ctx.pos)) return null;
     const id = consoleSource(path);
+    const current = id ? databaseRequest(id) : projectRequest();
     const source = sourceById(id);
     const driver: DbDriver = source?.driver ?? "sqlite";
+    // A custom JDBC source (`driver: "jdbc"`) says nothing about how its server folds
+    // identifiers; its URL does (`jdbc:oracle:thin:@…`). Quoting follows that dialect.
+    const dialect = driver === "jdbc" ? jdbcDialect(source?.url) : null;
     const model = id ? (useDatabase.getState().completion[id] ?? null) : null;
     if (id && !model) void loadCompletion(id);
+    // Unqualified names resolve in the console's active schema (IDEA's schema dropdown).
+    const schema = consoleSchema(path);
+    const scoped = model && schema ? { ...model, defaultSchema: schema } : model;
     // A selected template placeholder (`alias`) is about to be replaced: analyze without it.
     const sel = ctx.state.selection.main;
     const placeholder = !sel.empty && (ctx.pos === sel.from || ctx.pos === sel.to);
-    const doc = ctx.state.doc.toString();
+    const doc = sql.text(ctx.state);
     const analysis = placeholder
       ? analyze(doc.slice(0, sel.from) + doc.slice(sel.to), sel.from, driver)
       : analyze(doc, ctx.pos, driver);
     if (!ctx.explicit && !shouldAutoCompleteSql(analysis)) return null;
-    const candidates = sqlCandidates({ model, analysis, driver, sourceName: source?.name ?? undefined });
+    const cataloged = driver === "snowflake" && !!id;
+    if (cataloged && analysis.qualifier?.length) {
+      await loadQualified(id, analysis.qualifier).catch(() => {});
+      if (ctx.aborted || !current()) return null;
+    }
+    const candidates = sqlCandidates({
+      model: scoped,
+      analysis,
+      driver,
+      dialect,
+      sourceName: source?.name ?? undefined,
+      catalog: cataloged ? catalogOf(id) : undefined,
+    });
     if (!candidates.length) return null;
     return {
       from: analysis.prefix.from,
@@ -440,7 +1102,7 @@ function completionSource(path: string): CompletionSource {
         type: c.kind === "keyword" ? "keyword" : c.kind,
         boost: Math.max(-99, Math.min(99, c.boost)),
         info: c.doc ? () => docNode(c.doc!) : undefined,
-        apply: applyCandidate(c, driver),
+        apply: applyCandidate(c, driver, sql),
       })),
       validFor: /^[\p{L}\p{N}_$]*$/u,
     };
@@ -451,6 +1113,30 @@ const noKeywords: CompletionSource = (ctx) => ({ from: ctx.pos, options: [] });
 
 function driverOf(path: string): DbDriver {
   return sourceById(consoleSource(path))?.driver ?? "sqlite";
+}
+
+/**
+ * Syntax colours of the bound data source's dialect, over the editor's standard SQL mode.
+ * Follows the binding: a console moved to another data source is coloured for that one.
+ */
+function dialectColours(path: string): Extension {
+  const slot = new Compartment();
+  const colours = (driver: DbDriver): Extension =>
+    driver === "snowflake" ? Prec.high(snowflakeLanguage().extension) : [];
+  const initial = driverOf(path);
+  return [
+    slot.of(colours(initial)),
+    ViewPlugin.define((view) => {
+      let shown = initial;
+      const stop = useDatabase.subscribe(() => {
+        const driver = driverOf(path);
+        if (driver === shown) return;
+        shown = driver;
+        view.dispatch({ effects: slot.reconfigure(colours(driver)) });
+      });
+      return { destroy: stop };
+    }),
+  ];
 }
 
 /** Live template contexts at a position (`sql-statement` / `sql-query` / `sql-code`). */
@@ -521,6 +1207,8 @@ export function consoleExtension(ctx: EditorDocContext): Extension {
     consolePath.of(ctx.path),
     runField,
     runGutter,
+    inlineField,
+    syncInline,
     showPanel.of(consolePanel(ctx.path)),
     EditorState.languageData.of(() => [
       { openideaCompletion: completionSource(ctx.path), [TEMPLATE_CONTEXT_KEY]: templateContextsAt(ctx.path) },
@@ -528,6 +1216,7 @@ export function consoleExtension(ctx: EditorDocContext): Extension {
     completeAfterTemplate,
     valuesInfo(ctx.path),
     sqlSupport(ctx.path),
+    dialectColours(ctx.path),
     // The grammar's keyword list would duplicate ours (it is the fallback without a language server).
     Prec.highest(EditorState.languageData.of(() => [{ autocomplete: noKeywords }])),
   ];

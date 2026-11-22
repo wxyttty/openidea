@@ -27,6 +27,18 @@ export function revertUnifiedChunk(view: EditorView, pos: number) {
   });
 }
 
+export function onHunkButtonClick(button: HTMLButtonElement, apply: () => void) {
+  button.addEventListener("mousedown", (event) => {
+    // Keep editor focus and suppress MergeView's delegated one-directional revert.
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    apply();
+  });
+}
+
 /** A ">>" / "<<" button; the chunk index comes from the nearest `data-chunk` (itself included). */
 export function arrowButton(dir: "a-to-b" | "b-to-a", run: (chunkIndex: number) => void): HTMLButtonElement {
   const btn = document.createElement("button");
@@ -35,12 +47,9 @@ export function arrowButton(dir: "a-to-b" | "b-to-a", run: (chunkIndex: number) 
   const label = dir === "a-to-b" ? "Apply change to the right (Replace ›››)" : "Apply change to the left (‹‹‹ Replace)";
   btn.setAttribute("aria-label", label);
   btn.title = label;
-  btn.innerHTML = iconMarkup(dir === "a-to-b" ? "chevron-right" : "chevron-left", 12) ?? "";
-  btn.addEventListener("mousedown", (e) => {
-    // Handled here rather than by MergeView's own (one-directional) revert handler.
-    e.preventDefault();
-    e.stopPropagation();
-    const holder = (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-chunk]");
+  btn.innerHTML = iconMarkup(dir === "a-to-b" ? "diff-arrow-right" : "diff-arrow-left", 14) ?? "";
+  onHunkButtonClick(btn, () => {
+    const holder = btn.closest<HTMLElement>("[data-chunk]");
     const index = Number(holder?.dataset.chunk);
     if (Number.isInteger(index)) run(index);
   });
@@ -83,11 +92,7 @@ class RevertWidget extends WidgetType {
     btn.title = "Revert this change";
     btn.setAttribute("aria-label", "Revert this change");
     btn.innerHTML = `${iconMarkup("revert", 12) ?? ""}<span>Revert</span>`;
-    btn.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.onRevert(view, this.index);
-    });
+    onHunkButtonClick(btn, () => this.onRevert(view, this.index));
     return btn;
   }
   ignoreEvent() {

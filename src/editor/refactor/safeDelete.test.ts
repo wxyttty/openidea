@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { history, undo } from "@codemirror/commands";
-import type { MessageRequest } from "@/workbench/messages";
-import type { LocalSymbol, Location, Locals, OutlineItem, Range, StructuralRanges, SyntaxNode } from "@/bindings";
+import { render } from "@testing-library/react";
+import type { ConfirmOptions, MessageRequest } from "@/workbench/messages";
+import type { LocalSymbol, Location, Locals, OutlineItem, Pos, Range, StructuralRanges, SyntaxNode } from "@/bindings";
 
 // --- backend fakes ---------------------------------------------------------
 
@@ -15,11 +16,12 @@ const unavailable = () => ({ status: "error" as const, error: { kind: "unavailab
 
 let goto: Answer<Location[]> = ok([]);
 let outline: Answer<OutlineItem[]> = ok([]);
-let references: Answer<Location[]> = ok([]);
+/** Called with the position searched from. */
+let references: (pos: Pos) => ReturnType<Answer<Location[]>> = ok([]);
 const lspGoto = vi.fn(async () => goto());
 const docOutline = vi.fn(async () => outline());
-const lspReferences = vi.fn(async () => {
-  const r = references();
+const lspReferences = vi.fn(async (_request: number, _doc: number, pos: Pos) => {
+  const r = references(pos);
   return r.status === "ok" ? { status: "ok" as const, data: { locations: r.data, incomplete: null } } : r;
 });
 const lspCodeActions = vi.fn(async () => ({ status: "ok", data: [] }));
@@ -64,16 +66,21 @@ const showHint = vi.fn();
 vi.mock("@/editor/lsp/hint", () => ({ showHint }));
 const executeAction = vi.fn();
 vi.mock("@/platform/actions", () => ({ executeAction }));
+vi.mock("@tauri-apps/api/core", async (orig) => ({
+  ...(await orig<object>()),
+  Channel: class {
+    onmessage = () => {};
+  },
+}));
 let answer = "cancel";
 const ask = vi.fn(async (_request: MessageRequest) => ({ button: answer, checked: false }));
 let confirmAnswer: { checked: boolean } | null = { checked: false };
-const confirmChecked = vi.fn(
-  async (_opts: { title: string; message: string; checkbox?: string; checked?: boolean }) => confirmAnswer,
-);
+const confirmChecked = vi.fn(async (_opts: ConfirmOptions) => confirmAnswer);
 vi.mock("@/workbench/messages", () => ({ ask, confirmChecked }));
 
-const { deletionRange, localDeclaration, outlineItemAt, safeDelete, fileUsages, usagesMessage, textOccurrences } =
+const { deletionRange, localDeclaration, outlineItemAt, safeDelete, fileUsages, textOccurrences } =
   await import("./safeDelete");
+const { usagesMessage } = await import("./SafeDeleteUsages");
 const { closePopup, useLspPopup } = await import("@/editor/lsp/popupStore");
 const { lspDoc } = await import("@/editor/lsp/lsp");
 
@@ -287,7 +294,11 @@ describe("safeDelete in the editor", () => {
       await safeDelete(v);
       const request = ask.mock.calls[0]![0];
       expect(request.title).toBe("Usages Detected");
-      expect(request.body).toBe("1 usage found\nFunction 'used' has 1 usage that is not safe to delete.");
+      expect(request.presentation).toBe("form");
+      const summary = render(request.body);
+      expect(summary.getByRole("heading", { name: "1 usage found" })).toBeInTheDocument();
+      expect(summary.getByText("Function 'used' has 1 usage that is not safe to delete.")).toBeInTheDocument();
+      summary.unmount();
       expect(request.buttons.map((b) => b.label)).toEqual(["View Usages", "Delete Anyway"]);
       return v;
     };
@@ -307,6 +318,7 @@ describe("safeDelete in the editor", () => {
     expect(confirmChecked).toHaveBeenCalledTimes(1);
     const opts = confirmChecked.mock.calls[0]![0];
     expect(opts.title).toBe("Safe Delete");
+    expect(opts.presentation).toBe("form");
     expect(opts.message).toBe("Delete Function 'unused'?");
     expect(opts.checkbox).toBe("Search in comments and strings");
     expect(lspReferences).not.toHaveBeenCalled();
@@ -409,6 +421,78 @@ describe("fileUsages", () => {
     const res = await fileUsages(["/p/a.rs", "/p/gone.rs"]);
     expect(res).toEqual({ status: "ok", usages: [r("/p/main.rs", 4)] });
     expect(docClose).toHaveBeenCalledTimes(2);
+  });
+
+  // #1656: packages and namespaces are shared with other files; their members are what the file declares.
+  describe("searches members of packages and namespaces, not the container", () => {
+    const at = (path: string, line: number): Location => ({
+      path,
+      range: { start: { line, col: 0 }, end: { line, col: 1 } },
+    });
+    const within = (parent: OutlineItem, ...children: OutlineItem[]): OutlineItem => ({ ...parent, children });
+    /** References per searched name; `searched` records the order. */
+    function serve(text: string, refs: Record<string, Location[]>) {
+      const searched: string[] = [];
+      references = (pos) => {
+        const off = doc(text).line(pos.line + 1).from + pos.col;
+        const name = Object.keys(refs).find((n) => text.startsWith(n, off)) ?? "?";
+        searched.push(name);
+        return { status: "ok", data: refs[name] ?? [] };
+      };
+      return searched;
+    }
+
+    it("Java: the package's other classes imported elsewhere are not usages", async () => {
+      const text = "package com.example.config;\n\npublic class MessageSourceConfig {}\n";
+      outline = ok([
+        item(text, "com.example.config", "package com.example.config;", "package"),
+        item(text, "MessageSourceConfig", "public class MessageSourceConfig {}", "class"),
+      ]);
+      // References to the package: an import of its sibling class CommunicationConfig.
+      const searched = serve(text, {
+        "com.example.config": [at("/p/server/CommandSender.java", 2)],
+        MessageSourceConfig: [],
+      });
+      expect(await fileUsages(["/p/config/MessageSourceConfig.java"])).toEqual({ status: "ok", usages: [] });
+      expect(searched).toEqual(["MessageSourceConfig"]);
+    });
+
+    it("C++: a class inside a namespace is searched", async () => {
+      const text = "namespace config {\nclass Used {};\nnamespace detail {\nint helper();\n}\n}\n";
+      const ns = item(
+        text,
+        "config",
+        "namespace config {\nclass Used {};\nnamespace detail {\nint helper();\n}\n}",
+        "namespace",
+      );
+      const detail = item(text, "detail", "namespace detail {\nint helper();\n}", "namespace");
+      outline = ok([
+        within(
+          ns,
+          item(text, "Used", "class Used {};", "class"),
+          within(detail, item(text, "helper", "int helper();")),
+        ),
+      ]);
+      const searched = serve(text, { Used: [at("/p/main.cpp", 4)], helper: [at("/p/main.cpp", 5)] });
+      expect(await fileUsages(["/p/config/used.h"])).toEqual({
+        status: "ok",
+        usages: [at("/p/main.cpp", 4), at("/p/main.cpp", 5)],
+      });
+      expect(searched).toEqual(["Used", "helper"]);
+    });
+
+    it("modules a file declares (TS namespace, Rust mod) are still searched", async () => {
+      const text = "export namespace Utils {\n  export const version = 1;\n}\n";
+      outline = ok([
+        within(
+          item(text, "Utils", "export namespace Utils {\n  export const version = 1;\n}", "module"),
+          item(text, "version", "version = 1", "variable"),
+        ),
+      ]);
+      const searched = serve(text, { Utils: [at("/p/main.ts", 5)] });
+      expect(await fileUsages(["/p/lib/ns.ts"])).toEqual({ status: "ok", usages: [at("/p/main.ts", 5)] });
+      expect(searched).toEqual(["Utils"]);
+    });
   });
 
   it("is unsupported when the language server can't search", async () => {

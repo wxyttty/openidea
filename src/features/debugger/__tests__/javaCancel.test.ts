@@ -9,6 +9,7 @@ import { useDebug } from "../state";
 const ipc = vi.hoisted(() => ({
   javaResolveLaunch: vi.fn(),
   cancelRequest: vi.fn(async () => undefined),
+  javaDebugAdapter: vi.fn(async () => ({ status: "ok", data: "java-debug" })),
   javaDebugServer: vi.fn(async () => ({ status: "ok", data: 5005 })),
   debugStart: vi.fn(async () => ({ status: "ok", data: 42 })),
   debugStop: vi.fn(async () => ({ status: "ok", data: null })),
@@ -115,6 +116,30 @@ it("still reports a real resolve failure in the preparation console", async () =
       .map((line) => line.text)
       .join("\n"),
   ).toContain("Build failed");
+  expect(ipc.debugStart).not.toHaveBeenCalled();
+});
+
+it.each([
+  "jdtls: Given URI does not belong to any Java project.",
+  "jdtls: Launch configuration 1793460461218 references non-existing project parent.",
+])("explains how to import a module when Debug fails with %s", async (message) => {
+  const starting = executeAction("debug.startConfig", { ...config, module: "web" });
+  await vi.waitFor(() => expect(ipc.javaResolveLaunch).toHaveBeenCalledOnce());
+  respond({ status: "error", error: { kind: "protocol", message } });
+  await starting;
+  expect(notify).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      title: "Cannot start debugging",
+      body: expect.stringContaining("Java module 'web' is not imported."),
+    }),
+  );
+  expect(
+    Object.values(useDebug.getState().console)
+      .flat()
+      .map((line) => line.text)
+      .join("\n"),
+  ).toContain("open its folder as a project");
+  expect(ipc.javaDebugServer).not.toHaveBeenCalled();
   expect(ipc.debugStart).not.toHaveBeenCalled();
 });
 

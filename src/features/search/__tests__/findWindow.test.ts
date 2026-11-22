@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { provideToolWindowService, type ToolWindowService } from "@/workbench/contributions";
 import type { FileMatches, SearchQuery } from "@/platform/ipc";
 import { buildFindTree } from "../find/FindToolWindow";
 import type { FindDeps } from "../find/session";
 import {
+  closeFindTab,
   disposeFindWindow,
   openEditorResults,
   openInFindWindow,
@@ -38,22 +40,41 @@ const file = (rel: string): FileMatches => ({
 afterEach(disposeFindWindow);
 
 describe("Find tool window tabs", () => {
+  it("take the tool window and its stripe button away with the last one", () => {
+    const hide = vi.fn();
+    provideToolWindowService({ show: vi.fn(), hide } as unknown as ToolWindowService);
+    const a = openInFindWindow(q("a"), "a", { deps });
+    pinFindTab(a, true);
+    const b = openInFindWindow(q("b"), "b", { deps });
+    closeFindTab(a);
+    expect(hide).not.toHaveBeenCalled();
+    closeFindTab(b);
+    expect(hide).toHaveBeenCalledWith("find", { removeFromStripe: true });
+  });
+
   it("reuses the selected tab unless it is pinned", () => {
-    const a = openInFindWindow(q("a"), "a", null, deps);
-    const b = openInFindWindow(q("b"), "b", null, deps);
+    const a = openInFindWindow(q("a"), "a", { deps });
+    const b = openInFindWindow(q("b"), "b", { deps });
     expect(useFindWindow.getState().tabs.map((t) => t.title)).toEqual(["b"]);
     expect(useFindWindow.getState().active).toBe(b);
     expect(b).not.toBe(a);
 
     pinFindTab(b, true);
-    const c = openInFindWindow(q("c"), "c", null, deps);
+    const c = openInFindWindow(q("c"), "c", { deps });
     expect(useFindWindow.getState().tabs.map((t) => t.title)).toEqual(["b", "c"]);
     expect(useFindWindow.getState().active).toBe(c);
 
     // Selecting the pinned tab again opens the next search beside it.
     useFindWindow.setState({ active: b });
-    openInFindWindow(q("d"), "d", null, deps);
+    openInFindWindow(q("d"), "d", { deps });
     expect(useFindWindow.getState().tabs.map((t) => t.title)).toEqual(["b", "c", "d"]);
+  });
+
+  it("keeps the selected tab with IDEA's Open results in new tab", () => {
+    openInFindWindow(q("a"), "a", { deps });
+    const b = openInFindWindow(q("b"), "b", { deps, newTab: true });
+    expect(useFindWindow.getState().tabs.map((t) => t.title)).toEqual(["a", "b"]);
+    expect(useFindWindow.getState().active).toBe(b);
   });
 });
 
@@ -64,6 +85,14 @@ describe("buildFindTree", () => {
     const roots = buildFindTree(files);
     expect(roots.map((n) => n.kind)).toEqual(["file", "file", "file"]);
     expect(roots.map((n) => n.key)).toEqual(["f:/p/a.ts", "f:/p/src/a.ts", "f:/p/src/b.ts"]);
+  });
+
+  it("keeps each window of a long line as its own node", () => {
+    const long = file("min.js");
+    long.matches.push({ ...long.matches[0]!, textOffset: 2000 });
+    const [f] = buildFindTree([long]);
+    const children = f?.kind === "file" ? f.children : [];
+    expect(new Set(children.map((n) => n.key)).size).toBe(2);
   });
 
   it("groups files by directory on request", () => {

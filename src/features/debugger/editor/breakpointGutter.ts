@@ -15,6 +15,10 @@ import {
   updateBreakpoint,
   useBreakpoints,
 } from "../breakpoints/store";
+import { classFileBreakpointReason } from "@/platform/classFiles";
+import { tx } from "@/platform/i18n";
+import { showStatusInfo } from "@/workbench/contributions";
+import { lineHasCode } from "../breakpoints/codeLines";
 import { canPlaceBreakpoint } from "../breakpoints/languages";
 import {
   removeSpecial,
@@ -32,6 +36,7 @@ import styles from "./editor.module.css";
 export type BreakpointLook =
   | "normal"
   | "disabled"
+  | "muted"
   | "unverified"
   | "verified"
   | "conditional"
@@ -44,7 +49,9 @@ export type BreakpointLook =
   | "fieldVerified";
 
 export function lookOf(b: BreakpointEntry, status: BreakpointStatus | undefined, muted: boolean, running: boolean) {
-  if (!b.enabled || muted) return "disabled";
+  if (!b.enabled) return "disabled";
+  // Mute Breakpoints: IDEA's grey dot, so it isn't taken for a disabled breakpoint.
+  if (muted) return "muted";
   if (running && status && !status.verified) return "unverified";
   if (!suspends(b)) return "log";
   if (isConditional(b)) return "conditional";
@@ -58,7 +65,8 @@ export function specialLook(
   muted: boolean,
   running: boolean,
 ): BreakpointLook {
-  if (!b.enabled || muted) return b.kind === "method" ? "methodDisabled" : "fieldDisabled";
+  if (!b.enabled) return b.kind === "method" ? "methodDisabled" : "fieldDisabled";
+  if (muted) return "muted";
   if (running && status && !status.verified) return "unverified";
   if (running && status?.verified) return b.kind === "method" ? "methodVerified" : "fieldVerified";
   return b.kind;
@@ -77,8 +85,8 @@ class BreakpointMarker extends GutterMarker {
   }
 }
 
-const bpLine = Decoration.line({ class: styles.bpLine });
-const DISABLED_LOOKS = new Set<BreakpointLook>(["disabled", "methodDisabled", "fieldDisabled"]);
+const bpLine = Decoration.line({ class: `${styles.bpLine} cm-openidea-lineBg` });
+const DISABLED_LOOKS = new Set<BreakpointLook>(["disabled", "muted", "methodDisabled", "fieldDisabled"]);
 
 const setMarkers = StateEffect.define<RangeSet<BreakpointMarker>>();
 
@@ -129,6 +137,31 @@ function inBreakpointArea(e: MouseEvent): boolean {
 }
 
 export function breakpointGutter(ctx: EditorDocContext): Extension {
+  const reason = classFileBreakpointReason(ctx.path);
+  if (reason) {
+    const message = tx(reason);
+    return ViewPlugin.fromClass(
+      class {
+        constructor(readonly view: EditorView) {
+          view.dom.addEventListener("mouseover", this.hover);
+          view.dom.addEventListener("mousedown", this.down, true);
+        }
+        hover = (e: MouseEvent) => {
+          if (inBreakpointArea(e)) (e.target as HTMLElement).closest(".cm-gutters")?.setAttribute("title", message);
+        };
+        down = (e: MouseEvent) => {
+          if (!inBreakpointArea(e)) return;
+          showStatusInfo(message);
+        };
+        destroy() {
+          this.view.dom.removeEventListener("mouseover", this.hover);
+          this.view.dom.removeEventListener("mousedown", this.down, true);
+          const gutters = this.view.dom.querySelector(".cm-gutters");
+          if (gutters?.getAttribute("title") === message) gutters.removeAttribute("title");
+        }
+      },
+    );
+  }
   const path = ctx.path;
   const field = StateField.define<RangeSet<BreakpointMarker>>({
     create: (state) => buildMarkers(state, path),
@@ -153,14 +186,19 @@ export function breakpointGutter(ctx: EditorDocContext): Extension {
       private unsubs: Array<() => void>;
       private pending = false;
       private destroyed = false;
+      private running = sessionsRunning();
       constructor(readonly view: EditorView) {
         this.unsubs = [
           useBreakpoints.subscribe((s, prev) => {
-            if (s.byFile[path] !== prev.byFile[path] || s.status !== prev.status || s.muted !== prev.muted)
-              this.scheduleRebuild();
+            // States arrive per file: another file's don't change this one's markers.
+            const states = (s.byFile[path] ?? []).some((b) => s.status[b.id] !== prev.status[b.id]);
+            if (s.byFile[path] !== prev.byFile[path] || states || s.muted !== prev.muted) this.scheduleRebuild();
           }),
+          // The markers only show whether a session runs, while each step updates `sessions` several times.
           useDebug.subscribe((s, prev) => {
-            if (s.sessions !== prev.sessions) this.scheduleRebuild();
+            if (s.sessions === prev.sessions || sessionsRunning() === this.running) return;
+            this.running = !this.running;
+            this.scheduleRebuild();
           }),
           useSpecialBreakpoints.subscribe((s, prev) => {
             if (s.methods !== prev.methods || s.fields !== prev.fields || s.status !== prev.status)
@@ -200,9 +238,10 @@ export function breakpointGutter(ctx: EditorDocContext): Extension {
       }
 
       /**
-       * IDEA's gutter clicks: click toggles; on an empty line ⇧-click adds a non-suspending
-       * logging breakpoint and opens its properties, ⌥-click a temporary one. On an existing
-       * breakpoint only a plain (or ⌘/Ctrl) click removes it; middle-click enables/disables.
+       * IDEA's gutter clicks: click toggles; on a line without a breakpoint ⇧-click adds a
+       * non-suspending logging breakpoint and opens its properties, ⌥-click a temporary one.
+       * Blank and comment-only lines take none. On an existing breakpoint only a plain
+       * (or ⌘/Ctrl) click removes it; middle-click enables/disables.
        */
       onMouseDown = (e: MouseEvent) => {
         if ((e.button !== 0 && e.button !== 1) || !inBreakpointArea(e)) return;
@@ -239,6 +278,7 @@ export function breakpointGutter(ctx: EditorDocContext): Extension {
           else removeBreakpoint(path, bp!.id);
           return;
         }
+        if (!lineHasCode(this.view.state, line)) return;
         if (e.altKey) {
           addBreakpoint(path, line, { temporary: true });
           return;

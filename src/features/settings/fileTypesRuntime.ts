@@ -6,12 +6,14 @@
 import { executeAction, registerActions } from "@/platform/actions";
 import { call, commands, isTauri, type LanguageInfo_Serialize as LanguageInfo } from "@/platform/ipc";
 import {
+  overrideKey,
   sampleFileName,
   userFileType,
   validateFileTypeOverrides,
   validateFileTypes,
   type FileTypeAssociations,
 } from "@/platform/fileTypes";
+import { onLanguageListChanged } from "@/platform/languageList";
 import { loadSettings, useProject } from "@/platform/project";
 import { fileIconName, setFileIconOverride, type IconName, type MenuItem } from "@/ui";
 import { registerMenuGroup } from "@/workbench/contributions";
@@ -28,11 +30,6 @@ function loadLanguages(): Promise<LanguageInfo[]> {
       loading = null;
       return [];
     }));
-}
-
-/** Settings key of a file: project-relative inside the project, else absolute. */
-export function overrideKey(path: string, root: string | null): string {
-  return root && path.startsWith(root + "/") ? path.slice(root.length + 1) : path;
 }
 
 function currentOverrides(): Record<string, string> {
@@ -97,6 +94,11 @@ export function activateFileTypes(): () => void {
     if (s.settings !== prev.settings) syncIcons();
   });
   const disposers = [
+    // Plugins add and remove languages: read the list again.
+    onLanguageListChanged(() => {
+      loading = null;
+      void loadLanguages().then(syncIcons);
+    }),
     unsub,
     () => setFileIconOverride(null),
     registerActions([

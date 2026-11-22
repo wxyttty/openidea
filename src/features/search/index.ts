@@ -3,11 +3,13 @@
  * Recent Files / Recent Locations, Find / Replace in Files + the Find tool
  * window, the Structure tool window + File Structure popup, and bookmarks.
  */
-import { lazyComponent } from "@/ui";
+import { lazyComponent, lazyWhen } from "@/ui";
 import { activeEditor, registerEditorContribution } from "@/editor/api";
 import { executeAction, registerActions } from "@/platform/actions";
+import { onFilesMoved, pendingFileMoves } from "@/platform/fileOps";
+import { call, commands, IpcError, isTauri, onIdeEvent } from "@/platform/ipc";
 import { shortcutLabel } from "@/platform/keymap";
-import { onIdeEvent } from "@/platform/ipc";
+import { isSameOrInside } from "@/platform/paths";
 import { useProject } from "@/platform/project";
 import { EDIT_SCOPES_ACTION } from "@/platform/search";
 import { isVirtualUri } from "@/platform/virtualDocs";
@@ -28,22 +30,56 @@ import {
   updateBookmarks,
   useBookmarkPopups,
   useBookmarks,
-  type Bookmark,
 } from "./bookmarks/store";
 import { openLocation } from "./common/open";
 import { maybeToolWindowService } from "./common/services";
 import { installTracking, resetTracking } from "./common/tracking";
-import { SearchEverywhereOverlay } from "./everywhere/SearchEverywhere";
-import { hideSearchEverywhere, showSearchEverywhere } from "./everywhere/store";
-import { FindInFilesOverlay } from "./find/FindInFiles";
+import { hideSearchEverywhere, showSearchEverywhere, useSearchEverywhere } from "./everywhere/store";
 import { ScopesDialogOverlay, showScopesDialog } from "./find/ScopesDialog";
 import { hideFindPopup, parseFindArg, runFindPopupCommand, showFindPopup, useFindPopup } from "./find/store";
-import { disposeFindWindow, openEditorResults, rerunActiveFindTab, useFindHeaderMenu } from "./find/windowStore";
-import { RecentPopupsOverlay } from "./recent/RecentPopups";
-import { cycleSwitcher, hideRecentPopup, showRecentPopup } from "./recent/store";
-import { FileStructureOverlay, useFileStructurePopup } from "./structure/StructureView";
-import { useOutline, useStructureOptions } from "./structure/store";
+import {
+  disposeFindWindow,
+  openEditorResults,
+  rerunActiveFindTab,
+  rerunFindTab,
+  useFindHeaderMenu,
+  useFindWindow,
+} from "./find/windowStore";
+import { cycleSwitcher, hideRecentPopup, showRecentPopup, useRecentPopup } from "./recent/store";
+import { useFileStructurePopup } from "./structure/popupStore";
+import { useOutline, useStructureHeaderMenu, useStructureOptions } from "./structure/store";
 import { tx } from "@/platform/i18n";
+
+async function removeMissingBookmarks(removed: readonly string[]) {
+  const { scope } = useBookmarks.getState();
+  const pending = pendingFileMoves(scope);
+  if (pending) await pending;
+  if (scope !== useBookmarks.getState().scope) return;
+
+  const { items, paths } = useBookmarks.getState();
+  const missing = new Set(
+    [...items, ...paths].map((b) => b.path).filter((path) => removed.some((p) => isSameOrInside(path, p))),
+  );
+  if (!missing.size) return;
+  // A delayed watcher notification can also arrive after a rollback or Undo restored the path.
+  if (isTauri())
+    await Promise.all(
+      [...missing].map(async (path) => {
+        try {
+          await call(commands.fsEntryKind(path));
+        } catch (e) {
+          if (e instanceof IpcError && e.kind === "notFound") return;
+        }
+        missing.delete(path);
+      }),
+    );
+  if (!missing.size || scope !== useBookmarks.getState().scope) return;
+  updateBookmarkData((d) => ({
+    ...d,
+    items: d.items.filter((b) => !missing.has(b.path)),
+    paths: d.paths.filter((b) => !missing.has(b.path)),
+  }));
+}
 
 /** Single-line editor selection, used to prefill search fields. */
 function editorSelectionText(): string | null {
@@ -115,6 +151,11 @@ function jumpBookmark(dir: 1 | -1) {
   if (next) void openLocation(next.b.path, { line: next.b.line, col: 0 });
 }
 
+const useEverywhereOpen = () => useSearchEverywhere((s) => s.open);
+const useRecentOpen = () => useRecentPopup((s) => s.open !== null);
+const useFindOpen = () => useFindPopup((s) => s.open);
+const useFileStructureOpen = () => useFileStructurePopup((s) => s.open);
+
 export function activate(): void | (() => void) {
   const se = (tab: Parameters<typeof showSearchEverywhere>[0]) => () => {
     closeAllPopups("everywhere");
@@ -125,11 +166,27 @@ export function activate(): void | (() => void) {
     installTracking(),
     provideFindResults(openEditorResults),
 
-    registerOverlay({ id: "search.everywhere", component: SearchEverywhereOverlay }),
-    registerOverlay({ id: "search.recent", component: RecentPopupsOverlay }),
-    registerOverlay({ id: "search.findInFiles", component: FindInFilesOverlay }),
+    registerOverlay({
+      id: "search.everywhere",
+      component: lazyWhen(useEverywhereOpen, () =>
+        import("./everywhere/SearchEverywhere").then((m) => m.SearchEverywhereOverlay),
+      ),
+    }),
+    registerOverlay({
+      id: "search.recent",
+      component: lazyWhen(useRecentOpen, () => import("./recent/RecentPopups").then((m) => m.RecentPopupsOverlay)),
+    }),
+    registerOverlay({
+      id: "search.findInFiles",
+      component: lazyWhen(useFindOpen, () => import("./find/FindInFiles").then((m) => m.FindInFilesOverlay)),
+    }),
     registerOverlay({ id: "search.scopes", component: ScopesDialogOverlay }),
-    registerOverlay({ id: "search.fileStructure", component: FileStructureOverlay }),
+    registerOverlay({
+      id: "search.fileStructure",
+      component: lazyWhen(useFileStructureOpen, () =>
+        import("./structure/StructureView").then((m) => m.FileStructureOverlay),
+      ),
+    }),
     registerOverlay({ id: "search.bookmarks", component: BookmarkPopupsOverlay }),
 
     registerToolWindow({
@@ -141,6 +198,9 @@ export function activate(): void | (() => void) {
       secondary: true,
       order: 20,
       component: lazyComponent(() => import("./structure/StructureView").then((m) => m.StructureView)),
+      headerActions: lazyComponent(() => import("./structure/StructureView").then((m) => m.StructureHeaderActions)),
+      headerMenu: useStructureHeaderMenu,
+      plainTitle: true,
     }),
     registerToolWindow({
       id: "bookmarks",
@@ -160,10 +220,10 @@ export function activate(): void | (() => void) {
       icon: "toolwindow-find",
       anchor: "bottom",
       stripe: "onUse",
+      sessionContent: true,
       order: 5,
       component: lazyComponent(() => import("./find/FindToolWindow").then((m) => m.FindToolWindow)),
       headerContent: lazyComponent(() => import("./find/FindToolWindow").then((m) => m.FindTabs)),
-      headerActions: lazyComponent(() => import("./find/FindToolWindow").then((m) => m.FindToolWindowActions)),
       headerMenu: useFindHeaderMenu,
     }),
 
@@ -520,13 +580,18 @@ export function activate(): void | (() => void) {
       if (useFindPopup.getState().scopeTab === "directory")
         useFindPopup.setState({ scopeTab: "project", directory: "" });
     }),
+    onFilesMoved((moves) => {
+      if (!moves.length) return;
+      updateBookmarkData((d) => ({
+        ...d,
+        items: moves.reduce((items, { from, to }) => renameBookmarks(items, from, to), d.items),
+        paths: moves.reduce((paths, { from, to }) => renamePathBookmarks(paths, from, to), d.paths),
+      }));
+    }),
     onIdeEvent("fsChanged", (e) => {
-      if (!e.removed.length) return;
-      updateBookmarks((list) => e.removed.reduce<Bookmark[]>((acc, p) => renameBookmarks(acc, p, null), [...list]));
-      updateBookmarkData((d) => {
-        const paths = e.removed.reduce((acc, p) => renamePathBookmarks(acc, p, null), d.paths);
-        return paths.length === d.paths.length ? d : { ...d, paths };
-      });
+      if (e.ignoreRules?.length)
+        for (const tab of useFindWindow.getState().tabs) if (!tab.editorResults) rerunFindTab(tab.id);
+      if (e.removed.length) void removeMissingBookmarks(e.removed);
     }),
   );
 

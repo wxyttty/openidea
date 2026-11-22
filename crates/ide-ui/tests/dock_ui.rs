@@ -25,8 +25,10 @@ fn open(cx: &mut TestAppContext) -> Fixture {
     let root = temp.into_path();
     let config_dir = root.join("config");
     let data_dir = root.join("data");
+    let local_data_dir = root.join("local-data");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&local_data_dir).unwrap();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
     let stream = ide_ui::events::stream();
@@ -42,6 +44,7 @@ fn open(cx: &mut TestAppContext) -> Fixture {
         Arc::new(ide_host::Host::new(ide_host::HostConfig {
             config_dir: config_dir.clone(),
             data_dir: data_dir.clone(),
+            local_data_dir: local_data_dir.clone(),
             languages,
             syntax: Arc::new(OnceLock::new()),
             sink_for,

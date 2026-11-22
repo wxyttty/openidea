@@ -1,6 +1,8 @@
-import { useMemo, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { writeClipboardText } from "@/platform/clipboard";
+import { useMemo, useState, useSyncExternalStore, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import clsx from "clsx";
-import { call, commands, type RecentProject } from "@/platform/ipc";
+import { call, commands, type RecentProject, type RecentProjectGroup } from "@/platform/ipc";
+import { revealInFileManager, showInFileManagerLabel } from "@/platform/fileManager";
 import { parseRemoteLocation } from "@/platform/remote";
 import {
   HighlightedText,
@@ -13,14 +15,33 @@ import {
   showContextMenu,
   type MenuItem,
 } from "@/ui";
+import { promptInput } from "@/workbench/inputDialogs";
 import { confirm } from "@/workbench/messages";
-import { projectColorVars, projectInitials } from "@/workbench/projectColor";
-import { filterRecent, openRecent, removeRecent, useRecent, type RecentMatch } from "./recent";
+import { projectInitials } from "@/workbench/projectColor";
+import { subscribeTabColors, tabColorOverride, tabColorVars, tabColorsVersion } from "@/workbench/tabColors";
+import {
+  createGroup,
+  filterRecent,
+  groupNameError,
+  groupOf,
+  moveToGroup,
+  openRecent,
+  removeGroup,
+  removeRecent,
+  renameGroup,
+  useRecent,
+  type RecentMatch,
+} from "./recent";
 import styles from "./Welcome.module.css";
 import { tx } from "@/platform/i18n";
 
-/** IDEA's "Remove Recent Project" confirmation, then removes it from the list. */
-export async function askRemoveRecent(project: RecentProject) {
+/**
+ * IDEA's "Remove Recent Project" confirmation, then removes it from the list.
+ * `before` runs just before the confirmation opens: hosts above the dialog's
+ * layer (a popup) pass their closer so the confirmation is not covered (#1883).
+ */
+export async function askRemoveRecent(project: RecentProject, before?: () => void) {
+  before?.();
   const ok = await confirm({
     title: "Remove Recent Project",
     message: tx`Remove '${project.name}' from the list of recent projects?`,
@@ -29,16 +50,93 @@ export async function askRemoveRecent(project: RecentProject) {
   if (ok) await removeRecent(project.path);
 }
 
-/** Rounded-square project avatar; same colour slot and initials as the title bar's project widget. */
-export function ProjectBadge({ name, className }: { name: string; className?: string }) {
+/** Rounded-square project avatar; same colour and initials as the title bar's project widget. */
+export function ProjectBadge({
+  name,
+  path,
+  className,
+  missing,
+}: {
+  name: string;
+  path: string;
+  className?: string;
+  missing?: boolean;
+}) {
+  useSyncExternalStore(subscribeTabColors, tabColorsVersion);
   return (
-    <span className={clsx(styles.tile, className)} style={projectColorVars(name)} aria-hidden>
+    <span
+      className={clsx(styles.tile, missing && styles.tileMissing, className)}
+      style={tabColorVars(name, tabColorOverride(path))}
+      aria-hidden
+    >
       {projectInitials(name)}
     </span>
   );
 }
 
-export function recentMenu(project: RecentProject, onOpened?: () => void): MenuItem[] {
+/** The tooltip of a recent project whose folder is gone. */
+export function unavailableTitle(project: Pick<RecentProject, "path" | "missing">): string | undefined {
+  return project.missing ? tx`${project.path} (unavailable)` : undefined;
+}
+
+/** New Project Group…: asks for a name; with `path`, that project moves into the new group. */
+export async function askNewGroup(path?: string) {
+  const name = await promptInput({
+    title: "New Project Group",
+    label: "Group name:",
+    okLabel: "Create",
+    validate: (v) => groupNameError(v),
+  });
+  if (name !== null) await createGroup(name, path);
+}
+
+/** Move to Group: the other groups, a new one, or out of its group. */
+function moveToGroupMenu(project: RecentProject): MenuItem {
+  const groups = useRecent.getState().groups;
+  const current = groupOf(project.path, groups)?.name ?? null;
+  const others = groups.filter((g) => g.name !== current);
+  const submenu: MenuItem[] = [
+    ...others.map((g): MenuItem => ({
+      label: g.name,
+      verbatim: true,
+      run: () => void moveToGroup(project.path, g.name),
+    })),
+    ...(others.length ? [{ kind: "separator" } as const] : []),
+    { label: "New Group…", run: () => void askNewGroup(project.path) },
+    ...(current
+      ? [{ label: tx`Remove from '${current}'`, verbatim: true, run: () => void moveToGroup(project.path, null) }]
+      : []),
+  ];
+  return { label: "Move to Group", icon: "folder", submenu };
+}
+
+/** A project group's actions. */
+export function groupMenu(group: RecentProjectGroup): MenuItem[] {
+  return [
+    {
+      label: "Rename Group…",
+      icon: "edit",
+      run: () =>
+        void promptInput({
+          title: "Rename Project Group",
+          label: "Group name:",
+          initial: group.name,
+          okLabel: "Rename",
+          validate: (v) => groupNameError(v, group.name),
+        }).then((name) => (name === null ? undefined : renameGroup(group.name, name))),
+    },
+    { label: "New Project Group…", icon: "plus", run: () => void askNewGroup() },
+    { kind: "separator" },
+    {
+      label: "Remove Group",
+      icon: "close",
+      danger: true,
+      run: () => void removeGroup(group.name),
+    },
+  ];
+}
+
+export function recentMenu(project: RecentProject, onOpened?: () => void, onRemove?: () => void): MenuItem[] {
   // A remote project has no local folder.
   const remote = parseRemoteLocation(project.path);
   const items: MenuItem[] = [
@@ -54,31 +152,32 @@ export function recentMenu(project: RecentProject, onOpened?: () => void): MenuI
           label: "Open in New Window",
           icon: "folder-open",
           run: () =>
-            void call(commands.windowOpenRemote(remote.sshConfig, remote.path, true))
+            void call(commands.windowOpenRemote(remote.target, remote.path, true))
               .then(() => onOpened?.())
               .catch(() => undefined),
         }
       : { kind: "action", action: "file.openInNewWindow", arg: project.path, label: "Open in New Window" },
     {
       id: "reveal",
-      label: "Show in Finder",
+      label: showInFileManagerLabel(),
       icon: "external-link",
-      run: () =>
-        void import("@tauri-apps/plugin-opener").then((m) => m.revealItemInDir(project.path)).catch(() => undefined),
+      run: () => void revealInFileManager(project.path, null).catch(() => undefined),
     },
     {
       id: "copy",
       label: "Copy Path",
       icon: "copy",
-      run: () => void navigator.clipboard?.writeText(project.path).catch(() => undefined),
+      run: () => void writeClipboardText(project.path).catch(() => undefined),
     },
     { kind: "separator" },
+    // Groups hold local projects (remote ones live in this window's own list).
+    ...(remote ? [] : [moveToGroupMenu(project), { kind: "separator" } as const]),
     {
       id: "remove",
       label: "Remove from Recent Projects…",
       icon: "close",
       danger: true,
-      run: () => void askRemoveRecent(project),
+      run: () => void askRemoveRecent(project, onRemove),
     },
   ];
   return remote ? items.filter((i) => !("id" in i && i.id === "reveal")) : items;
@@ -110,12 +209,12 @@ function RecentRow({
   const opening = useRecent((s) => s.opening === m.project.path);
   const when = relativeTime(m.project.openedAtMs);
   return (
-    <div className={clsx(styles.recent, compact && styles.recentCompact)}>
-      <ProjectBadge name={m.project.name} />
+    <div className={styles.recent} title={unavailableTitle(m.project)}>
+      <ProjectBadge name={m.project.name} path={m.project.path} missing={!!m.project.missing} />
       <span className={styles.recentText}>
         <span className={styles.recentTop}>
           <HighlightedText
-            className={styles.recentName}
+            className={clsx(styles.recentName, m.project.missing && styles.unavailable)}
             text={m.project.name}
             indices={m.nameMatch}
             tone={active ? "accent" : "strong"}
@@ -187,7 +286,11 @@ export function RecentList({ exclude, compact, autoFocus, onOpened, className, t
       open(items[current]);
       return;
     }
-    if ((e.key === "Delete" || (e.key === "Backspace" && e.metaKey)) && items[current]) {
+    // Delete removes the selected project only when it has no text to delete: the caret is at the end
+    // of the query (⌘⌫: the query is empty). Otherwise it edits the query.
+    const field = e.currentTarget;
+    const atEnd = field.selectionStart === field.value.length && field.selectionEnd === field.value.length;
+    if (((e.key === "Delete" && atEnd) || (e.key === "Backspace" && e.metaKey && !field.value)) && items[current]) {
       e.preventDefault();
       void askRemoveRecent(items[current]!.project);
       return;

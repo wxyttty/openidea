@@ -1,7 +1,9 @@
+import { readClipboardPlainText, writeClipboardText } from "@/platform/clipboard";
 import { commitRepo } from "./multiRoot";
 /** Create Patch… (from local changes or commits) and Apply Patch… (file or clipboard, with a preview). */
 import { useEffect, useState } from "react";
 import type { Commit, FileStatus, PatchFile, PatchSource, ShelvedChangeList } from "@/bindings";
+import { canRevealInFileManager, fileManagerName, revealInFileManager } from "@/platform/fileManager";
 import { call, commands } from "@/platform/ipc";
 import { Button, Checkbox, Dialog, Icon, Input, List, Spinner, fileIconName, T } from "@/ui";
 import { workflowSettings } from "@/platform/workflowSettings";
@@ -15,7 +17,8 @@ import { FileChecklist, defaultChangeFiles, reportApply } from "./shelf";
 import { activeList, useChangelists } from "./changelists";
 import { currentRepoRoot, useVcs } from "./store";
 import styles from "./common.module.css";
-import { tx } from "@/platform/i18n";
+import { tx, useTx } from "@/platform/i18n";
+import previewStyles from "./ApplyPatch.module.css";
 
 export type PatchOrigin =
   | { kind: "changes"; files: FileStatus[] }
@@ -48,6 +51,21 @@ export function showCreatePatchForChanges(paths?: readonly string[]) {
   openDialog((close) => <CreatePatchDialog origin={{ kind: "changes", files }} onClose={close} />);
 }
 
+/** Copy as Patch to Clipboard: the selected local changes, without a dialog. */
+export async function copyChangesAsPatch(paths: readonly string[]) {
+  const files = defaultChangeFiles(paths);
+  if (!files.length) return;
+  await saveAll();
+  await runOp(
+    tx("Create patch"),
+    async () => {
+      const source: PatchSource = { from: "changes", paths: files.map((f) => stripSlash(f.path)), reverse: false };
+      await writeClipboardText(await call(commands.vcsCreatePatch(currentRepoRoot(), source)));
+    },
+    { success: "Patch copied to the clipboard", refresh: false },
+  );
+}
+
 export function showCreatePatchForCommits(commits: Commit[]) {
   if (!commits.length) return;
   openDialog((close) => <CreatePatchDialog origin={{ kind: "commits", commits }} onClose={close} />);
@@ -59,21 +77,31 @@ export function showCreatePatchForShelf(entry: ShelvedChangeList, path?: string)
 
 async function browseSave(current: string): Promise<string | null> {
   try {
-    const { save } = await import("@tauri-apps/plugin-dialog");
+    const { save } = await import("@/platform/dialog");
     return (await save({ defaultPath: current, filters: [{ name: "Patch", extensions: ["patch", "diff"] }] })) ?? null;
   } catch {
     return null;
   }
 }
 
-/** Settings › Version Control › Confirmation › When patch is created: ask / no / show in Finder. */
+/** Whole sentences let each locale translate the patch question. */
+export function patchSavedBody(): string {
+  const name = fileManagerName();
+  return name === "Finder"
+    ? "Patch file created successfully. Show it in Finder?"
+    : name === "Explorer"
+      ? "Patch file created successfully. Show it in Explorer?"
+      : "Patch file created successfully. Show it in Files?";
+}
+
+/** Settings › Version Control › Confirmation › When patch is created: ask / no / show in the file manager. */
 async function afterPatchSaved(path: string) {
   const mode = workflowSettings().vcs.confirmation.onPatchCreated;
-  if (mode === "no") return;
+  if (mode === "no" || !canRevealInFileManager()) return;
   if (mode === "ask") {
     const r = await ask({
       title: "Create Patch",
-      body: tx("Patch file created successfully. Show it in Finder?"),
+      body: tx(patchSavedBody()),
       checkbox: "Don't ask again",
       buttons: [{ id: "show", label: "Show", primary: true }],
     });
@@ -81,7 +109,7 @@ async function afterPatchSaved(path: string) {
     if (r.checked) await rememberSetting("vcs.confirmation.onPatchCreated", show ? "reveal" : "no");
     if (!show) return;
   }
-  void import("@tauri-apps/plugin-opener").then((m) => m.revealItemInDir(path)).catch(() => undefined);
+  void revealInFileManager(path).catch(() => undefined);
 }
 
 function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: () => void }) {
@@ -116,14 +144,14 @@ function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: 
               reverse,
             };
     const done = await runOp(
-      "Create patch",
+      tx("Create patch"),
       async () => {
         const patch =
           origin.kind === "shelf"
             ? await call(commands.vcsShelfPatch(origin.entry.id, origin.path ?? null))
             : await call(commands.vcsCreatePatch(repo, source!));
         if (toFile) await call(commands.vcsWritePatch(file.trim(), patch));
-        else await navigator.clipboard.writeText(patch);
+        else await writeClipboardText(patch);
         return true;
       },
       { success: toFile ? `Patch saved to ${baseName(file.trim())}` : "Patch copied to the clipboard", refresh: false },
@@ -194,14 +222,14 @@ function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: 
 /** Apply Patch…: from a file (chooser), or the clipboard. */
 export async function showApplyPatch(from: "file" | "clipboard", path?: string) {
   let text: string | null;
-  let source = "Clipboard";
+  let sourcePath: string | null = null;
   try {
     if (from === "clipboard") {
-      text = await navigator.clipboard.readText();
+      text = await readClipboardPlainText();
     } else {
       let file = path ?? null;
       if (!file) {
-        const { open } = await import("@tauri-apps/plugin-dialog");
+        const { open } = await import("@/platform/dialog");
         const picked = await open({
           multiple: false,
           directory: false,
@@ -211,7 +239,7 @@ export async function showApplyPatch(from: "file" | "clipboard", path?: string) 
         file = typeof picked === "string" ? picked : null;
       }
       if (!file) return;
-      source = baseName(file);
+      sourcePath = file;
       text = await call(commands.fsReadText(file));
     }
   } catch (e) {
@@ -228,10 +256,47 @@ export async function showApplyPatch(from: "file" | "clipboard", path?: string) 
     return;
   }
   const patch = text;
-  openDialog((close) => <ApplyPatchDialog patch={patch} source={source} onClose={close} />);
+  openDialog((close) => <ApplyPatchDialog patch={patch} sourcePath={sourcePath} onClose={close} />);
 }
 
-function ApplyPatchDialog({ patch, source, onClose }: { patch: string; source: string; onClose: () => void }) {
+function PatchFileRow({ file }: { file: PatchFile }) {
+  const t = useTx();
+  const name = baseName(file.path);
+  return (
+    <span
+      className={styles.fileTreeRow}
+      title={file.applies ? t("Applies cleanly") : t("Does not apply cleanly: a 3-way merge will be attempted")}
+    >
+      <Icon name={fileIconName(name, file.path)} size={14} />
+      <span className={previewStyles.filePath}>
+        <span
+          className={previewStyles.fileName}
+          style={{ color: KIND_COLOR[file.kind === "untracked" ? "added" : file.kind] }}
+          title={file.path}
+        >
+          {name}
+        </span>
+        <span className={styles.fileDir}>{file.oldPath ? t`from ${file.oldPath}` : dirName(file.path)}</span>
+      </span>
+      <span className={previewStyles.stats}>{file.binary ? t("binary") : `+${file.added} −${file.removed}`}</span>
+      <span className={previewStyles.fileStatus}>
+        {!file.applies && <Icon name="warning" size={14} label="Does not apply cleanly" />}
+      </span>
+    </span>
+  );
+}
+
+function ApplyPatchDialog({
+  patch,
+  sourcePath,
+  onClose,
+}: {
+  patch: string;
+  sourcePath: string | null;
+  onClose: () => void;
+}) {
+  const t = useTx();
+  const source = sourcePath ? baseName(sourcePath) : t("Clipboard");
   const [repo] = useState(currentRepoRoot);
   const [files, setFiles] = useState<PatchFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -245,12 +310,13 @@ function ApplyPatchDialog({ patch, source, onClose }: { patch: string; source: s
     return () => {
       alive = false;
     };
-  }, [patch]);
+  }, [patch, repo]);
+  const count = files?.length ?? 0;
   const failing = files?.filter((f) => !f.applies).length ?? 0;
   const run = async () => {
     onClose();
     await saveAll();
-    const outcome = await runOp(`Apply patch (${source})`, () => call(commands.vcsApplyPatch(repo, patch)), {
+    const outcome = await runOp(t`Apply patch (${source})`, () => call(commands.vcsApplyPatch(repo, patch)), {
       refresh: false,
     });
     if (outcome) await reportApply(outcome, "Patch applied");
@@ -258,71 +324,67 @@ function ApplyPatchDialog({ patch, source, onClose }: { patch: string; source: s
   return (
     <Dialog
       open
-      title={tx`Apply Patch: ${source}`}
+      title="Apply Patch"
+      aria-label={t`Apply Patch: ${source}`}
       onClose={onClose}
-      width={600}
-      footerStart={
-        files && failing > 0 ? (
-          <span className={styles.hint}>
-            {failing === 1
-              ? tx`${failing} file will be merged; conflicts open in the merge tool`
-              : tx`${failing} files will be merged; conflicts open in the merge tool`}
-          </span>
-        ) : undefined
-      }
+      width={660}
+      resizable="both"
+      minWidth={320}
+      className={previewStyles.dialog}
       buttons={[
-        { label: "OK", role: "default", autoFocus: true, disabled: !files?.length, onClick: () => void run() },
+        { label: "Apply", role: "default", autoFocus: true, disabled: !count, onClick: () => void run() },
         { label: "Cancel", role: "cancel" },
       ]}
     >
-      <div className={styles.section}>
-        {files ? `${files.length} file${files.length === 1 ? "" : "s"} in the patch` : ""}
-      </div>
-      <div style={{ height: 280, display: "flex", flexDirection: "column", padding: "0 14px 14px" }}>
-        {error ? (
-          <div className={styles.error}>{error}</div>
-        ) : !files ? (
-          <div className={styles.empty}>
-            <Spinner size={14} />
+      <div className={previewStyles.preview}>
+        <div className={previewStyles.fields}>
+          <label className={previewStyles.field}>
+            <T>Patch source</T>
+            <Input readOnly value={sourcePath ?? source} title={sourcePath ?? undefined} />
+          </label>
+          {repo && (
+            <label className={previewStyles.field}>
+              <T>Repository</T>
+              <Input readOnly value={repo} title={repo} />
+            </label>
+          )}
+        </div>
+        <section className={previewStyles.files}>
+          <div className={previewStyles.filesHeader}>
+            <h2 className={previewStyles.heading}>
+              <T>Patch files</T>
+            </h2>
+            {files && <span className={previewStyles.stats}>{count === 1 ? t`${count} file` : t`${count} files`}</span>}
           </div>
-        ) : (
-          <List
-            items={files}
-            getKey={(f) => f.path}
-            rowHeight={22}
-            aria-label="Patch files"
-            className={styles.boxList}
-            empty={
+          {error ? (
+            <div className={previewStyles.error} role="alert">
+              {error}
+            </div>
+          ) : !files ? (
+            <div className={styles.empty}>
+              <Spinner size={14} />
+            </div>
+          ) : (
+            <List
+              items={files}
+              getKey={(f) => f.path}
+              aria-label="Patch files"
+              className={previewStyles.list}
+              empty={<T>No changes</T>}
+              renderItem={(file) => <PatchFileRow file={file} />}
+            />
+          )}
+          {failing > 0 && (
+            <div className={previewStyles.warning} role="status">
+              <Icon name="warning" size={14} />
               <span>
-                <T>No changes</T>
+                {failing === 1
+                  ? t`${failing} file will be merged; conflicts open in the merge tool`
+                  : t`${failing} files will be merged; conflicts open in the merge tool`}
               </span>
-            }
-            renderItem={(f) => (
-              <span
-                className={styles.fileRow}
-                style={{ flex: 1, padding: 0 }}
-                title={
-                  f.applies ? tx("Applies cleanly") : tx("Does not apply cleanly: a 3-way merge will be attempted")
-                }
-              >
-                <Icon name={fileIconName(baseName(f.path))} size={14} />
-                <span
-                  className={styles.fileName}
-                  style={{
-                    color:
-                      KIND_COLOR[f.kind === "untracked" ? "added" : f.kind === "conflicted" ? "conflicted" : f.kind],
-                  }}
-                >
-                  {baseName(f.path)}
-                </span>
-                <span className={styles.fileDir}>{f.oldPath ? tx`from ${f.oldPath}` : dirName(f.path)}</span>
-                <span className={styles.grow} />
-                <span className={styles.commitMeta}>{f.binary ? tx("binary") : `+${f.added} −${f.removed}`}</span>
-                {!f.applies && <Icon name="warning" size={14} label="Does not apply cleanly" />}
-              </span>
-            )}
-          />
-        )}
+            </div>
+          )}
+        </section>
       </div>
     </Dialog>
   );

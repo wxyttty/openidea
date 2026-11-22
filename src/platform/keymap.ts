@@ -11,8 +11,8 @@
  * optionally with modifiers (`Alt+Button4`); they are single strokes.
  */
 import { create } from "zustand";
-import { getAction, isActionKeyEnabled, executeAction } from "./actions";
-import { getContext } from "./context";
+import { executeAction, executeActionFrom, getAction, isActionKeyEnabled } from "./actions";
+import { evaluateWhen, getContext } from "./context";
 import { intellijMacos } from "./keymaps/intellij-macos";
 import { intellijWindows } from "./keymaps/intellij-windows";
 import { eclipseMacos } from "./keymaps/eclipse-macos";
@@ -20,7 +20,9 @@ import { eclipseWindows } from "./keymaps/eclipse-windows";
 import { vscodeMacos } from "./keymaps/vscode-macos";
 import { vscodeWindows } from "./keymaps/vscode-windows";
 import { usePlatform } from "./platformInfo";
+import { tx } from "./i18n";
 import { isImeKey } from "./ime";
+import { isPageSwipe, PAGE_SWIPE_EVENT } from "./pageSwipe";
 
 export type Keymap = Record<string, string[]>;
 
@@ -70,9 +72,11 @@ interface KeymapState {
   preset: string;
   /** User overrides: action id → bindings (empty array removes defaults). */
   overrides: Keymap;
+  /** Extensions' default bindings (plugins), below the preset. */
+  extensions: Keymap;
 }
 
-export const useKeymap = create<KeymapState>(() => ({ preset: defaultPreset(), overrides: {} }));
+export const useKeymap = create<KeymapState>(() => ({ preset: defaultPreset(), overrides: {}, extensions: {} }));
 
 const MOUSE_KEY_RE = /^Button(\d+)$/i;
 
@@ -83,14 +87,14 @@ export function isMouseBinding(binding: string): boolean {
 }
 
 /**
- * Side buttons, or a left click with Ctrl/Alt/Meta. Plain and Shift-only
- * left clicks keep selection semantics; middle/right clicks keep their own meaning.
+ * Middle/side buttons, or a left click with Ctrl/Alt/Meta. Plain and Shift-only
+ * left clicks keep selection semantics; right clicks keep the context menu.
  */
 export function mouseStrokeOf(
   e: Pick<MouseEvent, "button" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
 ): string | null {
   if (!Number.isInteger(e.button) || e.button < 0) return null;
-  if (e.button < 3 && !(e.button === 0 && (e.ctrlKey || e.altKey || e.metaKey))) return null;
+  if (e.button === 2 || (e.button === 0 && !(e.ctrlKey || e.altKey || e.metaKey))) return null;
   const mods = [e.ctrlKey && "Ctrl", e.altKey && "Alt", e.shiftKey && "Shift", e.metaKey && "Meta"].filter(Boolean);
   return [...mods, `Button${e.button + 1}`].join("+");
 }
@@ -116,6 +120,9 @@ export function isValidBinding(binding: unknown): binding is string {
   const b = binding.trim();
   if (parseDoubleModifier(b)) return true;
   const strokes = b.split(/\s+/);
+  if (strokes.some((s) => /swipe(left|right)$/i.test(s))) {
+    return strokes.length === 1 && /^swipe(left|right)$/i.test(b);
+  }
   return strokes.length >= 1 && strokes.length <= 2 && strokes.every((s) => STROKE_RE.test(s));
 }
 
@@ -188,16 +195,93 @@ export function suspendKeyboardDispatch(): () => void {
   };
 }
 
-export function bindingsFor(actionId: string): string[] {
-  const { preset, overrides } = useKeymap.getState();
-  return overrides[actionId] ?? PRESETS[preset]?.[actionId] ?? [];
+/** Linux reserves middle paste by default; explicit overrides bypass this filter. */
+function platformPreset(preset: string): Keymap {
+  const own = PRESETS[preset] ?? {};
+  const id = "editor.createRectangularSelectionOnMouseDrag";
+  if (usePlatform.getState().os !== "linux" || !own[id]) return own;
+  return { ...own, [id]: own[id].filter((binding) => binding !== "Button2") };
 }
+
+export function bindingsFor(actionId: string): string[] {
+  const { preset, overrides, extensions } = useKeymap.getState();
+  return overrides[actionId] ?? platformPreset(preset)[actionId] ?? usableExtensionBindings(extensions)[actionId] ?? [];
+}
+
+let bindingsCache: {
+  preset: string;
+  overrides: Keymap;
+  extensions: Keymap;
+  os: string;
+  pairs: Array<[string, string]>;
+} | null = null;
 
 /** Every (binding, actionId) pair of the effective keymap. */
 export function effectiveBindings(): Array<[string, string]> {
+  const { preset, overrides, extensions } = useKeymap.getState();
+  const { os } = usePlatform.getState();
+  // The dispatcher asks for these on every keystroke; merging and normalizing
+  // the whole keymap each time costs more than handling the key. The store
+  // replaces `overrides` / `extensions` wholesale, so identity tracks changes.
+  if (
+    bindingsCache?.preset === preset &&
+    bindingsCache.os === os &&
+    bindingsCache.overrides === overrides &&
+    bindingsCache.extensions === extensions
+  )
+    return bindingsCache.pairs;
+  const merged: Keymap = { ...usableExtensionBindings(extensions), ...platformPreset(preset), ...overrides };
+  const pairs = Object.entries(merged).flatMap(([id, keys]) =>
+    keys.map((k) => [normalizeBinding(k), id] as [string, string]),
+  );
+  bindingsCache = { preset, overrides, extensions, os, pairs };
+  return pairs;
+}
+
+let extensionCache: { source: Keymap; preset: string; overrides: Keymap; os: string; usable: Keymap } | null = null;
+
+/**
+ * Plugin default bindings that stay: those of actions the preset and the
+ * user leave unbound, on keystrokes nothing else uses (the IDE's own
+ * shortcuts always win).
+ */
+function usableExtensionBindings(extensions: Keymap | undefined = {}): Keymap {
   const { preset, overrides } = useKeymap.getState();
-  const merged: Keymap = { ...PRESETS[preset], ...overrides };
-  return Object.entries(merged).flatMap(([id, keys]) => keys.map((k) => [normalizeBinding(k), id] as [string, string]));
+  const { os } = usePlatform.getState();
+  if (
+    extensionCache?.source === extensions &&
+    extensionCache.preset === preset &&
+    extensionCache.os === os &&
+    extensionCache.overrides === overrides
+  )
+    return extensionCache.usable;
+  const builtIn: Keymap = { ...platformPreset(preset), ...overrides };
+  const taken = new Set(Object.values(builtIn).flatMap((keys) => keys.map(normalizeBinding)));
+  const usable: Keymap = {};
+  for (const [id, keys] of Object.entries(extensions)) {
+    if (id in builtIn) continue;
+    const free = keys.filter((k) => !taken.has(normalizeBinding(k)));
+    for (const k of free) taken.add(normalizeBinding(k));
+    if (free.length) usable[id] = free;
+  }
+  extensionCache = { source: extensions, preset, overrides, os, usable };
+  return usable;
+}
+
+/**
+ * Default bindings contributed by an extension (a plugin's `keymaps`), below
+ * the preset and the user's: dropped when the keystroke is already taken.
+ * Returns a disposer.
+ */
+export function registerExtensionBindings(actionId: string, bindings: string[]): () => void {
+  const valid = bindings.filter(isValidBinding);
+  useKeymap.setState((s) => ({ extensions: { ...(s.extensions ?? {}), [actionId]: valid } }));
+  return () =>
+    useKeymap.setState((s) => {
+      if (s.extensions?.[actionId] !== valid) return s;
+      const { [actionId]: _, ...rest } = s.extensions ?? {};
+      return { extensions: rest };
+    });
 }
 
 const MOD_ORDER = MODIFIERS;
@@ -214,6 +298,8 @@ export function normalizeBinding(binding: string): string {
       const key = parts.pop()!;
       const mods = MOD_ORDER.filter((m) => parts.some((p) => p.toLowerCase() === m.toLowerCase()));
       const mouse = MOUSE_KEY_RE.exec(key);
+      const swipe = /^swipe(left|right)$/i.exec(key);
+      if (swipe) return `Swipe${swipe[1]!.toLowerCase() === "left" ? "Left" : "Right"}`;
       return [...mods, mouse ? `Button${mouse[1]}` : key.length === 1 ? key.toUpperCase() : key].join("+");
     })
     .join(" ");
@@ -318,7 +404,7 @@ export function formatBinding(binding: string, mac = isMacHost()): string {
   if (isMouseBinding(binding)) {
     const parts = normalizeBinding(binding).split("+");
     const key = parts.pop();
-    const button = key === "Button1" ? "Left Click" : `${key} Click`;
+    const button = key === "Button1" ? "Left Click" : key === "Button2" ? tx("Middle Click") : `${key} Click`;
     return mac ? parts.map((p) => SYMBOLS[p] ?? p).join("") + button : [...parts, button].join("+");
   }
   if (!mac)
@@ -341,7 +427,7 @@ export function formatBinding(binding: string, mac = isMacHost()): string {
 
 /** The first keyboard binding of an action: what menus and tooltips show. */
 export function primaryKeyBinding(actionId: string): string | undefined {
-  return bindingsFor(actionId).find((b) => !isMouseBinding(b));
+  return bindingsFor(actionId).find((b) => !isMouseBinding(b) && !isPageSwipe(b));
 }
 
 export function shortcutLabel(actionId: string): string | undefined {
@@ -367,6 +453,66 @@ function modifierHeld(e: Pick<KeyboardEvent, "ctrlKey" | "altKey" | "shiftKey" |
 
 const otherModifiers = (e: Pick<KeyboardEvent, "ctrlKey" | "altKey" | "shiftKey" | "metaKey">, m: Modifier) =>
   MODIFIERS.some((x) => x !== m && modifierHeld(e, x));
+
+/** Recognizes the same modifier sequences for dispatch and shortcut capture. */
+export function createDoubleModifierRecognizer(now: () => number = () => performance.now()) {
+  // Step 1 pressed, 2 released, 3 pressed again. A bare gesture completes on the second release.
+  let tap: { modifier: Modifier; step: 1 | 2 | 3; at: number; typed: boolean; keyUsed: boolean } | null = null;
+  let otherKeyAt = -Infinity;
+  const reset = () => {
+    tap = null;
+  };
+
+  const pressModifier = (e: KeyboardEvent, modifier: Modifier) => {
+    const t = now();
+    if (e.repeat && tap?.step === 3 && tap.modifier === modifier) return;
+    if (e.repeat || otherModifiers(e, modifier)) return reset();
+    const typed = t - otherKeyAt < DOUBLE_TAP_TYPING_GUARD_MS;
+    if (tap && (tap.modifier !== modifier || t - tap.at > DOUBLE_TAP_STEP_MS)) reset();
+    if (!tap) tap = { modifier, step: 1, at: t, typed, keyUsed: false };
+    else if (tap.step === 2) tap = { ...tap, step: 3, at: t, typed: tap.typed || typed };
+    else reset();
+  };
+
+  return {
+    keyDown(e: KeyboardEvent, heldAction?: (event: KeyboardEvent, binding: string) => (() => void) | undefined) {
+      const modifier = KEY_MODIFIER[e.key];
+      if (modifier) {
+        pressModifier(e, modifier);
+        return true;
+      }
+      if (heldAction && tap?.step === 3 && modifierHeld(e, tap.modifier) && !otherModifiers(e, tap.modifier)) {
+        const key = strokeOf(e)?.split("+").pop();
+        const action = key ? heldAction(e, normalizeBinding(`${tap.modifier} ${tap.modifier}+${key}`)) : undefined;
+        if (action) {
+          tap.keyUsed = true;
+          action();
+          return true;
+        }
+      }
+      reset();
+      otherKeyAt = e.key === "Escape" || e.key === "Tab" ? -Infinity : now();
+      return false;
+    },
+    keyUp(e: KeyboardEvent) {
+      const modifier = KEY_MODIFIER[e.key];
+      if (!modifier || !tap || tap.modifier !== modifier) return null;
+      const t = now();
+      if (otherModifiers(e, modifier) || t - tap.at > DOUBLE_TAP_STEP_MS) {
+        reset();
+        return null;
+      }
+      if (tap.step === 1) {
+        tap = { ...tap, step: 2, at: t };
+        return null;
+      }
+      const completed = tap.step === 3 && !tap.keyUsed && !tap.typed;
+      reset();
+      return completed ? `${modifier} ${modifier}` : null;
+    },
+    reset,
+  };
+}
 
 function isPlainTextField(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
@@ -402,21 +548,114 @@ export function isAltGrTyping(
 function runIfEnabled(id: string): boolean {
   const action = getAction(id);
   if (!action || !isActionKeyEnabled(action)) return false;
-  void executeAction(id);
+  void executeActionFrom("keyboard", id);
   return true;
 }
 
 /** Run a configured mouse binding; editors prepare the clicked caret and focus first. */
-export function dispatchMouseShortcut(e: MouseEvent, prepare?: () => boolean): boolean {
+export function dispatchMouseShortcut(e: MouseEvent, prepare?: (id: string) => boolean, arg?: unknown): boolean {
   if (suspended > 0) return false;
   const stroke = mouseStrokeOf(e);
   if (!stroke) return false;
   const ids = effectiveBindings()
     .filter(([b]) => b === stroke)
     .map(([, id]) => id);
-  if (!ids.length || (prepare && !prepare())) return false;
-  for (const id of ids.reverse()) if (runIfEnabled(id)) return true;
+  for (const id of ids.reverse()) {
+    const action = getAction(id);
+    if (!action || !isActionKeyEnabled(action)) continue;
+    // A rectangular selection needs the drag; do not consume it as an ordinary click.
+    if (id === "editor.createRectangularSelectionOnMouseDrag") return false;
+    if (prepare && !prepare(id)) return false;
+    void executeAction(id, arg);
+    return true;
+  }
   return false;
+}
+
+/**
+ * Actions a shortcut passed on by a plugin's frame may run (`dispatchForwardedKey`) when the plugin
+ * does not hold `ide.commands`: saving, closing the editor tab, settings, and those that only move
+ * the caret or focus, or show a popup or tool window. The frame's page may send any key at any time,
+ * so nothing that runs, changes or sends something is listed: not themes, schemes, zoom or
+ * bookmarks, nor opening, merging or closing windows and tabs, nor the terminal (showing it starts
+ * a shell). Exact ids, never prefixes; a test checks that each one is still registered.
+ */
+export const FORWARDABLE_ACTIONS: ReadonlySet<string> = new Set([
+  "file.save",
+  "file.settings",
+  "editor.closeTab",
+  "navigate.back",
+  "navigate.forward",
+  "navigate.lastEditLocation",
+  "navigate.nextEditLocation",
+  "navigate.gotoLine",
+  "navigate.gotoClass",
+  "navigate.gotoFile",
+  "navigate.gotoSymbol",
+  "navigate.searchEverywhere",
+  "navigate.findAction",
+  "navigate.searchText",
+  "navigate.recentFiles",
+  "navigate.recentLocations",
+  "navigate.switcher",
+  "navigate.switcherBack",
+  "navigate.fileStructure",
+  "navigate.navigationBar",
+  "navigate.selectIn",
+  "navigate.selectInProjectView",
+  "navigate.showFilePath",
+  "navigate.showBookmarks",
+  ...Array.from({ length: 10 }, (_, d) => `navigate.gotoBookmark${d}`),
+  "navigate.declaration",
+  "navigate.typeDeclaration",
+  "navigate.implementation",
+  "navigate.superMethod",
+  "navigate.callHierarchy",
+  "navigate.typeHierarchy",
+  "navigate.nextError",
+  "navigate.prevError",
+  "navigate.nextMethod",
+  "navigate.previousMethod",
+  "navigate.nextOccurrence",
+  "navigate.prevOccurrence",
+  "navigate.nextHighlightedUsage",
+  "navigate.prevHighlightedUsage",
+  "toolwindow.project",
+  "toolwindow.structure",
+  "toolwindow.problems",
+  "toolwindow.find",
+  "toolwindow.bookmarks",
+  "toolwindow.git",
+  "toolwindow.commit",
+  "toolwindow.run",
+  "toolwindow.debug",
+  "toolwindow.hideActive",
+  "toolwindow.hideAll",
+  "toolwindow.jumpToLast",
+  "toolwindow.focusEditor",
+  "toolwindow.maximize",
+  "toolwindow.resizeUp",
+  "toolwindow.resizeDown",
+  "toolwindow.resizeLeft",
+  "toolwindow.resizeRight",
+  "window.next",
+  "window.previous",
+  "window.nextTab",
+  "window.previousTab",
+]);
+
+const restrictedKeys = new WeakSet<Event>();
+
+/**
+ * Dispatches on `target` a shortcut that a plugin's sandboxed frame says was pressed in it and left
+ * alone, for the keymap. The page can post one at any time, so unless the plugin may run any IDE
+ * action (`anyAction`: it holds `ide.commands`), the keymap runs only `FORWARDABLE_ACTIONS` from it,
+ * and it neither starts nor finishes a chord and takes no part in a double-modifier gesture.
+ */
+export function dispatchForwardedKey(target: EventTarget, init: KeyboardEventInit, anyAction = false): void {
+  const e = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
+  if (!anyAction) restrictedKeys.add(e);
+  target.dispatchEvent(e);
 }
 
 /**
@@ -430,65 +669,42 @@ export function installKeyboardDispatcher(
 ): () => void {
   let pending: string[] = [];
   let pendingTimer: ReturnType<typeof setTimeout> | undefined;
-  /**
-   * Double modifier: step 1 pressed, 2 released, 3 pressed again. A bare
-   * gesture (`Shift Shift`) fires on the second release; while the second
-   * press is held, keys fire their `Alt Alt+Up` gestures.
-   */
-  let tap: { modifier: Modifier; step: 1 | 2 | 3; at: number; typed: boolean; keyUsed: boolean } | null = null;
-  let otherKeyAt = -Infinity;
+  const doubleModifier = createDoubleModifierRecognizer(now);
 
   const reset = () => {
     pending = [];
     clearTimeout(pendingTimer);
   };
-  const resetTap = () => {
-    tap = null;
-  };
-
-  const onModifierDown = (e: KeyboardEvent, modifier: Modifier) => {
-    const t = now();
-    if (e.repeat && tap?.step === 3 && tap.modifier === modifier) return;
-    if (e.repeat || otherModifiers(e, modifier)) return resetTap();
-    const typed = t - otherKeyAt < DOUBLE_TAP_TYPING_GUARD_MS;
-    if (tap && (tap.modifier !== modifier || t - tap.at > DOUBLE_TAP_STEP_MS)) resetTap();
-    if (!tap) tap = { modifier, step: 1, at: t, typed, keyUsed: false };
-    else if (tap.step === 2) tap = { ...tap, step: 3, at: t, typed: tap.typed || typed };
-    else resetTap();
-  };
 
   /** A key pressed while the second press of a modifier is held: its `Alt Alt+Up` gesture. */
-  const runHeldGesture = (e: KeyboardEvent): boolean => {
-    if (tap?.step !== 3 || !modifierHeld(e, tap.modifier) || otherModifiers(e, tap.modifier)) return false;
-    const key = strokeOf(e)?.split("+").pop();
-    if (!key) return false;
-    const binding = normalizeBinding(`${tap.modifier} ${tap.modifier}+${key}`);
+  const heldAction = (e: KeyboardEvent, binding: string) => {
     const ids = effectiveBindings()
       .filter(([b]) => b === binding)
       .map(([, id]) => id);
     for (const id of ids.reverse()) {
       const action = getAction(id);
       if (!action || !isActionKeyEnabled(action)) continue;
-      e.preventDefault();
-      e.stopPropagation();
-      tap.keyUsed = true;
-      void executeAction(id);
-      return true;
+      return () => {
+        e.preventDefault();
+        e.stopPropagation();
+        void executeActionFrom("keyboard", id);
+        reset();
+      };
     }
-    return false;
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (suspended > 0) {
       reset();
-      resetTap();
+      doubleModifier.reset();
       return;
     }
-    const modifier = KEY_MODIFIER[e.key];
-    if (modifier) return onModifierDown(e, modifier);
-    if (runHeldGesture(e)) return reset();
-    resetTap();
-    otherKeyAt = e.key === "Escape" || e.key === "Tab" ? -Infinity : now();
+    const restricted = restrictedKeys.has(e);
+    if (restricted) {
+      reset();
+      if (KEY_MODIFIER[e.key]) return;
+    }
+    if (doubleModifier.keyDown(e, restricted ? undefined : heldAction)) return;
     if (isImeKey(e)) return;
     const stroke = strokeOf(e);
     if (!stroke) return;
@@ -496,7 +712,12 @@ export function installKeyboardDispatcher(
     if (!chord) {
       if (isAltGrTyping(e)) return;
       const hasCommandMod = e.metaKey || e.ctrlKey || e.altKey;
-      if (!hasCommandMod && isPlainTextField(e.target) && !/^(Shift\+)?(F\d{1,2}|Escape)$/.test(stroke)) return;
+      if (isPlainTextField(e.target)) {
+        // Native deletion stays in the field; Shift bindings and terminal keys keep their own routing.
+        if ((e.key === "Backspace" || e.key === "Delete") && !e.shiftKey && !(e.target as Element).closest?.(".xterm"))
+          return;
+        if (!hasCommandMod && !/^(Shift\+)?(F\d{1,2}|Escape)$/.test(stroke)) return;
+      }
       if (isClaimed(e, stroke)) return;
     }
 
@@ -514,18 +735,35 @@ export function installKeyboardDispatcher(
       : physicalSeq.replace(/Numpad(Add|Subtract|Multiply|Divide)/g, (key) => keypadAliases[key]!);
     const ctx = getContext();
     const exact = bindings.filter(([b]) => b === seq).map(([, id]) => id);
-    // Later presets/overrides win; the first enabled match runs.
-    for (const id of exact.reverse()) {
+    // Later presets/overrides win; the first enabled match runs. When several
+    // actions share the sequence, a binding whose `keyWhen` matches the current
+    // context runs before one without it: the context-specific claim beats the
+    // context-free one at equal specificity, so Eclipse's Alt+Shift+R renames
+    // in the project view instead of reaching the Git log's Edit Commit
+    // Message. An unmatching `keyWhen` fails the enablement check below, and
+    // when no `keyWhen` matches, the preset/override order decides as before.
+    const keyWhenMatches = (id: string) => {
       const action = getAction(id);
-      if (action && isActionKeyEnabled(action, ctx)) {
+      return !!action?.keyWhen && evaluateWhen(action.keyWhen, ctx);
+    };
+    const ordered = exact.reverse();
+    const preferred: string[] = [];
+    const fallback: string[] = [];
+    for (const id of ordered) {
+      if (keyWhenMatches(id)) preferred.push(id);
+      else fallback.push(id);
+    }
+    for (const id of [...preferred, ...fallback]) {
+      const action = getAction(id);
+      if (action && isActionKeyEnabled(action, ctx) && (!restricted || FORWARDABLE_ACTIONS.has(id))) {
         e.preventDefault();
         e.stopPropagation();
         reset();
-        void executeAction(id);
+        void executeActionFrom("keyboard", id);
         return;
       }
     }
-    if (bindings.some(([b]) => b.startsWith(seq + " "))) {
+    if (!restricted && bindings.some(([b]) => b.startsWith(seq + " "))) {
       e.preventDefault();
       e.stopPropagation();
       pending.push(stroke);
@@ -542,27 +780,24 @@ export function installKeyboardDispatcher(
   };
 
   const onKeyUp = (e: KeyboardEvent) => {
-    const modifier = KEY_MODIFIER[e.key];
-    if (suspended > 0 || !modifier || !tap || tap.modifier !== modifier) return;
-    const t = now();
-    if (otherModifiers(e, modifier) || t - tap.at > DOUBLE_TAP_STEP_MS) return resetTap();
-    if (tap.step === 1) {
-      tap = { ...tap, step: 2, at: t };
-      return;
-    }
-    const fire = tap.step === 3 && !tap.keyUsed && !tap.typed;
-    resetTap();
-    if (!fire) return;
+    if (suspended > 0) return;
+    const binding = doubleModifier.keyUp(e);
+    if (!binding) return;
     const ids = effectiveBindings()
-      .filter(([b]) => b === `${modifier} ${modifier}`)
+      .filter(([b]) => b === binding)
       .map(([, id]) => id);
     for (const id of ids.reverse()) if (runIfEnabled(id)) return;
   };
 
   const onMouseDown = (e: MouseEvent) => {
     // Shift+click (extend a selection) is not half of a double Shift.
-    resetTap();
-    if (suspended > 0) return;
+    doubleModifier.reset();
+    if (suspended > 0) {
+      reset();
+      return;
+    }
+    // Editors arbitrate middle click/drag; other components may use middle paste.
+    if (e.button === 1) return;
     const stroke = mouseStrokeOf(e);
     if (!stroke) return;
     if (e.button === 0) {
@@ -591,23 +826,80 @@ export function installKeyboardDispatcher(
     e.stopPropagation();
   };
 
+  /** macOS force click: no system Look Up popover over IDE text; the editor navigates instead. */
+  const onForceWillBegin = (e: Event) => e.preventDefault();
+
   const onBlur = () => {
     reset();
-    resetTap();
+    doubleModifier.reset();
   };
 
+  const onSwipe = (event: Event) => {
+    const stroke = (event as CustomEvent).detail;
+    if (suspended > 0 || !isPageSwipe(stroke)) return;
+    reset();
+    doubleModifier.reset();
+    const ids = effectiveBindings()
+      .filter(([binding]) => binding === stroke)
+      .map(([, id]) => id);
+    for (const id of ids.reverse()) if (runIfEnabled(id)) return;
+  };
+  target.addEventListener(PAGE_SWIPE_EVENT, onSwipe);
   target.addEventListener("keydown", onKeyDown, true);
   target.addEventListener("keyup", onKeyUp, true);
   target.addEventListener("mousedown", onMouseDown, true);
   target.addEventListener("mouseup", onMouseRelease, true);
   target.addEventListener("auxclick", onMouseRelease, true);
+  target.addEventListener("webkitmouseforcewillbegin", onForceWillBegin, true);
   target.addEventListener("blur", onBlur);
   return () => {
+    target.removeEventListener(PAGE_SWIPE_EVENT, onSwipe);
     target.removeEventListener("keydown", onKeyDown, true);
     target.removeEventListener("keyup", onKeyUp, true);
     target.removeEventListener("mousedown", onMouseDown, true);
     target.removeEventListener("mouseup", onMouseRelease, true);
     target.removeEventListener("auxclick", onMouseRelease, true);
+    target.removeEventListener("webkitmouseforcewillbegin", onForceWillBegin, true);
     target.removeEventListener("blur", onBlur);
   };
+}
+
+/** A keymap being edited: a bundled preset and the overrides on top of it. */
+export interface KeymapDraft {
+  preset: string;
+  overrides: Keymap;
+}
+
+/**
+ * The defaults of `id`: the preset's, or for an action the preset leaves out,
+ * the shortcut its plugin declares (`keymaps`). Removing or changing one is an
+ * override like any other.
+ */
+export function presetBindings(preset: string, id: string): string[] {
+  const own = platformPreset(preset);
+  const keys = own && id in own ? own[id] : useKeymap.getState().extensions?.[id];
+  return (keys ?? []).map(normalizeBinding);
+}
+
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** Sets the full binding list of `id`; drops the override when it equals the preset. */
+export function withBindings(draft: KeymapDraft, id: string, bindings: readonly string[]): Keymap {
+  const list = [...new Set(bindings.map(normalizeBinding))];
+  const overrides = { ...draft.overrides };
+  if (sameList(list, presetBindings(draft.preset, id))) delete overrides[id];
+  else overrides[id] = list;
+  return overrides;
+}
+
+/** A free id for a user keymap called `name`. */
+export function customKeymapId(name: string, customs: Record<string, unknown>): string {
+  const slug =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "keymap";
+  let id = `custom.${slug}`;
+  for (let i = 2; customs[id] || PRESETS[id]; i++) id = `custom.${slug}-${i}`;
+  return id;
 }

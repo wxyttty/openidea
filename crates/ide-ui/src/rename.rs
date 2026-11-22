@@ -207,10 +207,7 @@ impl RenameDialog {
                     // Applied through the shared `Documents`, so open buffers
                     // update (and repaint from `DocPatched`) before the server's
                     // next response.
-                    match host.project("main") {
-                        Ok(project) => ide_host::apply_workspace_edit(&project.documents, &renamed.edit),
-                        Err(err) => Err(err),
-                    }
+                    ide_host::ops::lsp::apply_workspace_edit(&host, "main", renamed.edit).await
                 })
                 .await;
             this.update(cx, |dialog, cx| {
@@ -346,7 +343,7 @@ fn summarize(edit: &WorkspaceEdit) -> Vec<(SharedString, usize)> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for file in &edit.files {
         match file {
-            FileEdit::Edit { path, edits } => {
+            FileEdit::Edit { path, edits, .. } => {
                 *counts.entry(path.0.display().to_string()).or_default() += edits.len();
             }
             FileEdit::Create { path, .. } => {
@@ -402,6 +399,7 @@ mod tests {
                     new_text: "x".into(),
                 })
                     .collect(),
+            version: None,
         }
     }
 
@@ -409,6 +407,7 @@ mod tests {
     fn summary_counts_edits_per_file() {
         let edit = WorkspaceEdit {
             files: vec![edit("src/a.rs", 2), edit("src/b.rs", 1), edit("src/a.rs", 1)],
+            preconditions: Vec::new(),
         };
         let summary = summarize_edit(&edit);
         let a = summary.iter().find(|(path, _)| path.as_ref() == "src/a.rs").expect("a.rs listed");
@@ -426,6 +425,7 @@ mod tests {
                 },
                 FileEdit::Delete { path: IpcPath(std::path::PathBuf::from("gone.rs")), recursive: false },
             ],
+            preconditions: Vec::new(),
         };
         let summary = summarize_edit(&edit);
         assert_eq!(summary.len(), 2);

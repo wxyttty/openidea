@@ -6,10 +6,14 @@
 //! project-relative and `/`-separated; `""` is the project root itself.
 
 mod detect;
+pub mod eclipse;
+pub(crate) use detect::{BUILD_FILES, virtual_env_marker};
 mod gradle;
+mod java;
 mod maven;
 
 pub use detect::{affects_roots, detect};
+pub use java::unmanaged_java_source_paths;
 
 use ide_core::settings::ProjectStructureSettings;
 use serde::{Deserialize, Serialize};

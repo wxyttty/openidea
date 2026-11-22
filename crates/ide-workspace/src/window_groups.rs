@@ -1,6 +1,30 @@
 //! Window grouping is independent of a window's project or workspace.
 use ide_core::{IdeError, IdeResult};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Platform adapters supply the system's tab preference and active project state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabbingPreference {
+    Always,
+    InFullScreen,
+    Manually,
+}
+
+pub fn should_group_new_project(
+    preference: TabbingPreference,
+    fullscreen: bool,
+    active_project: bool,
+    light_edit: bool,
+) -> bool {
+    active_project
+        && !light_edit
+        && match preference {
+            TabbingPreference::Always => true,
+            TabbingPreference::InFullScreen => fullscreen,
+            TabbingPreference::Manually => false,
+        }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowGroup {
@@ -39,6 +63,13 @@ impl WindowGroups {
         Ok(())
     }
 
+    /// Adds a window to the anchor's group without merging unrelated groups.
+    pub fn join(&mut self, anchor: &str, member: &str) -> IdeResult<()> {
+        let mut members = self.group(anchor).map(|g| g.members.clone()).unwrap_or_else(|| vec![anchor.to_owned()]);
+        members.push(member.to_owned());
+        self.merge(members, anchor)
+    }
+
     pub fn select(&mut self, caller: &str, target: &str) -> IdeResult<WindowGroup> {
         let group = self
             .groups
@@ -53,16 +84,24 @@ impl WindowGroups {
         Ok(before)
     }
 
+    /// The member `detach(member)` will make active: the selection, or the selected member's neighbour.
+    pub fn successor(&self, member: &str) -> Option<String> {
+        let group = self.group(member)?;
+        if group.selected != member {
+            return Some(group.selected.clone());
+        }
+        let index = group.members.iter().position(|m| m == member)?;
+        let next = if index + 1 < group.members.len() { index + 1 } else { index.checked_sub(1)? };
+        Some(group.members[next].clone())
+    }
+
     /// Returns the remaining active member, including when the last pair dissolves.
     pub fn detach(&mut self, member: &str) -> Option<String> {
+        let selected = self.successor(member)?;
         let i = self.groups.iter().position(|g| g.members.iter().any(|m| m == member))?;
         let group = &mut self.groups[i];
-        let index = group.members.iter().position(|m| m == member).unwrap();
-        group.members.remove(index);
-        if group.selected == member {
-            group.selected = group.members[index.min(group.members.len() - 1)].clone();
-        }
-        let selected = group.selected.clone();
+        group.members.retain(|m| m != member);
+        group.selected = selected.clone();
         if group.members.len() < 2 {
             self.groups.remove(i);
         }
@@ -87,11 +126,87 @@ impl WindowGroups {
     }
 }
 
+/// One entry of the window session reopened at the next start (`window-groups.json`): a
+/// window group, or a single project window (one project).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWindows {
+    pub projects: Vec<PathBuf>,
+    /// Index into `projects` of the group's selected tab.
+    pub selected: usize,
+}
+
+/// The project windows open now, to reopen at the next start: every group with its selected
+/// tab, then each window outside a group, in the order of `windows`. `project_of` gives a
+/// window's project (`None` for the welcome screen or LightEdit). `None` while a grouped
+/// window has no project yet (a restored member still opening): keep the previous session.
+pub fn session(
+    groups: &[WindowGroup],
+    windows: &[String],
+    project_of: impl Fn(&str) -> Option<PathBuf>,
+) -> Option<Vec<SavedWindows>> {
+    let mut saved = Vec::new();
+    for group in groups {
+        let projects: Option<Vec<PathBuf>> = group.members.iter().map(|label| project_of(label)).collect();
+        let selected = group.members.iter().position(|l| l == &group.selected).unwrap_or(0);
+        saved.push(SavedWindows { projects: projects?, selected });
+    }
+    for label in windows {
+        if groups.iter().any(|g| g.members.contains(label)) {
+            continue;
+        }
+        if let Some(project) = project_of(label)
+            && !saved.iter().any(|s| s.projects.contains(&project))
+        {
+            saved.push(SavedWindows { projects: vec![project], selected: 0 });
+        }
+    }
+    Some(saved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn members(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).into()).collect()
+    }
+
+    #[test]
+    fn new_project_grouping_follows_system_preference_and_excludes_light_edit() {
+        for preference in [TabbingPreference::Always, TabbingPreference::InFullScreen, TabbingPreference::Manually] {
+            for fullscreen in [false, true] {
+                for active_project in [false, true] {
+                    for light_edit in [false, true] {
+                        let expected = matches!(
+                            (preference, fullscreen, active_project, light_edit),
+                            (TabbingPreference::Always, _, true, false)
+                                | (TabbingPreference::InFullScreen, true, true, false)
+                        );
+                        assert_eq!(
+                            should_group_new_project(preference, fullscreen, active_project, light_edit),
+                            expected,
+                            "{preference:?}, fullscreen={fullscreen}, active={active_project}, light={light_edit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn joining_new_windows_preserves_the_active_group_and_other_groups() {
+        let mut groups = WindowGroups::default();
+        groups.merge(members(&["other-a", "other-b"]), "other-b").unwrap();
+        groups.join("a", "b").unwrap();
+        assert_eq!(groups.group("a").unwrap().members, members(&["a", "b"]));
+        let before = groups.select("a", "b").unwrap();
+        assert_eq!(before.selected, "a");
+        groups.join("b", "c").unwrap();
+        let before = groups.select("b", "c").unwrap();
+        assert_eq!(before.selected, "b");
+        assert_eq!(groups.group("c").unwrap().members, members(&["a", "b", "c"]));
+        assert_eq!(groups.group("c").unwrap().selected, "c");
+        assert_eq!(groups.group("other-a").unwrap().members, members(&["other-a", "other-b"]));
+        assert_eq!(groups.group("other-a").unwrap().selected, "other-b");
     }
 
     #[test]
@@ -107,6 +222,19 @@ mod tests {
     }
 
     #[test]
+    fn the_successor_is_the_member_detach_selects() {
+        let mut groups = WindowGroups::default();
+        groups.merge(members(&["a", "b", "c"]), "b").unwrap();
+        assert_eq!(groups.successor("a"), Some("b".into()));
+        assert_eq!(groups.successor("b"), Some("c".into()));
+        groups.select("a", "c").unwrap();
+        assert_eq!(groups.successor("c"), Some("b".into()));
+        assert_eq!(groups.successor("unrelated"), None);
+        assert_eq!(groups.detach("c"), Some("b".into()));
+        assert_eq!(groups.group("a").unwrap().selected, "b");
+    }
+
+    #[test]
     fn merging_groups_and_reordering_keep_unique_members() {
         let mut groups = WindowGroups::default();
         groups.merge(members(&["a", "b"]), "a").unwrap();
@@ -116,5 +244,29 @@ mod tests {
         assert!(groups.reorder("a", members(&["a", "a", "c", "d"])).is_err());
         groups.reorder("a", members(&["d", "c", "b", "a"])).unwrap();
         assert_eq!(groups.group("a").unwrap().members[0], "d");
+    }
+
+    #[test]
+    fn the_session_keeps_groups_and_every_ungrouped_project_window() {
+        let groups = vec![WindowGroup { members: members(&["project-1", "project-2"]), selected: "project-2".into() }];
+        let windows = members(&["main", "project-1", "project-2", "project-3", "project-4"]);
+        let project_of = |label: &str| match label {
+            "main" => Some(PathBuf::from("/a")),
+            "project-1" => Some(PathBuf::from("/b")),
+            "project-2" => Some(PathBuf::from("/c")),
+            "project-3" => Some(PathBuf::from("/d")),
+            // The welcome screen or LightEdit.
+            _ => None,
+        };
+        assert_eq!(
+            session(&groups, &windows, project_of).unwrap(),
+            [
+                SavedWindows { projects: vec!["/b".into(), "/c".into()], selected: 1 },
+                SavedWindows { projects: vec!["/a".into()], selected: 0 },
+                SavedWindows { projects: vec!["/d".into()], selected: 0 },
+            ]
+        );
+        // A grouped window still opening its project: keep the previous session.
+        assert_eq!(session(&groups, &windows, |l| (l != "project-2").then(|| PathBuf::from(l))), None);
     }
 }

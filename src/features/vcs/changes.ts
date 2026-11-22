@@ -2,14 +2,22 @@
 import type { ChangelistState, FileStatus } from "@/bindings";
 import { baseName, dirName, effectiveKind, relTo, repoLabel, rootOf, stripSlash, type EffectiveKind } from "./model";
 import { tx } from "@/platform/i18n";
+import type { RepoHead } from "./store";
 
-export type GroupId = "conflicts" | "changes" | "unversioned";
+export type GroupId = "conflicts" | "changes" | "unversioned" | "staged" | "unstaged";
 
 export const GROUP_LABEL: Record<GroupId, string> = {
   conflicts: "Merge Conflicts",
   changes: "Changes",
   unversioned: "Unversioned Files",
+  staged: "Staged Changes",
+  unstaged: "Unstaged Changes",
 };
+
+/** The index side a file under a "by staging state" group is compared on (partially staged files only). */
+export function stagingSide(group: GroupId, fs: FileStatus): "staged" | "unstaged" | null {
+  return (group === "staged" || group === "unstaged") && isPartiallyStaged(fs) ? group : null;
+}
 
 /**
  * Inclusion of a file in the next commit:
@@ -31,8 +39,10 @@ export interface ChangeNode {
   kind?: EffectiveKind;
   /** Absolute path (files and directories). */
   path?: string;
-  /** Detail text: the relative directory (flat mode) or the old name. */
+  /** Detail text: the relative directory (flat mode), the old name or a repository's branch. */
   detail?: string;
+  /** Icon before the detail: a repository's branch, or its HEAD commit when detached. */
+  detailIcon?: "branch" | "commit";
   /** Change list id (change list groups and their descendants). */
   changelist?: string;
   /** The active change list's group. */
@@ -47,6 +57,14 @@ export function groupOf(fs: FileStatus): GroupId | null {
   return "changes";
 }
 
+/**
+ * Added to the index, then deleted from disk: no change against HEAD, so the change list leaves
+ * it out, but the staging area shows the staged addition (and the deletion, unstaged).
+ */
+export function addedThenDeleted(fs: Pick<FileStatus, "staged" | "unstaged">): boolean {
+  return fs.staged === "added" && fs.unstaged === "deleted";
+}
+
 export function isPartiallyStaged(fs: FileStatus): boolean {
   return (
     !!fs.staged &&
@@ -57,23 +75,28 @@ export function isPartiallyStaged(fs: FileStatus): boolean {
   );
 }
 
-export function initialCheck(fs: FileStatus): CheckState {
+export function initialCheck(fs: FileStatus, includeByDefault = true): CheckState {
+  if (!includeByDefault) return "none";
   const g = groupOf(fs);
   // Unversioned files and unresolved conflicts are opt-in, as in IDEA.
   if (g !== "changes") return "none";
   return isPartiallyStaged(fs) ? "staged" : "all";
 }
 
-export function checkOf(fs: FileStatus, checks: ReadonlyMap<string, CheckState>): CheckState {
-  return checks.get(fs.path) ?? initialCheck(fs);
+export function checkOf(fs: FileStatus, checks: ReadonlyMap<string, CheckState>, includeByDefault = true): CheckState {
+  return checks.get(fs.path) ?? initialCheck(fs, includeByDefault);
 }
 
 /** Aggregate checkbox state for a set of files. */
-export function aggregateCheck(files: readonly FileStatus[], checks: ReadonlyMap<string, CheckState>) {
+export function aggregateCheck(
+  files: readonly FileStatus[],
+  checks: ReadonlyMap<string, CheckState>,
+  includeByDefault = true,
+) {
   let on = 0;
   let partial = false;
   for (const f of files) {
-    const c = checkOf(f, checks);
+    const c = checkOf(f, checks, includeByDefault);
     if (c !== "none") on++;
     if (c === "staged" || c === "hunks") partial = true;
   }
@@ -89,7 +112,9 @@ const KIND_ORDER: GroupId[] = ["conflicts", "changes", "unversioned"];
 function fileNode(fs: FileStatus, root: string, group: GroupId, flat: boolean, scope: string = group): ChangeNode {
   const path = stripSlash(fs.path);
   const rel = relTo(root, path);
-  const kind = effectiveKind(fs) ?? "modified";
+  // Under Staged / Unstaged, a file without an overall kind (added, then deleted) shows its side's.
+  const side = group === "staged" ? fs.staged : group === "unstaged" ? fs.unstaged : null;
+  const kind = effectiveKind(fs) ?? (side === "added" || side === "deleted" ? side : "modified");
   const dir = dirName(rel);
   return {
     key: `${scope}:${path}`,
@@ -112,6 +137,8 @@ function fileNode(fs: FileStatus, root: string, group: GroupId, flat: boolean, s
 interface Trie {
   dirs: Map<string, Trie>;
   files: FileStatus[];
+  /** Absolute path of the directory. */
+  path?: string;
 }
 
 function dirNodes(trie: Trie, prefix: string, root: string, group: GroupId, scope: string = group): ChangeNode[] {
@@ -137,7 +164,7 @@ function dirNodes(trie: Trie, prefix: string, root: string, group: GroupId, scop
       group,
       children,
       files,
-      path: `${root}/${rel}`,
+      path: node.path!,
     });
   }
   const files = [...trie.files].sort((a, b) => baseName(a.path).localeCompare(baseName(b.path)));
@@ -155,13 +182,18 @@ function childNodes(files: readonly FileStatus[], root: string, group: GroupId, 
   if (groupByDir) {
     const trie: Trie = { dirs: new Map(), files: [] };
     for (const f of files) {
-      const rel = relTo(root, stripSlash(f.path));
+      const path = stripSlash(f.path);
+      const rel = relTo(root, path);
       const parts = rel.split("/");
       parts.pop();
+      // Outside the root (a repository elsewhere, not grouped by repository): from its absolute path.
+      if (rel === path && parts[0] === "" && parts.length > 1) parts.splice(0, 2, `/${parts[1]}`);
       let t = trie;
+      let at = rel === path ? "" : `${root}/`;
       for (const p of parts) {
+        at += t === trie ? p : `/${p}`;
         let next = t.dirs.get(p);
-        if (!next) t.dirs.set(p, (next = { dirs: new Map(), files: [] }));
+        if (!next) t.dirs.set(p, (next = { dirs: new Map(), files: [], path: at }));
         t = next;
       }
       t.files.push(f);
@@ -173,6 +205,13 @@ function childNodes(files: readonly FileStatus[], root: string, group: GroupId, 
     .map((f) => fileNode(f, root, group, true, scope));
 }
 
+/** The branch a repository is on, or its HEAD commit when detached (IDEA's repository node hint). */
+function headHint(head: RepoHead | undefined): Pick<ChangeNode, "detail" | "detailIcon"> {
+  if (head?.head) return { detail: head.head, detailIcon: "branch" };
+  if (head?.headCommit) return { detail: head.headCommit.slice(0, 8), detailIcon: "commit" };
+  return {};
+}
+
 /** With several repositories, a node per repository (IDEA's "Group by Repository") above the files. */
 function repoNodes(
   files: readonly FileStatus[],
@@ -181,6 +220,7 @@ function repoNodes(
   groupByDir: boolean,
   scope: string,
   repos: readonly string[],
+  heads: Readonly<Record<string, RepoHead>>,
 ): ChangeNode[] {
   if (repos.length < 2) return childNodes(files, root, group, groupByDir, scope);
   const byRepo = new Map<string, FileStatus[]>();
@@ -201,6 +241,7 @@ function repoNodes(
       children: childNodes(own, repo, group, groupByDir, `${scope}@${repo}`),
       files: own,
       path: repo,
+      ...headHint(heads[repo]),
     }));
 }
 
@@ -216,7 +257,11 @@ function tagList(nodes: ChangeNode[], id: string): ChangeNode[] {
  * Group roots (Merge Conflicts / Changes / Unversioned Files) with flat or directory
  * children. With change lists, "Changes" is split into one group per list
  * (`ChangelistState.files` keys are project-relative paths). With several
- * repositories (`repos`), each group's files are grouped by repository first.
+ * repositories (`repos`), each group's files are grouped by repository first, with
+ * each repository's branch (`heads`) beside its name, unless `byRepo` is off. With
+ * `byStaging`, "Changes" becomes "Staged Changes" and "Unstaged Changes" instead.
+ * Without `showUnversionedSeparately`, untracked files join Changes (the active list)
+ * or Unstaged Changes; their Git status and default commit inclusion stay unchanged.
  */
 export function buildChangeTree(
   status: readonly FileStatus[],
@@ -224,10 +269,16 @@ export function buildChangeTree(
   groupByDir: boolean,
   lists?: ChangelistState,
   repos: readonly string[] = [],
+  byStaging = false,
+  heads: Readonly<Record<string, RepoHead>> = {},
+  byRepo = true,
+  showUnversionedSeparately = true,
 ): ChangeNode[] {
+  const repoRoots = byRepo ? repos : [];
   const byGroup = new Map<GroupId, FileStatus[]>();
   for (const fs of status) {
-    const g = groupOf(fs);
+    const kind = groupOf(fs) ?? (byStaging && addedThenDeleted(fs) ? "changes" : null);
+    const g = kind === "unversioned" && !showUnversionedSeparately ? "changes" : kind;
     if (!g) continue;
     let list = byGroup.get(g);
     if (!list) byGroup.set(g, (list = []));
@@ -236,10 +287,30 @@ export function buildChangeTree(
   const roots: ChangeNode[] = [];
   for (const g of KIND_ORDER) {
     const files = byGroup.get(g) ?? [];
+    if (g === "changes" && byStaging) {
+      // A partially staged file is listed under both, each opening its own side of the index.
+      const sides: Array<["staged" | "unstaged", FileStatus[]]> = [
+        ["staged", files.filter((f) => !!f.staged)],
+        ["unstaged", files.filter((f) => !!f.unstaged)],
+      ];
+      for (const [side, own] of sides) {
+        if (!own.length) continue;
+        const children = repoNodes(own, root, side, groupByDir, side, repoRoots, heads);
+        roots.push({
+          key: `group:${side}`,
+          type: "group",
+          label: GROUP_LABEL[side],
+          group: side,
+          children,
+          files: own,
+        });
+      }
+      continue;
+    }
     if (g === "changes" && lists) {
       const byList = new Map<string, FileStatus[]>(lists.lists.map((l) => [l.id, []]));
       for (const f of files) {
-        const id = lists.files?.[relTo(root, stripSlash(f.path))];
+        const id = groupOf(f) === "unversioned" ? lists.active : lists.files?.[relTo(root, stripSlash(f.path))];
         byList.get(id && byList.has(id) ? id : lists.active)?.push(f);
       }
       for (const l of lists.lists) {
@@ -252,7 +323,7 @@ export function buildChangeTree(
           type: "group",
           label: l.name,
           group: g,
-          children: tagList(repoNodes(own, root, g, groupByDir, scope, repos), l.id),
+          children: tagList(repoNodes(own, root, g, groupByDir, scope, repoRoots, heads), l.id),
           files: own,
           changelist: l.id,
           active: l.id === lists.active,
@@ -262,15 +333,59 @@ export function buildChangeTree(
       continue;
     }
     if (!files.length) continue;
-    const children = repoNodes(files, root, g, groupByDir, g, repos);
+    const children = repoNodes(files, root, g, groupByDir, g, repoRoots, heads);
     roots.push({ key: `group:${g}`, type: "group", label: GROUP_LABEL[g], group: g, children, files });
   }
   return roots;
 }
 
+export function changeGroupPaths(roots: readonly ChangeNode[], path: string): string[] {
+  const group = roots.find((node) => node.files.some((file) => stripSlash(file.path) === path));
+  if (!group) return [path];
+  const paths: string[] = [];
+  const walk = (nodes: readonly ChangeNode[]) => {
+    for (const node of nodes) {
+      if (node.type === "file" && node.path) paths.push(node.path);
+      else walk(node.children ?? []);
+    }
+  };
+  walk([group]);
+  return paths;
+}
+
+/** Every file node of the tree, in tree order (a partially staged file is listed under both staging groups). */
+export function changeFileNodes(roots: readonly ChangeNode[]): ChangeNode[] {
+  const out: ChangeNode[] = [];
+  const walk = (nodes: readonly ChangeNode[]) => {
+    for (const node of nodes) {
+      if (node.type === "file" && node.path) out.push(node);
+      else walk(node.children ?? []);
+    }
+  };
+  walk(roots);
+  return out;
+}
+
+/** File nodes, in tree order, of the group a file node belongs to. */
+export function groupFileNodes(roots: readonly ChangeNode[], node: ChangeNode): ChangeNode[] {
+  const group = roots.find((r) => r.group === node.group && r.files.some((f) => stripSlash(f.path) === node.path));
+  if (!group) return [node];
+  const out: ChangeNode[] = [];
+  const walk = (nodes: readonly ChangeNode[]) => {
+    for (const n of nodes) {
+      if (n.type === "file" && n.path) out.push(n);
+      else walk(n.children ?? []);
+    }
+  };
+  walk([group]);
+  return out;
+}
+
 export interface CommitPlan {
+  /** Included files committed with their working-tree content. */
   stage: string[];
-  unstage: string[];
+  /** Staged files left out of the commit; they stay staged. */
+  exclude: string[];
   /** Files that end up in the commit. */
   included: FileStatus[];
   /** Absolute paths of included files committed with only some of their hunks. */
@@ -299,19 +414,32 @@ export function renamedFromPath(fs: FileStatus): string | null {
   return root === null ? null : `${root}${fs.renamedFrom}`;
 }
 
-/** What to stage / unstage so the index holds exactly the included changes. */
-export function planCommit(status: readonly FileStatus[], checks: ReadonlyMap<string, CheckState>): CommitPlan {
-  const plan: CommitPlan = { stage: [], unstage: [], included: [], partial: [] };
+/** What the commit takes beyond the index, and what staged changes it leaves out. */
+export function planCommit(
+  status: readonly FileStatus[],
+  checks: ReadonlyMap<string, CheckState>,
+  includeByDefault = true,
+): CommitPlan {
+  const plan: CommitPlan = { stage: [], exclude: [], included: [], partial: [] };
   for (const fs of status) {
-    if (!groupOf(fs)) continue;
-    const c = checkOf(fs, checks);
+    if (!groupOf(fs)) {
+      // Added to the index, then deleted from disk: no change against HEAD, so the commit
+      // leaves the staged addition out, unless the staging area commits it (checked "staged").
+      if (addedThenDeleted(fs) && (checks.get(fs.path) ?? checks.get(stripSlash(fs.path))) === "staged") {
+        plan.included.push(fs);
+        continue;
+      }
+      if (fs.staged && fs.staged !== "conflicted" && fs.unstaged !== "ignored") plan.exclude.push(stripSlash(fs.path));
+      continue;
+    }
+    const c = checkOf(fs, checks, includeByDefault);
     const path = stripSlash(fs.path);
     if (c === "none") {
       if (fs.staged && fs.staged !== "conflicted") {
-        plan.unstage.push(path);
-        // A staged rename is a deletion + addition: leaving the deletion staged would commit it.
+        plan.exclude.push(path);
+        // A staged rename is a deletion + addition: leaving the deletion in would commit it.
         const from = renamedFromPath(fs);
-        if (from) plan.unstage.push(from);
+        if (from) plan.exclude.push(from);
       }
       continue;
     }
@@ -321,6 +449,20 @@ export function planCommit(status: readonly FileStatus[], checks: ReadonlyMap<st
     plan.included.push(fs);
   }
   return plan;
+}
+
+/**
+ * Inclusion overrides kept after a commit (same shape for `checks` and `excludedHunks`):
+ * the committed changes start over, since they either left the tree or only some of
+ * their blocks went in. The changes the user left out keep their override, so they stay
+ * excluded instead of falling back to "included" in the next commit.
+ */
+export function remainingOverrides<T>(
+  overrides: ReadonlyMap<string, T>,
+  committed: readonly FileStatus[],
+): Map<string, T> {
+  const done = new Set(committed.map((f) => stripSlash(f.path)));
+  return new Map([...overrides].filter(([path]) => !done.has(stripSlash(path))));
 }
 
 /**
@@ -388,4 +530,17 @@ export function filesOf(nodes: readonly ChangeNode[]): FileStatus[] {
       out.push(f);
     }
   return out;
+}
+
+/**
+ * Changed files at or below `paths` (absolute, a directory expands to its files):
+ * the files a drop assigns to a change list. Unversioned and conflicted paths are
+ * left out — an unversioned file only joins a list once it has been added to Git.
+ */
+export function changedPathsUnder(paths: readonly string[], status: readonly FileStatus[]): string[] {
+  const wanted = paths.map(stripSlash);
+  return status
+    .filter((f) => groupOf(f) === "changes")
+    .map((f) => stripSlash(f.path))
+    .filter((p) => wanted.some((w) => p === w || p.startsWith(`${w}/`)));
 }

@@ -21,14 +21,54 @@
 .tabActions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 0 2px;
+}
+
+/* A tab group: its header (while split) over its tabs' terminals. */
+.group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.output {
+  container: terminal-output / size;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .panels {
   flex: 1;
   position: relative;
   min-height: 0;
+}
+
+/* tab drag & drop target on a group: an edge splits, the middle joins (the editor's look) */
+.dropZone {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.drop-left {
+  right: 50%;
+}
+.drop-right {
+  left: 50%;
+}
+.drop-top {
+  bottom: 50%;
+}
+.drop-bottom {
+  top: 50%;
 }
 
 .panel {
@@ -60,25 +100,6 @@
   position: relative;
 }
 
-.paneActions {
-  position: absolute;
-  right: 14px;
-  bottom: 8px;
-  z-index: 10;
-  display: flex;
-  gap: 2px;
-  opacity: 0;
-  transition: opacity 0.15s;
-  background: var(--bg-elev, var(--bg-app));
-  border-radius: 4px;
-}
-
-.pane:hover .paneActions,
-.pane:focus-within .paneActions,
-.paneActions:focus-within {
-  opacity: 1;
-}
-
 .exited :global(.xterm-cursor-layer),
 .exited :global(.xterm-cursor) {
   visibility: hidden;
@@ -100,14 +121,34 @@
 .pane :global(.xterm-viewport) {
   background-color: var(--bg-island, var(--bg-app)) !important;
 }
-.pane :global(.xterm .xterm-scrollable-element > .scrollbar > .slider) {
+.pane :global(.xterm-screen) {
+  isolation: isolate;
+}
+.pane :global(.openidea-terminal-selection-matches) {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+.pane :global(.openidea-terminal-selection-match) {
+  position: absolute;
+  box-sizing: border-box;
+  border-radius: 2px;
+  background-color: var(--bg-identifier-under-caret, color-mix(in srgb, var(--fg) 9%, transparent));
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -1px;
+}
+.pane :global(.xterm-decoration-container) {
+  pointer-events: none;
+}
+.pane :global(.xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider) {
   box-sizing: border-box;
   border: 2px solid transparent;
   border-radius: 6px;
   background: var(--scrollbar-thumb) content-box;
 }
-.pane :global(.xterm .xterm-scrollable-element > .scrollbar > .slider:hover),
-.pane :global(.xterm .xterm-scrollable-element > .scrollbar > .slider.active) {
+.pane :global(.xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider:hover),
+.pane :global(.xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider.xterm-active) {
   background: var(--scrollbar-thumb-hover) content-box;
 }
 
@@ -121,18 +162,18 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   padding: 4px 8px;
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
 }
 .findField {
-  flex: 0 1 360px;
+  flex: 1;
   min-width: 160px;
 }
 .findCount {
-  font-family: var(--font-mono);
   font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
   color: var(--fg-subtle);
   padding: 0 6px;
   white-space: nowrap;
@@ -141,6 +182,30 @@
 .findCountNone {
   color: var(--danger);
 }
-.findSpacer {
-  flex: 1;
+@container terminal-output (min-width: 500px) and (min-height: 160px) {
+  .find {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 6;
+    width: 500px;
+    border-left: 1px solid var(--border);
+  }
+  .find[data-match-covered] {
+    top: auto;
+    bottom: 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 0;
+  }
+}
+
+@container terminal-output (max-width: 360px) {
+  .find {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(3, var(--h-control-small));
+  }
+  .findField {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
 }

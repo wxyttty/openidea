@@ -2,7 +2,8 @@
  * SQL tokens for completion and resolution: words, quoted identifiers, string
  * literals, numbers and punctuation, with comments and whitespace dropped.
  * Dialect-aware (MySQL backticks / `#` comments / backslash escapes,
- * PostgreSQL dollar quoting). Offsets are UTF-16, like the editor's.
+ * PostgreSQL dollar quoting, Snowflake `$$` strings / `//` comments / stages /
+ * variant paths). Offsets are UTF-16, like the editor's.
  */
 import type { DbDriver } from "@/platform/ipc";
 
@@ -16,6 +17,7 @@ export interface Token {
   to: number;
   /** Upper-cased `text` of words, for keyword checks. */
   upper: string;
+  value?: string;
 }
 
 export interface Lexed {
@@ -26,17 +28,31 @@ export interface Lexed {
 
 const WORD_START = /[\p{L}_]/u;
 const WORD_PART = /[\p{L}\p{N}_$]/u;
+const STAGE_START = /[\p{L}_~%"]/u;
+const STAGE_END = /[\s(),;']/;
+const PATH_OWNER = /[\p{L}\p{N}_$)\]"']/u;
 const TWO_CHAR = new Set(["::", "<=", ">=", "<>", "!=", "||", "->", "=>", ":="]);
 
 export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
   const mysql = driver === "mysql";
+  const clickhouse = driver === "clickhouse";
+  const snowflake = driver === "snowflake";
   const tokens: Token[] = [];
   const comments: Lexed["comments"] = [];
   const n = text.length;
   let i = 0;
   const push = (kind: TokenKind, from: number, to: number) => {
     const t = text.slice(from, to);
-    tokens.push({ kind, text: t, from, to, upper: kind === "word" ? t.toUpperCase() : t });
+    tokens.push({
+      kind,
+      text: t,
+      from,
+      to,
+      upper: kind === "word" ? t.toUpperCase() : t,
+      ...(kind === "quoted" && clickhouse
+        ? { value: t.slice(1, t.endsWith(t[0]!) ? -1 : undefined).replace(/\\([\\'"`])/g, "$1") }
+        : {}),
+    });
   };
   /** End of a quoted run starting at `i` (closing char doubled = escaped). */
   const quoted = (start: number, close: string, backslash: boolean): number => {
@@ -56,7 +72,7 @@ export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
     const next = text[i + 1];
     if (c === " " || c === "\t" || c === "\n" || c === "\r") {
       i++;
-    } else if ((c === "-" && next === "-") || (c === "#" && mysql)) {
+    } else if ((c === "-" && next === "-") || (c === "#" && mysql) || (c === "/" && next === "/" && snowflake)) {
       const end = text.indexOf("\n", i);
       const to = end < 0 ? n : end;
       comments.push({ from: i, to, open: true });
@@ -67,15 +83,15 @@ export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
       comments.push({ from: i, to, open: end < 0 });
       i = to;
     } else if (c === "'") {
-      const to = quoted(i, "'", mysql);
+      const to = quoted(i, "'", mysql || clickhouse || snowflake);
       push("string", i, to);
       i = to;
     } else if (c === '"') {
-      const to = quoted(i, '"', false);
+      const to = quoted(i, '"', clickhouse);
       push(mysql ? "string" : "quoted", i, to);
       i = to;
-    } else if (c === "`" && mysql) {
-      const to = quoted(i, "`", false);
+    } else if (c === "`" && (mysql || clickhouse)) {
+      const to = quoted(i, "`", clickhouse);
       push("quoted", i, to);
       i = to;
     } else if (c === "$" && driver === "postgres") {
@@ -92,6 +108,25 @@ export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
         push("param", i, j);
         i = j;
       }
+    } else if (c === "$" && snowflake) {
+      if (next === "$") {
+        const close = text.indexOf("$$", i + 2);
+        const to = close < 0 ? n : close + 2;
+        push("string", i, to);
+        i = to;
+      } else {
+        // `$1` (positional column) / `$name` (session variable).
+        let j = i + 1;
+        while (j < n && WORD_PART.test(text[j]!)) j++;
+        push(j > i + 1 ? "param" : "punct", i, j);
+        i = j;
+      }
+    } else if (c === "@" && snowflake && next !== undefined && STAGE_START.test(next)) {
+      // A stage reference with its path: `@stage/dir/file.csv`, `@~/x`, `@%table`.
+      let j = i + 1;
+      while (j < n && !STAGE_END.test(text[j]!)) j++;
+      push("param", i, j);
+      i = j;
     } else if (/\d/.test(c) || (c === "." && next !== undefined && /\d/.test(next))) {
       let j = i + 1;
       while (j < n && /[\d.eE_xXa-fA-F]/.test(text[j]!)) j++;
@@ -100,13 +135,19 @@ export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
     } else if (WORD_START.test(c)) {
       let j = i + 1;
       while (j < n && WORD_PART.test(text[j]!)) j++;
-      push("word", i, j);
+      if (snowflake && text.startsWith("://", j)) {
+        // A location of PUT / GET (`file:///tmp/data.csv`): one token, and its `//` no comment.
+        while (j < n && !STAGE_END.test(text[j]!)) j++;
+        push("param", i, j);
+      } else push("word", i, j);
       i = j;
     } else if (
       (c === "?" || c === ":" || c === "@") &&
       next !== undefined &&
       WORD_START.test(next) &&
-      !(c === ":" && text[i - 1] === ":")
+      !(c === ":" && text[i - 1] === ":") &&
+      // Snowflake `col:path` (also after `)`, `]` and quotes) reads a VARIANT.
+      !(c === ":" && snowflake && i > 0 && PATH_OWNER.test(text[i - 1]!))
     ) {
       let j = i + 1;
       while (j < n && WORD_PART.test(text[j]!)) j++;
@@ -114,7 +155,7 @@ export function lex(text: string, driver: DbDriver = "sqlite"): Lexed {
       i = j;
     } else {
       const two = text.slice(i, i + 2);
-      const len = TWO_CHAR.has(two) ? 2 : 1;
+      const len = two === "->" && text[i + 2] === ">" ? 3 : TWO_CHAR.has(two) ? 2 : 1;
       push("punct", i, i + len);
       i += len;
     }
@@ -146,6 +187,7 @@ function closed(t: Token): boolean {
 /** The identifier a word / quoted token names (quotes removed, doubled quotes collapsed). */
 export function identName(t: Token): string {
   if (t.kind !== "quoted") return t.text;
+  if (t.value !== undefined) return t.value;
   const q = t.text[0]!;
   const body = t.text.endsWith(q) && t.text.length > 1 ? t.text.slice(1, -1) : t.text.slice(1);
   return body.split(q + q).join(q);

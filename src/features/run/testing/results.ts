@@ -10,8 +10,28 @@ export interface TestNode {
   own: TestStatus | null;
   durationMs?: number;
   location?: TestLocation;
-  /** Failure output captured for this node. */
+  /** Output captured for this node: its console output and failure details. */
   output: string[];
+}
+
+/** A node's output followed by its descendants' in tree order: a group shows the output of its tests. */
+export function nodeOutput(node: TestNode): string[] {
+  return [...node.output, ...node.children.flatMap(nodeOutput)];
+}
+
+/** A test's duration, or the sum of its children's for a group. */
+export function nodeDuration(node: TestNode): number | undefined {
+  if (node.durationMs !== undefined) return node.durationMs;
+  let sum = 0;
+  let any = false;
+  for (const c of node.children) {
+    const d = nodeDuration(c);
+    if (d !== undefined) {
+      sum += d;
+      any = true;
+    }
+  }
+  return any ? sum : undefined;
 }
 
 export interface TestCounts {
@@ -68,6 +88,19 @@ export class TestResults {
     return this.byId.get(id);
   }
 
+  /** The test at `path` has finished with a result. */
+  hasResult(path: readonly string[]): boolean {
+    const own = this.byId.get(path.join(SEP))?.own;
+    return !!own && own !== "running";
+  }
+
+  /** Puts lines before a test's output (what it printed, read after the run, goes before its failure). */
+  prependOutput(path: string[], lines: readonly string[]) {
+    const n = this.node(path);
+    n.output = [...lines, ...n.output].slice(0, MAX_OUTPUT_LINES);
+    this.version++;
+  }
+
   /** Finds a test by a suffix of its path (pytest failure headers name `Class.test`). */
   findBySuffix(suffix: string[]): TestNode | undefined {
     let best: TestNode | undefined;
@@ -79,6 +112,26 @@ export class TestResults {
       }
     }
     return best;
+  }
+
+  /** Moves the subtree at `from` to `into`, merging it with what is already there. */
+  move(from: string[], into: string[]) {
+    const source = this.byId.get(from.join(SEP));
+    if (!source || from.join(SEP) === into.join(SEP)) return;
+    this.version++;
+    const parent = from.length > 1 ? this.byId.get(from.slice(0, -1).join(SEP))?.children : this.roots;
+    parent?.splice(parent.indexOf(source), 1);
+    this.mergeInto(source, into);
+  }
+
+  private mergeInto(source: TestNode, into: string[]) {
+    this.byId.delete(source.id);
+    const target = this.node(into);
+    if (source.own && (!target.own || source.own === "failed")) target.own = source.own;
+    target.durationMs ??= source.durationMs;
+    target.location ??= source.location;
+    if (target.output.length === 0) target.output = source.output;
+    for (const child of source.children) this.mergeInto(child, [...into, child.name]);
   }
 
   apply(events: readonly TestEvent[]) {
@@ -102,7 +155,9 @@ export class TestResults {
         }
         case "location": {
           const n = this.node(e.path);
-          n.location ??= e.location;
+          // The first location wins, except that a place to search for (Ruby tests) gives way to a real one.
+          if (!n.location || (n.location.resolve === "rubyTest" && e.location.resolve !== "rubyTest"))
+            n.location = e.location;
           break;
         }
         case "output": {

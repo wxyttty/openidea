@@ -306,6 +306,15 @@ impl DbPanel {
             DbDriver::Postgres => "public".into(),
             DbDriver::Mysql => source.database.clone(),
             DbDriver::SqlServer => "dbo".into(),
+            // ClickHouse calls its databases schemas; the connected one is the default.
+            DbDriver::Clickhouse => {
+                if source.database.trim().is_empty() { "default".into() } else { source.database.clone() }
+            }
+            // Oracle's default schema is the login's own, upper-cased.
+            DbDriver::Oracle => source.user.to_uppercase(),
+            DbDriver::Snowflake => "PUBLIC".into(),
+            // JDBC reports its own namespace; the tree lists it once connected.
+            DbDriver::Jdbc => String::new(),
         }
     }
 

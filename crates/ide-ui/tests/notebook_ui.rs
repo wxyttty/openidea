@@ -25,8 +25,10 @@ fn open_panel(cx: &mut TestAppContext) -> (Entity<NotebookPanel>, PathBuf) {
     let root = temp.into_path();
     let config_dir = root.join("config");
     let data_dir = root.join("data");
+    let local_data_dir = root.join("local-data");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&local_data_dir).unwrap();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -43,6 +45,7 @@ fn open_panel(cx: &mut TestAppContext) -> (Entity<NotebookPanel>, PathBuf) {
         Arc::new(Host::new(HostConfig {
             config_dir: config_dir.clone(),
             data_dir: data_dir.clone(),
+            local_data_dir: local_data_dir.clone(),
             languages,
             syntax: Arc::new(OnceLock::new()),
             sink_for,

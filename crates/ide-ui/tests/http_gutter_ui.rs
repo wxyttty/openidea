@@ -48,6 +48,7 @@ fn a_response_can_be_built_from_a_streamed_body() {
         version: "HTTP/1.1".into(),
         headers: vec![("content-type".into(), "application/json".into())],
         content_type: Some("application/json".into()),
+        redirects: Vec::new(),
         body: Some("{\"ok\":true}".into()),
         size: 11.,
         truncated: false,

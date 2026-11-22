@@ -5,17 +5,27 @@
   display: flex;
   position: relative;
 }
+.group {
+  flex: 1;
+}
+.group:has(> :global([data-separator="active"][aria-orientation="vertical"])) * {
+  cursor: col-resize !important;
+}
+.group:has(> :global([data-separator="active"][aria-orientation="horizontal"])) * {
+  cursor: row-resize !important;
+}
 .editor {
-  flex: 1 1 50%;
+  flex: 1;
+  min-height: 0;
   min-width: 0;
   display: flex;
   flex-direction: column;
 }
-.mode-preview .editor {
-  display: none;
+.mode-preview > :global([data-group]) > :global([data-panel]:first-child) {
+  display: none !important;
 }
-.mode-split .editor {
-  border-right: 1px solid var(--border-editor-tabs, var(--border));
+.mode-preview > :global([data-group]) > :global([data-panel]:last-child) {
+  flex-grow: 1 !important;
 }
 
 .layoutActions {
@@ -28,16 +38,23 @@
 }
 
 .preview {
-  flex: 1 1 50%;
+  flex: 1;
+  min-height: 0;
   min-width: 0;
   position: relative;
   overflow: auto;
+  /* Positions are restored and synced by source line; Chromium's scroll anchoring
+     would keep a later block in view while images above it load. */
+  overflow-anchor: none;
   padding: 16px 28px 40vh;
   outline: none;
+  /* The preview sits on the editor background, so its text comes from the
+     editor scheme: with a light UI theme + dark editor scheme, the UI's
+     --fg would be black-on-black here. */
   background: var(--bg-editor, var(--bg-app));
-  color: var(--fg);
+  color: var(--fg-editor, var(--fg));
   font-family: var(--font-ui);
-  font-size: calc(14px + var(--markdown-font-zoom, 0px));
+  font-size: calc(var(--markdown-preview-font-size, 14px) + var(--markdown-font-zoom, 0px));
   line-height: 1.6;
   overflow-wrap: break-word;
 }
@@ -46,6 +63,16 @@
   padding-bottom: 0.3em;
   border-bottom: 1px solid var(--border-strong);
 }
+.preview :global([role="doc-footnote"]) {
+  display: flex;
+  gap: var(--space-2);
+}
+.preview :global([role="doc-footnote"] > div > :first-child) {
+  margin-block-start: 0;
+}
+.preview :global([role="doc-footnote"] > div > :last-child) {
+  margin-block-end: 0;
+}
 .preview :global(h1),
 .preview :global(h2),
 .preview :global(h3),
@@ -53,7 +80,7 @@
 .preview :global(h5),
 .preview :global(h6) {
   margin: 1.2em 0 0.6em;
-  color: var(--fg-strong);
+  color: var(--fg-editor, var(--fg-strong));
   line-height: 1.25;
 }
 .preview :global(h1) {
@@ -90,43 +117,85 @@
   font-size: 0.9em;
   padding: 0.1em 0.35em;
   border-radius: var(--radius-small);
-  background: var(--bg-elev);
+  background: var(--bg-editor-inline, var(--bg-elev));
 }
 .preview :global(pre) {
   padding: 10px 12px;
   border-radius: var(--radius-control);
-  background: var(--bg-elev);
+  background: var(--bg-editor-inline, var(--bg-elev));
   overflow: auto;
   line-height: 1.45;
 }
 .preview :global(pre code) {
   padding: 0;
   background: none;
-  font-size: calc(var(--fs-code) + var(--markdown-font-zoom, 0px));
+  font-size: 0.93em;
 }
 .preview :global(blockquote) {
   padding: 0 1em;
   border-left: 3px solid var(--border-strong);
-  color: var(--fg-secondary);
+  color: var(--fg-editor, var(--fg-secondary));
+  opacity: 0.8;
 }
 .preview :global(table) {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
 }
 .preview :global(th),
 .preview :global(td) {
   padding: 4px 10px;
   border: 1px solid var(--border-strong);
+  overflow-wrap: normal;
+}
+.preview :global(td code),
+.preview :global(td a) {
+  overflow-wrap: anywhere;
 }
 .preview :global(th) {
-  background: var(--bg-elev);
+  background: var(--bg-editor-inline, var(--bg-elev));
 }
 .preview :global(hr) {
   border: none;
   border-top: 1px solid var(--border-strong);
   margin: 1.5em 0;
 }
+.preview :global([role="doc-endnotes"] > hr) {
+  margin-block-end: 2.5em;
+}
 .preview :global(img) {
-  max-width: 100%;
+  max-width: calc(100% * var(--markdown-zoom-scale, 1));
+}
+.preview :global(img[data-natural-width]) {
+  width: calc(min(var(--image-width), 100%) * var(--markdown-zoom-scale, 1));
+  height: auto;
+}
+/* the wrapper takes the image's size, so the image fills it */
+.preview :global(.image-zoom) {
+  display: inline-block;
+  max-width: calc(100% * var(--markdown-zoom-scale, 1));
+}
+.preview :global(.image-zoom[data-natural-width]) {
+  width: calc(min(var(--image-width), 100%) * var(--markdown-zoom-scale, 1));
+}
+.preview :global(.image-zoom > .pan-zoom-content > img) {
+  width: 100%;
+  max-width: none;
+  height: auto;
+}
+.preview :global(.image-zoom[data-zoomed="true"]) {
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.preview :global(.image-zoom[data-zoomed="true"] img) {
+  -webkit-user-drag: none;
+}
+.preview :global(.image-zoom[data-dragging="true"]) {
+  cursor: grabbing;
 }
 .preview :global(ul.contains-task-list) {
   list-style: none;
@@ -139,48 +208,9 @@
   outline: 1px dashed var(--border-strong);
 }
 
-/* Lezer classHighlighter tokens in fenced code (same colours as documentation popups). */
-.preview :global(.tok-keyword),
-.preview :global(.tok-modifier),
-.preview :global(.tok-controlKeyword),
-.preview :global(.tok-operatorKeyword) {
-  color: var(--syn-keyword);
-}
-.preview :global(.tok-string),
-.preview :global(.tok-string2) {
-  color: var(--syn-string);
-}
-.preview :global(.tok-number),
-.preview :global(.tok-bool),
-.preview :global(.tok-atom) {
-  color: var(--syn-number);
-}
-.preview :global(.tok-typeName),
-.preview :global(.tok-className),
-.preview :global(.tok-namespace) {
-  color: var(--syn-type);
-}
-.preview :global(.tok-comment) {
-  color: var(--syn-comment);
-  font-style: italic;
-}
-.preview :global(.tok-meta),
-.preview :global(.tok-macroName) {
-  color: var(--syn-annotation);
-}
-.preview :global(.tok-propertyName) {
-  color: var(--syn-property);
-}
-.preview :global(.tok-variableName.tok-definition) {
-  color: var(--syn-function);
-}
-.preview :global(.tok-punctuation),
-.preview :global(.tok-operator) {
-  color: var(--syn-punct);
-}
-
 /* Mermaid diagrams: the source stays until the diagram is drawn, and next to an error. */
 .preview :global([data-mermaid]) {
+  position: relative;
   margin: 0 0 1em;
 }
 .preview :global([data-mermaid] > pre) {
@@ -189,11 +219,35 @@
 .preview :global([data-mermaid-state="ok"] > pre) {
   display: none;
 }
+.preview :global([align="left" i]) {
+  --mermaid-align: left;
+  --mermaid-margin-left: 0;
+  --mermaid-margin-right: auto;
+}
+.preview :global([align="right" i]) {
+  --mermaid-align: right;
+  --mermaid-margin-left: auto;
+  --mermaid-margin-right: 0;
+}
+.preview :global([align="center" i]),
+.preview :global(center) {
+  --mermaid-align: center;
+  --mermaid-margin-left: auto;
+  --mermaid-margin-right: auto;
+}
 .preview :global(.mermaid-output) {
-  overflow: hidden;
-  text-align: center;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: var(--mermaid-align, center);
+}
+.preview :global(.mermaid-output svg[data-natural-width]) {
+  display: block;
+  margin: 0 var(--mermaid-margin-right, auto) 0 var(--mermaid-margin-left, auto);
+  width: calc(min(var(--diagram-width), 100%) * var(--markdown-zoom-scale, 1));
+  height: auto;
 }
 .preview :global(.mermaid-output[data-zoomed="true"]) {
+  overflow: hidden;
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -212,4 +266,16 @@
   font-size: var(--fs-code);
   text-align: left;
   white-space: pre-wrap;
+}
+
+::highlight(markdown-selection-match) {
+  background-color: var(--bg-identifier-under-caret, color-mix(in srgb, var(--fg) 9%, transparent));
+}
+::highlight(markdown-find) {
+  background-color: var(--bg-search-match, color-mix(in srgb, var(--warning) 30%, transparent));
+  color: var(--fg-search-match, inherit);
+}
+::highlight(markdown-find-current) {
+  background-color: var(--bg-search-match-current, color-mix(in srgb, var(--warning) 48%, transparent));
+  color: var(--fg-search-match, inherit);
 }

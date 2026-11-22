@@ -3,11 +3,15 @@
  * nodes (filtering, sorting, IDEA's "Compact Middle Packages") and plans the
  * incremental refresh for `fsChanged` events. No React, no IPC.
  */
-import type { FileEntry } from "@/bindings";
+import type { FileEntry, OutlineItem } from "@/bindings";
 import { isIgnoredName } from "@/platform/ignoredNames";
 import { ancestorsWithin, isInside, isSameOrInside, nameOf, parentOf, relativeTo } from "./paths";
 
 export interface TreeOptions {
+  /** Applied only by the Unity pane, never persisted as a user preference. */
+  unityRoot?: string;
+  showUnityMeta: boolean;
+  showUnityGenerated: boolean;
   /** Show ignored names (`files.ignoredNames`: `.git`, `.DS_Store`, …). Dotfiles are always shown. */
   showHidden: boolean;
   /** Show entries matched by .gitignore / exclude settings (dimmed). */
@@ -22,6 +26,8 @@ export interface TreeOptions {
 export type SortKey = "name" | "type" | "modified";
 
 export const DEFAULT_TREE_OPTIONS: TreeOptions = {
+  showUnityMeta: false,
+  showUnityGenerated: false,
   showHidden: false,
   showExcluded: true,
   compact: true,
@@ -54,6 +60,8 @@ export interface ProjectNode {
   group?: boolean;
   /** Library sources: no new / rename / move / delete. */
   readOnly?: boolean;
+  /** A declaration of the file itself ("Show Members"); navigating lands on its `selection_range`. */
+  member?: OutlineItem;
 }
 
 export interface TreeModel {
@@ -67,7 +75,23 @@ export interface TreeModel {
 
 export type Listings = ReadonlyMap<string, readonly FileEntry[]>;
 
+export function unityPathVisible(path: string, opts: TreeOptions): boolean {
+  if (opts.unityRoot && path.startsWith(opts.unityRoot + "/")) {
+    const relative = path.slice(opts.unityRoot.length + 1);
+    // The full Project / Project Files panes retain access to generated files.
+    if (!opts.showUnityGenerated) {
+      if (/^(Library|Temp|Obj|obj|Logs|Build|Builds|UserSettings|\.vs|\.idea|\.vscode)(\/|$)/.test(relative))
+        return false;
+      if (!relative.includes("/") && /\.(csproj|sln|slnx|suo|user|pidb|booproj|unityproj)$/i.test(relative))
+        return false;
+    }
+    if (!opts.showUnityMeta && /\.meta$/i.test(relative)) return false;
+  }
+  return true;
+}
+
 export function isVisible(entry: FileEntry, opts: TreeOptions): boolean {
+  if (!unityPathVisible(entry.path, opts)) return false;
   // Ignored names are also excluded on the backend; only "Show Hidden" brings them back.
   if (isIgnoredName(entry.name)) return opts.showHidden;
   if (!opts.showExcluded && entry.ignored) return false;
@@ -75,6 +99,10 @@ export function isVisible(entry: FileEntry, opts: TreeOptions): boolean {
 }
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+export function compareNames(a: string, b: string): number {
+  return collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0);
+}
 
 /** Symlinks report the target's metadata; folders have size 0 (the entry has no target kind). */
 export const isDirEntry = (e: FileEntry) => e.kind === "dir" || (e.kind === "symlink" && e.size === 0);
@@ -101,7 +129,7 @@ export function sortEntries(
       const m = (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0);
       if (m) return m;
     }
-    return collator.compare(a.name, b.name) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    return compareNames(a.name, b.name);
   });
 }
 
@@ -247,6 +275,8 @@ export interface ExtraRoot {
   children?: readonly ExtraRoot[];
   detail?: string;
   readOnly?: boolean;
+  /** Listed above the project folder (IDEA's module group of the build). */
+  beforeProject?: boolean;
 }
 
 /** Key prefix of group nodes that show no folder ("External Libraries", an SDK). */
@@ -274,6 +304,42 @@ export function pathOfKey(key: string): string {
 /** The key of `path` in the same subtree as the node keyed `like`. */
 export function keyLike(like: string, path: string): string {
   return isLibKey(like) ? like.slice(0, like.indexOf(LIB_SEP, LIB_PREFIX.length) + 1) + path : path;
+}
+
+// ---------------------------------------------------------------------------
+// "Show Members": a file's declarations as rows below the file
+
+/**
+ * Key prefix of member rows (`\0sym:<file>\0<kind>:<name>#<n>`): never a path,
+ * so file operations resolving keys through `byKey` skip them naturally.
+ */
+export const MEMBER_PREFIX = "\0sym:";
+
+/** The key of a member row; `n` disambiguates same-named siblings. */
+export function memberKey(file: string, item: OutlineItem, n = 0): string {
+  return `${MEMBER_PREFIX}${file}\u0000${item.kind}:${item.name}${n ? `#${n}` : ""}`;
+}
+
+/** The member rows of a file's outline, nested symbols as their parent row's children. */
+export function memberNodes(file: string, items: readonly OutlineItem[]): ProjectNode[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const n = seen.get(item.name) ?? 0;
+    seen.set(item.name, n + 1);
+    return {
+      key: memberKey(file, item, n),
+      path: file,
+      chain: [],
+      label: item.name,
+      dir: false,
+      root: false,
+      entry: null,
+      ignored: false,
+      excluded: false,
+      symlink: false,
+      member: item,
+    };
+  });
 }
 
 /**
@@ -349,13 +415,24 @@ export function withExtraRoots(
       readOnly: true,
     };
     out.byKey.set(key, node);
-    const kids = (extra.children ?? []).map((c) => add(c, key, ro)).filter((n): n is ProjectNode => !!n);
-    out.children.set(key, kids);
+    // Deepest folders first: a module folder nested in a sibling's (`billing/modules/core`
+    // in `billing`) would otherwise already be keyed by the sibling's listing and dropped.
+    const children = extra.children ?? [];
+    const depth = (c: ExtraRoot) => c.path?.split("/").length ?? 0;
+    const built: (ProjectNode | null)[] = [];
+    for (const i of children.map((_, i) => i).sort((a, b) => depth(children[b]!) - depth(children[a]!)))
+      built[i] = add(children[i]!, key, ro);
+    out.children.set(
+      key,
+      built.filter((n): n is ProjectNode => !!n),
+    );
     return node;
   };
+  let before = 0;
   for (const extra of extras) {
     const node = add(extra, null, false);
-    if (node) out.roots.push(node);
+    if (node && extra.beforeProject) out.roots.splice(before++, 0, node);
+    else if (node) out.roots.push(node);
   }
   return out;
 }
@@ -507,7 +584,12 @@ export interface RefreshPlan {
 }
 
 export function planRefresh(
-  event: { created: readonly string[]; modified: readonly string[]; removed: readonly string[] },
+  event: {
+    created: readonly string[];
+    modified: readonly string[];
+    removed: readonly string[];
+    ignoreRules?: readonly string[];
+  },
   loaded: ReadonlySet<string>,
 ): RefreshPlan {
   const reload = new Set<string>();
@@ -528,6 +610,7 @@ export function planRefresh(
       drop.delete(p);
     }
   }
+  for (const dir of loadedList) if (event.ignoreRules?.some((root) => isSameOrInside(dir, root))) reload.add(dir);
   for (const d of drop) reload.delete(d);
   // A reloaded parent may report the folder as present again; keep its descendants then.
   return { reload: [...reload], drop: [...drop] };

@@ -36,6 +36,17 @@ export function methodStop(outline: readonly OutlineItem[], caret: Pos, dir: 1 |
   return null;
 }
 
+/** The outermost type around `caret`, looking through namespaces and packages (C#, Kotlin scripts). */
+export function topLevelTypeAt(outline: readonly OutlineItem[], caret: Pos): OutlineItem | null {
+  let level: readonly OutlineItem[] = outline;
+  for (;;) {
+    const hit = level.find((i) => inside(i, caret));
+    if (!hit) return null;
+    if (hit.kind !== "namespace" && hit.kind !== "package") return TYPES.has(hit.kind) ? hit : null;
+    level = hit.children;
+  }
+}
+
 export interface CaretMember {
   /** Innermost method at the caret. */
   method: OutlineItem | null;
@@ -90,8 +101,28 @@ export function methodsInType(outline: readonly OutlineItem[], item: HierarchyIt
   return exact.length ? exact : named;
 }
 
+/**
+ * Methods of the type declared at `item` that override `signature` (`save(T, int)` as jdtls names
+ * it): those with the same signature, or `null` when one with the same name has another signature
+ * (`save(Order)` for a generic `save(T)`) and only the server can tell whether it overrides.
+ */
+export function overridersInType(
+  outline: readonly OutlineItem[],
+  item: HierarchyItem,
+  signatureName: string,
+): OutlineItem[] | null {
+  const type = typeOf(outline, item);
+  if (!type) return null;
+  const bare = baseName(signatureName);
+  const named = type.children.filter((c) => METHODS.has(c.kind) && baseName(c.name) === bare);
+  const exact = named.filter((c) => signature(c.name) === signature(signatureName));
+  return named.length > exact.length ? null : exact;
+}
+
 export interface SuperDeps {
   supertypes: (path: string, pos: Pos) => Promise<HierarchyItem[]>;
+  /** Direct subtypes, when the type hierarchy answers it (fallback for implementation requests). */
+  subtypes?: (path: string, pos: Pos) => Promise<HierarchyItem[]>;
   outline: (path: string) => Promise<OutlineItem[]>;
 }
 

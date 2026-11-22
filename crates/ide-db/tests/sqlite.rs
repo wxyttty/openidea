@@ -1,7 +1,10 @@
 //! Introspection, queries and table edits against a real SQLite file.
 
 use ide_core::{CancellationToken, IdeResult};
-use ide_db::{CellValue, DataSource, DbDriver, DbManager, DbOptions, DbProperty, DbRowEdit, DbTableKind, SortKey};
+use ide_db::{
+    CellValue, DataSource, DbDriver, DbManager, DbOptions, DbProperty, DbRowEdit, DbSchemaSelection, DbTableKind,
+    DbVisibilityChange, QueryResult, SortKey,
+};
 
 async fn setup() -> (tempfile::TempDir, DbManager) {
     let tmp = tempfile::tempdir().unwrap();
@@ -124,6 +127,28 @@ async fn queries_with_limits_nulls_and_blobs() -> IdeResult<()> {
 }
 
 #[tokio::test]
+async fn a_later_page_returns_only_its_rows() -> IdeResult<()> {
+    let (_tmp, db) = setup().await;
+    let c = CancellationToken::new();
+    let sql = "SELECT id FROM users ORDER BY id";
+    let ids = |r: &QueryResult| r.rows.iter().map(|row| row[0].clone().unwrap()).collect::<Vec<_>>();
+
+    let second = db.execute_from("s1", sql, 1, 1, &c, None).await?;
+    assert_eq!(ids(&second), vec!["2"]);
+    assert!(second.has_more);
+    assert_eq!(second.columns.len(), 1);
+
+    let last = db.execute_from("s1", sql, 2, 5, &c, None).await?;
+    assert_eq!(ids(&last), vec!["3"]);
+    assert!(!last.has_more);
+
+    let past = db.execute_from("s1", sql, 9, 5, &c, None).await?;
+    assert!(past.rows.is_empty() && !past.has_more);
+    assert_eq!(past.columns.len(), 1, "columns of a page past the end come from the prepared statement");
+    Ok(())
+}
+
+#[tokio::test]
 async fn pages_sorts_filters_and_edits_in_a_transaction() -> IdeResult<()> {
     let (_tmp, db) = setup().await;
     let c = CancellationToken::new();
@@ -197,7 +222,7 @@ async fn count(db: &DbManager) -> String {
 async fn manual_commit_keeps_a_transaction_until_commit_or_rollback() -> IdeResult<()> {
     let (_tmp, db) = setup().await;
     let c = CancellationToken::new();
-    db.set_manual_commit("s1", true).await;
+    db.set_manual_commit("s1", true).await.unwrap();
     db.execute("s1", "INSERT INTO users (name) VALUES ('dee')", 1, &c).await?;
     // The session sees its own change.
     assert_eq!(count(&db).await, "4");
@@ -208,13 +233,79 @@ async fn manual_commit_keeps_a_transaction_until_commit_or_rollback() -> IdeResu
     db.finish_transaction("s1", true).await?;
     // Leaving manual mode rolls back what is still open.
     db.execute("s1", "DELETE FROM users", 1, &c).await?;
-    db.set_manual_commit("s1", false).await;
+    db.set_manual_commit("s1", false).await.unwrap();
     assert_eq!(count(&db).await, "4");
     // Disconnecting with an open transaction does not hang.
-    db.set_manual_commit("s1", true).await;
+    db.set_manual_commit("s1", true).await.unwrap();
     db.execute("s1", "DELETE FROM users", 1, &c).await?;
     db.disconnect("s1").await;
     assert_eq!(count(&db).await, "4");
+    Ok(())
+}
+
+#[tokio::test]
+async fn visibility_edits_preserve_the_held_transaction() -> IdeResult<()> {
+    let (tmp, db) = setup().await;
+    let c = CancellationToken::new();
+    db.set_manual_commit("s1", true).await?;
+    db.execute("s1", "INSERT INTO users (name) VALUES ('dee')", 1, &c).await?;
+    assert_eq!(count(&db).await, "4");
+
+    let mut source = db.source("s1")?;
+    source.introspection.all_schemas = false;
+    source.introspection.schemas.clear();
+    db.save_sources(vec![source.clone()]).await?;
+    assert!(db.is_connected("s1"), "saving rules must keep the active connection");
+    assert_eq!(count(&db).await, "4", "the held transaction must still see its uncommitted row");
+    db.save_source_visibility(
+        "s1",
+        &["main".into()],
+        DbVisibilityChange::Schemas { selection: DbSchemaSelection { all: true, names: vec![] } },
+    )?;
+    assert!(db.source("s1")?.introspection.all_schemas);
+    assert_eq!(count(&db).await, "4", "the scoped save must keep the live transaction");
+
+    db.reconcile_sources().await;
+    let root = tmp.path();
+    let ssh = std::sync::Arc::new(ide_ssh::SshManager::new(root.join("ssh-passwords.json")));
+    let other = DbManager::new(root.to_path_buf(), root.join("passwords.json"), root.join("history.json"), ssh);
+    source = db.source("s1")?;
+    source.introspection.object_filter = "user*".into();
+    other.save_sources(vec![source.clone()]).await?;
+    assert!(db.reconcile_sources().await);
+    assert_eq!(count(&db).await, "4", "a visibility edit from another window must keep the transaction");
+    db.finish_transaction("s1", true).await?;
+    assert_eq!(count(&db).await, "4");
+
+    source.introspection.show_system = true;
+    db.save_sources(vec![source]).await?;
+    assert!(!db.is_connected("s1"), "raw metadata option changes keep their invalidation path");
+    Ok(())
+}
+
+#[tokio::test]
+async fn visibility_save_does_not_mask_an_unreconciled_connection_edit() -> IdeResult<()> {
+    let (tmp, db) = setup().await;
+    let first = db.source("s1")?;
+    let second = DataSource { id: "s2".into(), name: "Another source".into(), ..first.clone() };
+    db.save_sources(vec![first.clone(), second.clone()]).await?;
+    db.reconcile_sources().await;
+    assert!(db.is_connected("s1"));
+
+    let root = tmp.path();
+    let ssh = std::sync::Arc::new(ide_ssh::SshManager::new(root.join("ssh-passwords.json")));
+    let external = DbManager::new(root.to_path_buf(), root.join("passwords.json"), root.join("history.json"), ssh);
+    external.save_sources(vec![DataSource { read_only: true, ..first }, second]).await?;
+    db.save_source_visibility(
+        "s2",
+        &["main".into()],
+        DbVisibilityChange::Schemas { selection: DbSchemaSelection { all: false, names: vec![] } },
+    )?;
+
+    assert!(db.is_connected("s1"));
+    assert!(db.reconcile_sources().await);
+    assert!(!db.is_connected("s1"));
+    assert!(!db.source("s2")?.introspection.all_schemas);
     Ok(())
 }
 
@@ -252,11 +343,11 @@ async fn ddl_of_tables_and_views() -> IdeResult<()> {
 async fn explains_queries_without_running_them() -> IdeResult<()> {
     let (_tmp, db) = setup().await;
     let c = CancellationToken::new();
-    let plan = db.explain("s1", "SELECT * FROM users WHERE id > 1 ORDER BY note;", &c).await?;
+    let plan = db.explain("s1", "SELECT * FROM users WHERE id > 1 ORDER BY note;", &c, None).await?;
     let ops: Vec<_> = plan.iter().map(|n| n.operation.as_str()).collect();
     assert_eq!(ops, vec!["Index Scan", "Order By"]);
     assert!(plan[0].params.starts_with("table: users;"), "{}", plan[0].params);
-    db.explain("s1", "DELETE FROM users", &c).await?;
+    db.explain("s1", "DELETE FROM users", &c, None).await?;
     assert_eq!(count(&db).await, "3");
     Ok(())
 }
@@ -316,5 +407,33 @@ async fn applies_driver_properties_and_the_startup_script_on_connect() -> IdeRes
     let url = format!("jdbc:sqlite:{}", tmp.path().join("app.db").display());
     db.save_sources(vec![DataSource { url_only: true, url, file: None, ..s }]).await?;
     assert_eq!(db.schemas("s1").await?, vec!["main"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn data_sources_edited_on_disk_close_their_connections() -> IdeResult<()> {
+    let (tmp, db) = setup().await;
+    std::fs::File::create(tmp.path().join("other.db")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _watch = db.watch_sources(Box::new(move || _ = tx.send(())))?;
+    db.pool("s1").await?;
+    assert_eq!(db.connected(), vec!["s1"]);
+
+    // Our own save is no edit on disk.
+    let mut sources = db.sources()?;
+    sources[0].name = "renamed".into();
+    db.save_sources(sources.clone()).await?;
+    assert!(!db.reconcile_sources().await);
+
+    // Edited outside the IDE (by hand, by an agent): the watcher reports it, and the
+    // connection made with the old settings closes.
+    db.pool("s1").await?;
+    sources[0].file = Some("other.db".into());
+    ide_db::source::save(tmp.path(), &sources)?;
+    rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the watcher reports the edit");
+    assert!(db.reconcile_sources().await);
+    assert!(db.connected().is_empty());
+    assert_eq!(db.sources()?[0].file.as_ref().map(|f| f.0.clone()), Some("other.db".into()));
+    assert!(!db.reconcile_sources().await);
     Ok(())
 }

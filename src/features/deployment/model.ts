@@ -1,5 +1,6 @@
 /** Pure helpers of the deployment feature: target paths, sync defaults, reports, remote paths. */
-import type { SyncAction, SyncEntry, SyncStatus, TransferReport } from "@/platform/ipc";
+import { tx } from "@/platform/i18n";
+import type { ResolvedMapping, SyncAction, SyncEntry, SyncStatus, TransferReport } from "@/platform/ipc";
 import type { DeploymentServerValid, DeploymentSettingsValid, SshAuthValid } from "@/platform/remoteSettings";
 
 /** Which part had focus last: the project view's selection or the editor's file is the target. */
@@ -15,24 +16,35 @@ export function pathsFromArg(arg: unknown): string[] | null {
 }
 
 /**
- * Files an action works on: the paths passed by a menu, else the project view
+ * Files an action works on: the paths passed by a menu, else the Commit / Local
+ * Changes selection while that window is focused, else the project view
  * selection when it had focus last, else the active editor's file. Paths
  * outside the project are dropped.
  */
 export function targetPaths(
   arg: unknown,
-  ctx: { part: FocusedPart; selection: readonly string[]; editorPath: string | null; projectRoot: string | null },
+  ctx: {
+    part: FocusedPart;
+    selection: readonly string[];
+    /** Absolute paths from the Commit/Local Changes tree while it has focus. */
+    changesSelection?: readonly string[];
+    editorPath: string | null;
+    projectRoot: string | null;
+  },
 ): string[] {
   const passed = pathsFromArg(arg);
+  const changes = ctx.changesSelection?.length ? [...ctx.changesSelection] : null;
   const picked = passed
     ? passed
-    : ctx.part === "project" && ctx.selection.length
-      ? [...ctx.selection]
-      : ctx.editorPath
-        ? [ctx.editorPath]
-        : ctx.selection.length && ctx.part !== "editor"
-          ? [...ctx.selection]
-          : [];
+    : changes
+      ? changes
+      : ctx.part === "project" && ctx.selection.length
+        ? [...ctx.selection]
+        : ctx.editorPath
+          ? [ctx.editorPath]
+          : ctx.selection.length && ctx.part !== "editor"
+            ? [...ctx.selection]
+            : [];
   const root = ctx.projectRoot;
   if (!root) return [];
   const inside = picked.filter((p) => p === root || p.startsWith(`${root}/`));
@@ -87,6 +99,43 @@ export function resolveServer(settings: DeploymentSettingsValid, id: string | nu
 
 export const serverLabel = (s: Pick<DeploymentServerValid, "id" | "name">) => s.name.trim() || s.id;
 
+/** The default target when it is a server group: its name and servers, in upload order. */
+export function defaultGroup(
+  settings: DeploymentSettingsValid,
+): { name: string; servers: DeploymentServerValid[] } | null {
+  const group = settings.groups.find((g) => g.id === settings.defaultServer);
+  if (!group) return null;
+  const servers = group.servers.flatMap((id) => settings.servers.find((s) => s.id === id) ?? []);
+  return { name: group.name.trim() || group.id, servers };
+}
+
+/** Transfer entries of the Deployment menu: named after the default server, choosers when there are several. */
+export function transferMenuEntries(settings: DeploymentSettingsValid): { action: string; label?: string }[] {
+  // A default group uploads to each of its servers; downloads and syncs pick one server.
+  const group = defaultGroup(settings);
+  if (group)
+    return [
+      { action: "deployment.uploadToDefault", label: tx`Upload to ${group.name}` },
+      { action: "deployment.uploadTo" },
+      { action: "deployment.downloadFrom" },
+      { action: "deployment.syncWith" },
+    ];
+  const target = resolveServer(settings, null);
+  const name = target && serverLabel(target);
+  const named = target
+    ? [
+        { action: "deployment.uploadToDefault", label: tx`Upload to ${name}` },
+        { action: "deployment.downloadFromDefault", label: tx`Download from ${name}` },
+        { action: "deployment.syncWithDefault", label: tx`Sync with Deployed to ${name}…` },
+      ]
+    : [];
+  const choosers =
+    settings.servers.length > 1 || !target
+      ? [{ action: "deployment.uploadTo" }, { action: "deployment.downloadFrom" }, { action: "deployment.syncWith" }]
+      : [];
+  return [...named, ...choosers];
+}
+
 export interface ReportSummary {
   level: "info" | "warning" | "error";
   /** English source text with `{n}` / `{server}` placeholders (translated by the caller). */
@@ -129,28 +178,17 @@ export function remoteName(path: string): string {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1) || "/";
 }
 
-/**
- * The local project path a remote path is deployed from, through the server's
- * mappings (the most specific deployment path wins); null when not mapped.
- * `root` is the server's root path as resolved on the host.
- */
-export function localPathForRemote(
-  remotePath: string,
-  root: string,
-  mappings: DeploymentServerValid["mappings"],
-  projectRoot: string,
-): string | null {
+/** The most specific backend-resolved mapping of a remote path; null when unmapped. */
+export function localPathForRemote(remotePath: string, mappings: readonly ResolvedMapping[]): string | null {
   let best: { len: number; local: string } | null = null;
   for (const m of mappings) {
-    const deployed = m.deployment.startsWith("/")
-      ? m.deployment.replace(/\/+$/, "") || "/"
-      : joinRemote(root, m.deployment);
+    const deployed = m.deployment;
     const within =
       remotePath === deployed || remotePath.startsWith(deployed === "/" ? "/" : `${deployed}/`) ? deployed : null;
     if (within === null || (best && best.len >= deployed.length)) continue;
     const rest = remotePath.slice(deployed.length).replace(/^\/+/, "");
-    const base = joinRemote(projectRoot, m.local);
-    best = { len: deployed.length, local: joinRemote(base, rest) };
+    if (rest.split("/").some((part) => part === "." || part === "..")) return null;
+    best = { len: deployed.length, local: joinRemote(m.local, rest) };
   }
   return best?.local ?? null;
 }
@@ -166,6 +204,7 @@ export function sshRemedy(kind: string | undefined, message: string, auth: SshAu
   if (kind !== "permissionDenied") return null;
   if (/^SSH host key .* has changed/.test(message)) return null;
   if (/^SSH (password|key passphrase) required|^cannot decrypt SSH key/.test(message)) return "secret";
+  if (/^FTP (password required|authentication failed)/.test(message)) return "secret";
   // With OpenSSH config + agent there is nothing to type unless a key is encrypted.
   if (/^SSH authentication failed/.test(message)) return auth === "openSsh" ? null : "secret";
   return null;

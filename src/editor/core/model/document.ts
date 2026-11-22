@@ -26,9 +26,9 @@ import {
   useEditorRegistry,
   type EditorDocContext,
 } from "@/editor/api";
-import { isVirtualUri } from "@/platform/virtualDocs";
+import { isUntitledUri, isVirtualUri } from "@/platform/virtualDocs";
 import { DocSync, type Scheduler, frameScheduler } from "../sync/DocSync";
-import type { DocBackend, LanguageInfo } from "../backend";
+import type { DocBackend, DocDirtyEvent, LanguageInfo } from "../backend";
 import {
   findLanguageDescription,
   languageInfo,
@@ -36,6 +36,7 @@ import {
   loadSupport,
   loadedSupport,
   commentTokens,
+  uiModeForPath,
 } from "../cm/languages";
 import { foldEffect } from "@codemirror/language";
 import { backendFolds, setBackendFolds } from "../cm/folding";
@@ -61,6 +62,33 @@ import {
 import { setMethodLines, softWrapActive } from "../cm/prefs";
 import type { EditorSlot } from "./slot";
 import { tx } from "@/platform/i18n";
+import { logError } from "@/platform/errorLog";
+import { WorkspaceHistory } from "./workspaceHistory";
+
+/**
+ * Whether a comment fold is the file header (as opposed to a documentation
+ * comment). Both conditions must hold: the fold sits at the top of the file
+ * (its first line is at or before the first code line) and that line starts
+ * with a comment token. Otherwise ordinary documentation comments further down
+ * would follow the file-header toggle. A Python module docstring opens with
+ * quotes, so it is documentation even though it is the first thing in the file.
+ *
+ * Line numbers are 1-based; `firstCodeLine` is 0 when the file has no code line
+ * (only blanks / shebang), in which case nothing is a header.
+ */
+export function isFileHeaderFold(
+  foldLine: number,
+  firstCodeLine: number,
+  line: string,
+  lineComment: string | null | undefined,
+  blockComment: readonly [string, string] | null | undefined,
+): boolean {
+  if (firstCodeLine === 0 || foldLine > firstCodeLine) return false;
+  const text = line.trimStart();
+  if (lineComment && text.startsWith(lineComment)) return true;
+  if (blockComment && text.startsWith(blockComment[0])) return true;
+  return false;
+}
 
 export type Banner = "binary" | "tooLarge" | "readOnly" | "library" | null;
 
@@ -68,6 +96,9 @@ export type Banner = "binary" | "tooLarge" | "readOnly" | "library" | null;
 export interface DocAttachmentTarget {
   /** Applies changes that are already in the model (another view / the backend). */
   applyExternal(changes: ChangeSet, annotations: Annotation<unknown>[]): void;
+  /** Secondary views that share the text tab's undo history hand it over as tabs open/close. */
+  historyState?(): EditorState | null;
+  adoptHistory?(state: EditorState): void;
 }
 
 export interface DocMeta {
@@ -76,9 +107,12 @@ export interface DocMeta {
   language: string;
   uiMode: string | null;
   encoding: string;
+  hasBom: boolean;
   lineEnding: LineEnding;
   readOnly: boolean;
   dirty: boolean;
+  /** "Reload with Encoding" can re-decode this document's source bytes. */
+  canReloadEncoding: boolean;
   banner: Banner;
   indent: { tabSize: number; insertSpaces: boolean };
 }
@@ -89,6 +123,11 @@ export const useDocMeta = create<Record<string, DocMeta>>(() => ({}));
 export const useOutline = create<Record<string, OutlineItem[]>>(() => ({}));
 
 const REFRESH_DELAY = 450;
+/**
+ * Languages whose stream mode works from word lists, so the grammar's highlights are drawn
+ * over it: Kotlin declaration roles, Shell commands, function names and `local`.
+ */
+const GRAMMAR_SUPPLEMENTED = new Set(["kotlin", "shellscript"]);
 function bannerFor(info: DocumentInfo): Banner {
   // Virtual documents (library classes) get their own notice from the editor area.
   if (info.uri) return null;
@@ -195,7 +234,7 @@ export function saveCleanupChanges(
 export class DocModel {
   readonly doc: DocId;
   /** File path, or the URI of a virtual (read-only, language-server provided) document. */
-  readonly path: string;
+  path: string;
   readonly virtual: boolean;
   readonly sync: DocSync;
   readonly slots = new Set<EditorSlot>();
@@ -215,8 +254,14 @@ export class DocModel {
   /** Bumped by every change (local or remote). */
   changeCounter = 0;
   closed = false;
+  /**
+   * Tab moved to an auxiliary editor window that already holds this document:
+   * release must drop the local model and backend ref without autosave / keep-dirty.
+   */
+  handoffRelease = false;
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private saving: Promise<void> = Promise.resolve();
+  private backendDirty: DocDirtyEvent | null = null;
   private meta: DocMeta;
 
   constructor(
@@ -225,7 +270,7 @@ export class DocModel {
   ) {
     this.doc = info.id;
     this.path = info.path;
-    this.virtual = !!info.uri;
+    this.virtual = !!info.uri && !isUntitledUri(info.path);
     this.info = languageInfo(info.language);
     this.editorconfig = info.editorconfig ?? null;
     // `large`: the backend skips LSP and syntax trees for it; heavy UI features follow.
@@ -242,10 +287,12 @@ export class DocModel {
       language: info.language,
       uiMode: uiMode ?? this.desc?.name ?? null,
       encoding: info.encoding,
+      hasBom: info.hasBom,
       lineEnding: info.lineEnding,
       // Library sources (External Libraries) open read-only, like IDEA's.
       readOnly: info.readOnly || (!this.virtual && isLibraryPath(info.path)),
       dirty: info.dirty,
+      canReloadEncoding: info.canReloadEncoding,
       banner: bannerFor(info),
       indent: { tabSize: 4, insertSpaces: true },
     };
@@ -260,14 +307,31 @@ export class DocModel {
         snapshot: () => manager.backend.snapshot(this.doc),
       },
       {
-        applyRemote: (cs) => this.applyRemote(cs),
-        onDiscarded: () =>
+        applyRemote: (cs, grouped) => this.applyRemote(cs, grouped),
+        onLocalCommitted: (baseVersion, version, changes) => {
+          const eventChanges: Array<{ from: number; to: number; insert: string }> = [];
+          changes.iterChanges((from, to, _fromB, _toB, inserted) => {
+            eventChanges.push({ from, to, insert: inserted.toString() });
+          });
+          _emitEditorEvent({
+            type: "docChanged",
+            doc: this.doc,
+            path: this.path,
+            baseVersion,
+            version,
+            changes: eventChanges,
+          });
+        },
+        onSynced: () => this.applyBackendClean(),
+        onDiscarded: (reason) => {
+          logError(`document ${this.path}: unsaved edits replaced by the file's content`, reason);
           manager.notify({
             level: "warning",
             title: "Editor resynchronised",
             body: tx`Some unsaved edits to ${this.path} could not be applied and were replaced by the file's current content.`,
-          }),
-        onError: (e) => console.warn(`document ${this.path}: sync error`, e),
+          });
+        },
+        onError: (e) => logError(`document ${this.path}: sync error`, e),
       },
       manager.scheduler,
     );
@@ -281,6 +345,26 @@ export class DocModel {
   setMeta(patch: Partial<DocMeta>) {
     this.meta = { ...this.meta, ...patch };
     if (!this.closed) useDocMeta.setState({ [this.path]: this.meta });
+  }
+
+  onBackendDirty(event: DocDirtyEvent) {
+    if (this.backendDirty && event.version < this.backendDirty.version) return;
+    this.backendDirty = event;
+    if (event.dirty) {
+      if (!this.meta.dirty) this.setMeta({ dirty: true });
+    } else this.applyBackendClean();
+  }
+
+  private applyBackendClean() {
+    const event = this.backendDirty;
+    if (event && !event.dirty) this.markClean(event.version);
+  }
+
+  private markClean(version: number) {
+    // A clean event can arrive before an edit acknowledgement or after a newer edit.
+    if (!this.meta.dirty || !this.sync.idle || this.sync.serverVersion !== version) return;
+    this.modified.clear();
+    this.setMeta({ dirty: false });
   }
 
   ctx(): EditorDocContext {
@@ -305,6 +389,8 @@ export class DocModel {
   }
 
   removeSlot(slot: EditorSlot) {
+    if (this.slots.size === 1)
+      for (const attachment of this.attachments) attachment.adoptHistory?.(slot.currentState());
     this.slots.delete(slot);
     if (this.lastFocused === slot) this.lastFocused = null;
     if (!this.inUse()) this.manager.release(this);
@@ -343,14 +429,14 @@ export class DocModel {
     this.scheduleRefresh();
   }
 
-  private applyRemote(cs: ChangeSet) {
+  private applyRemote(cs: ChangeSet, grouped = false) {
     this.modified.map(cs);
     this.changeCounter++;
     const primary = this.primarySlot();
     for (const s of this.slots)
-      s.applyExternal(cs, [remoteChange.of(true), Transaction.addToHistory.of(s === primary)]);
+      s.applyExternal(cs, [remoteChange.of(true), Transaction.addToHistory.of(!grouped && s === primary)]);
     // Without a tab, the first attached view keeps backend edits (Replace in Files…) undoable.
-    let first = !primary;
+    let first = !grouped && !primary;
     for (const a of this.attachments) {
       a.applyExternal(cs, [remoteChange.of(true), Transaction.addToHistory.of(first)]);
       first = false;
@@ -390,7 +476,7 @@ export class DocModel {
 
   /** Per-file indentation chosen from the status bar; wins over settings until the file is closed. */
   indentOverride: { tabSize: number; insertSpaces: boolean } | null = null;
-  /** Indentation detected in the file's text at open time. */
+  /** Indentation detected in the file's text at open time and after Reformat Code. */
   detectedIndent: { insertSpaces: boolean; size?: number } | null = null;
   /** Last tree-sitter highlighting, for slots opened before the next refresh. */
   private highlights: { counter: number; value: SyntaxHighlights } | null = null;
@@ -401,6 +487,30 @@ export class DocModel {
 
   effectiveIndent() {
     return this.indentOverride ?? effectiveIndent(this.settings(), this.info, this.editorconfig, this.detectedIndent);
+  }
+
+  /**
+   * Indentation explicit reformat requests use (`formatIndentFacet`): the Code Style
+   * (EditorConfig included) without the file's detected indents, as in IDEA, where
+   * detection only affects editing. Otherwise a file indented differently from the
+   * Code Style reformats to its own indent and other files to the Code Style's.
+   * An indent chosen for this file in the status bar still applies.
+   */
+  formatIndent() {
+    return this.indentOverride ?? effectiveIndent(this.settings(), this.info, this.editorconfig, null);
+  }
+
+  /**
+   * Detects the indents again after Reformat Code rewrote them: tabs written by
+   * the formatter then render at the Code Style tab size and new lines indent
+   * like them, instead of following the indents detected at open time.
+   */
+  redetectIndent() {
+    const detected = detectIndent(this.sync.localText.sliceString(0, 200_000));
+    const current = this.detectedIndent;
+    if (detected?.insertSpaces === current?.insertSpaces && detected?.size === current?.size) return;
+    this.detectedIndent = detected;
+    this.applySettings();
   }
 
   /** Soft wraps toggled for this file (wins over settings until the file is closed). */
@@ -416,6 +526,18 @@ export class DocModel {
     this.applySettings();
   }
 
+  /** Rendered doc comments toggled for this file (wins over settings until the file is closed). */
+  renderedDocsOverride: boolean | null = null;
+
+  renderedDocsOn(): boolean {
+    return this.renderedDocsOverride ?? prefsOf(this.settings()).appearance.renderDocComments;
+  }
+
+  toggleRenderedDocs() {
+    this.renderedDocsOverride = !this.renderedDocsOn();
+    this.applySettings();
+  }
+
   setIndent(indent: { tabSize: number; insertSpaces: boolean }) {
     this.indentOverride = indent;
     this.applySettings();
@@ -427,7 +549,7 @@ export class DocModel {
     const indent = this.effectiveIndent();
     this.setMeta({ indent: { tabSize: indent.tabSize, insertSpaces: indent.insertSpaces } });
     const effects = [
-      compartments.indent.reconfigure(indentExtension(indent)),
+      compartments.indent.reconfigure(indentExtension(indent, this.formatIndent())),
       compartments.wrap.reconfigure(wrapExtension(editor, this.path, this.softWrapOverride)),
       compartments.sticky.reconfigure(stickyExtension(editor)),
       compartments.font.reconfigure(fontExtension(editor)),
@@ -444,6 +566,7 @@ export class DocModel {
           info: this.info,
           readOnly: this.meta.readOnly,
           wrapOverride: this.softWrapOverride,
+          renderedDocsOverride: this.renderedDocsOverride,
         }),
       ),
     ];
@@ -479,6 +602,7 @@ export class DocModel {
             info: this.info,
             readOnly,
             wrapOverride: this.softWrapOverride,
+            renderedDocsOverride: this.renderedDocsOverride,
           }),
         ),
       ]);
@@ -507,8 +631,7 @@ export class DocModel {
     const [folds, outline, highlights] = await Promise.allSettled([
       backend.folding(this.doc),
       backend.outline(this.doc),
-      // Without a CodeMirror mode, colours come from the grammar's tree-sitter query.
-      this.desc ? null : backend.highlights(this.doc),
+      !this.desc || GRAMMAR_SUPPLEMENTED.has(this.meta.language) ? backend.highlights(this.doc) : null,
     ]);
     if (this.closed) return;
     if (counter !== this.changeCounter) {
@@ -540,17 +663,23 @@ export class DocModel {
     for (const s of this.slots) {
       const state = s.currentState();
       const folds = state.field(backendFolds, false) ?? [];
-      const firstCode = (() => {
+      const info = this.info;
+      const firstCodeLine = (() => {
         for (let n = 1; n <= state.doc.lines; n++) {
           const t = state.doc.line(n).text.trim();
-          if (t && !t.startsWith("#!")) return state.doc.line(n).from;
+          if (t && !t.startsWith("#!")) return n;
         }
         return 0;
       })();
       const chosen = folds.filter((r) => {
         if (r.kind === "imports") return f.imports;
         if (r.kind !== "comment") return false;
-        const header = state.doc.lineAt(r.from).from <= firstCode;
+        // A file header must sit at the top AND start with a comment token.
+        // Keeping the position check keeps ordinary doc comments further down
+        // under "documentation comments"; the token check keeps a Python module
+        // docstring (which opens with quotes) out of the file-header toggle.
+        const first = state.doc.lineAt(r.from);
+        const header = isFileHeaderFold(first.number, firstCodeLine, first.text, info?.lineComment, info?.blockComment);
         return header ? f.fileHeader : f.docComments;
       });
       const effects: StateEffect<unknown>[] = chosen.map((r) => foldEffect.of({ from: r.from, to: r.to }));
@@ -565,10 +694,9 @@ export class DocModel {
 
   // --- saving -----------------------------------------------------------------
 
-  save(reason: "explicit" | "auto"): Promise<void> {
+  save(reason: "explicit" | "auto" | "exact"): Promise<void> {
     const run = async () => {
-      if (this.closed || this.meta.readOnly) return;
-      if (reason === "auto" && !this.meta.dirty) return;
+      if (this.closed || this.meta.readOnly || !this.meta.dirty) return;
       const slot = this.primarySlot();
       if (reason === "explicit") {
         for (const p of _saveParticipants()) {
@@ -580,7 +708,7 @@ export class DocModel {
         }
       }
       const files: FileSettings | undefined = this.manager.settings()?.files;
-      if (slot && !this.closed) {
+      if (slot && !this.closed && reason !== "exact") {
         const state = slot.currentState();
         const protectLines = new Set<number>();
         // Like IDEA's "keep trailing spaces on caret line": never strip under a visible caret.
@@ -602,13 +730,54 @@ export class DocModel {
       }
       await this.sync.whenIdle();
       if (this.closed) return;
-      await this.manager.backend.save(this.doc);
-      this.modified.clear();
-      this.setMeta({ dirty: false });
+      if (isUntitledUri(this.path)) {
+        // An untitled buffer has no path to write to: autosave is a no-op and
+        // an explicit save asks for one (Save As re-points the buffer, or stays
+        // dirty on Cancel).
+        if (reason === "auto") return;
+        await this.manager.saveAs(this);
+        return;
+      }
+      const backend = this.manager.backend;
+      const version = this.sync.serverVersion;
+      const observedDirty = this.backendDirty;
+      // Autosave never overwrites external changes made after the buffer was edited.
+      if (reason === "auto" && backend.autosave) {
+        if (!(await backend.autosave(this.doc))) return;
+      } else await backend.save(this.doc);
+      // The reply does not identify what was saved. It only confirms the version
+      // we sent if the buffer and the observed backend dirty state haven't moved on.
+      if (this.backendDirty === observedDirty && (!observedDirty || observedDirty.version <= version))
+        this.markClean(version);
       _emitEditorEvent({ type: "docSaved", doc: this.doc, path: this.path });
     };
     this.saving = this.saving.then(run, run);
     return this.saving;
+  }
+
+  /** Save As turned this untitled buffer into the file `info` points at. */
+  retarget(info: DocumentInfo) {
+    const old = this.path;
+    if (!this.backendDirty?.dirty || this.backendDirty.version < info.version) this.markClean(info.version);
+    this.path = info.path;
+    this.info = languageInfo(info.language);
+    this.editorconfig = info.editorconfig ?? null;
+    this.meta = {
+      ...this.meta,
+      path: info.path,
+      language: info.language,
+      encoding: info.encoding,
+      hasBom: info.hasBom,
+      lineEnding: info.lineEnding,
+      canReloadEncoding: info.canReloadEncoding,
+    };
+    useDocMeta.setState((s) => {
+      const next = { ...s };
+      delete next[old];
+      next[info.path] = this.meta;
+      return next;
+    }, true);
+    _emitEditorEvent({ type: "docSaved", doc: this.doc, path: this.path });
   }
 
   dispose() {
@@ -621,9 +790,20 @@ export class DocModel {
 export interface ManagerHost {
   settings(): Settings | null | undefined;
   notify(n: { level: "info" | "warning" | "error"; title: string; body?: string }): void;
+  /**
+   * An untitled buffer's explicit save: asks for a path, writes the buffer
+   * there and re-points the model. `false` = cancelled or failed.
+   */
+  saveAs?(model: DocModel): Promise<boolean>;
 }
 
 export class DocumentManager {
+  readonly workspaceHistory = new WorkspaceHistory(
+    async () => {
+      await Promise.all([...this.byPath.values()].map((m) => m.sync.whenIdle()));
+    },
+    (n) => this.notify(n),
+  );
   readonly byPath = new Map<string, DocModel>();
   readonly byId = new Map<DocId, DocModel>();
   private opening = new Map<string, Promise<DocModel>>();
@@ -646,15 +826,10 @@ export class DocumentManager {
 
   start() {
     this.disposers.push(
+      this.workspaceHistory.start(),
       this.backend.onPatched((e) => this.byId.get(e.doc)?.sync.remote(e)),
       this.backend.onLanguage?.((e) => this.byId.get(e.doc)?.setLanguage(e.language, e.uiMode)) ?? (() => {}),
-      this.backend.onDirty((e) => {
-        const m = this.byId.get(e.doc);
-        if (m && m.getMeta().dirty !== e.dirty) {
-          m.setMeta({ dirty: e.dirty });
-          if (!e.dirty) m.modified.clear();
-        }
-      }),
+      this.backend.onDirty((e) => this.byId.get(e.doc)?.onBackendDirty(e)),
     );
     let prev = useEditorRegistry.getState().contributions;
     this.disposers.push(
@@ -676,6 +851,29 @@ export class DocumentManager {
     return this.byPath.get(path);
   }
 
+  /** Registers a backend document opened outside `acquire` (a minted untitled buffer). */
+  adopt(info: DocumentInfo): DocModel {
+    const model = new DocModel(this, info);
+    void model.loadLanguage();
+    this.byPath.set(model.path, model);
+    this.byId.set(model.doc, model);
+    _emitEditorEvent({ type: "docOpened", doc: model.doc, path: model.path, language: info.language });
+    return model;
+  }
+
+  /** An untitled buffer's explicit save (Save As); `false` = cancelled or failed. */
+  saveAs(model: DocModel): Promise<boolean> {
+    return this.host.saveAs?.(model) ?? Promise.resolve(false);
+  }
+
+  /** Save As re-pointed `model` from its untitled URI to a real file path. */
+  retarget(model: DocModel, info: DocumentInfo) {
+    if (model.path === info.path) return;
+    this.byPath.delete(model.path);
+    this.byPath.set(info.path, model);
+    model.retarget(info);
+  }
+
   /** Opens (or returns the already open) document model for `path`. */
   acquire(path: string): Promise<DocModel> {
     const existing = this.byPath.get(path);
@@ -683,8 +881,21 @@ export class DocumentManager {
     let p = this.opening.get(path);
     if (!p) {
       p = (async () => {
-        await loadLanguageInfos(this.backend);
-        const info = isVirtualUri(path) ? await this.backend.openVirtual(path) : await this.backend.open(path);
+        const catalog = loadLanguageInfos(this.backend);
+        void catalog
+          .then(() => {
+            const desc = findLanguageDescription(uiModeForPath(path) ?? null, path);
+            if (desc) return loadSupport(desc);
+          })
+          .catch(() => {});
+        const [info] = await Promise.all([
+          isUntitledUri(path)
+            ? this.backend.openUntitled(path)
+            : isVirtualUri(path)
+              ? this.backend.openVirtual(path)
+              : this.backend.open(path),
+          catalog,
+        ]);
         const raced = this.byPath.get(path);
         if (raced) {
           void this.backend.close(info.id);
@@ -709,31 +920,25 @@ export class DocumentManager {
     // Defer so that "close tab + reopen in split" in one tick keeps the model.
     queueMicrotask(async () => {
       if (model.inUse() || model.closed) return;
+      const handoff = model.handoffRelease;
+      model.handoffRelease = false;
       const files = this.settings()?.files;
-      if (files?.autoSave !== false && model.getMeta().dirty) {
+      if (!handoff && files?.autoSave !== false && model.getMeta().dirty) {
         try {
           await model.save("auto");
         } catch (e) {
-          console.warn(`autosave of ${model.path} failed`, e);
+          logError(`autosave of ${model.path} failed`, e);
         }
       }
+      // As in IDEA, a file whose changes are not saved (autosave off, or a failed save) stays
+      // open without a tab: reopening shows the changes, and Save All and the exit check still
+      // cover them. An untitled buffer was asked about when its tab closed.
+      // Handoff to an aux editor: the sibling window already references the same document.
+      if (!handoff && model.getMeta().dirty && !isUntitledUri(model.path)) return;
       if (model.inUse()) return;
       await model.sync.whenIdle();
-      if (model.inUse()) return;
-      model.dispose();
-      this.byPath.delete(model.path);
-      this.byId.delete(model.doc);
-      useDocMeta.setState((s) => {
-        const next = { ...s };
-        delete next[model.path];
-        return next;
-      }, true);
-      useOutline.setState((s) => {
-        const next = { ...s };
-        delete next[model.path];
-        return next;
-      }, true);
-      _emitEditorEvent({ type: "docClosed", doc: model.doc, path: model.path });
+      if (model.inUse() || model.closed) return;
+      this.forget(model);
       try {
         await this.backend.close(model.doc);
       } catch (e) {
@@ -742,19 +947,49 @@ export class DocumentManager {
     });
   }
 
+  /**
+   * The project closed or another one replaced it: its backend documents are gone, including
+   * those kept open without a tab for their unsaved changes (the leave guard already saved or
+   * discarded them). Untitled buffers follow the window and stay.
+   */
+  releaseProjectDocuments() {
+    for (const model of [...this.byPath.values()]) if (!isUntitledUri(model.path)) this.forget(model);
+  }
+
+  private forget(model: DocModel) {
+    model.dispose();
+    this.byPath.delete(model.path);
+    this.byId.delete(model.doc);
+    useDocMeta.setState((s) => {
+      const next = { ...s };
+      delete next[model.path];
+      return next;
+    }, true);
+    useOutline.setState((s) => {
+      const next = { ...s };
+      delete next[model.path];
+      return next;
+    }, true);
+    _emitEditorEvent({ type: "docClosed", doc: model.doc, path: model.path });
+  }
+
   applySettings() {
     for (const m of this.byPath.values()) m.applySettings();
   }
 
-  /** Saves every document; failures are notified, and an explicit Save All also rejects with them. */
-  async saveAll(reason: "explicit" | "auto") {
+  /** Saves dirty documents; failures are notified, and an explicit Save All also rejects with them. */
+  async saveAll(reason: "explicit" | "auto", skipUntitled = false) {
     const errors: unknown[] = [];
     await Promise.all(
-      [...this.byPath.values()].map((m) =>
-        m.save(reason).catch((e) => {
-          errors.push(e);
-        }),
-      ),
+      [...this.byPath.values()]
+        .filter((m) => !(skipUntitled && isUntitledUri(m.path)))
+        .map((m) =>
+          m.save(reason).catch((e) => {
+            // The notification shows the message only; the log keeps the stack for reports.
+            logError(`saving ${m.path} failed`, e);
+            errors.push(e);
+          }),
+        ),
     );
     if (errors.length) {
       const e = errors[0];

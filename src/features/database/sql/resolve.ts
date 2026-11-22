@@ -7,7 +7,7 @@
  */
 import type { DbCompletion, DbCompletionColumn, DbCompletionTable, DbDriver } from "@/platform/ipc";
 import { analyze, type TableRef } from "./analyze";
-import { CLAUSE_WORDS, DATA_TYPES, functions, isReserved } from "./dialect";
+import { CLAUSE_WORDS, DATA_TYPES, functions, isReserved, nameMatcher } from "./dialect";
 import { identName, lex, type Lexed, type Token } from "./lexer";
 
 export type SqlSymbol =
@@ -48,15 +48,22 @@ const NOT_COLUMNS = new Set(
     "TRAILING BOTH NOWAIT SKIP LOCKED SHARE MODE BINARY UNSIGNED SIGNED"
   ).split(" "),
 );
-
-const eq = (a: string | null | undefined, b: string | null | undefined) =>
-  !!a && !!b && a.toLowerCase() === b.toLowerCase();
+/** Snowflake: select-list modifiers, sampling words, pseudo-columns and date parts. */
+const SNOWFLAKE_NOT_COLUMNS = new Set(
+  (
+    "EXCLUDE RENAME REPLACE BERNOULLI SYSTEM BLOCK SEED REPEATABLE LEVEL RESPECT QUARTER WEEK WEEKOFYEAR DAYOFWEEK " +
+    "DAYOFYEAR DAYOFMONTH MILLISECOND MICROSECOND NANOSECOND YEARS MONTHS DAYS HOURS MINUTES SECONDS WEEKS YY YYYY " +
+    "MM MON DD HH MI SS MS US NS"
+  ).split(" "),
+);
 
 export function findTable(
   model: DbCompletion | null,
   schema: string | null,
   name: string,
+  driver: DbDriver = "sqlite",
 ): DbCompletionTable | undefined {
+  const eq = nameMatcher(driver);
   const tables = model?.tables ?? [];
   if (schema) return tables.find((t) => eq(t.schema, schema) && eq(t.name, name));
   return (
@@ -126,9 +133,11 @@ export class SqlResolver {
 
   /** Resolves token `i`; `null` when it is no name (keywords, function names…). */
   resolve(i: number): Resolved | null {
+    const eq = nameMatcher(this.driver);
     const toks = this.lexed.tokens;
     const t = toks[i]!;
     if (!isName(t) || (t.kind === "word" && CLAUSE_WORDS.has(t.upper))) return null;
+    if (this.driver === "snowflake" && isVariantKey(toks, i)) return null;
     const prev = toks[i - 1];
     const next = toks[i + 1];
     const name = identName(t);
@@ -148,6 +157,9 @@ export class SqlResolver {
       if (cte) return { ...span, symbol: { kind: "cte", name: cte.name, def: { from: cte.from, to: cte.to } } };
       if (this.model?.tables.some((x) => eq(x.schema, name))) return this.schema(name, span);
       if (!checked || PSEUDO_TABLES.has(name.toUpperCase()) || ctx.kind === "none") return { ...span, symbol: null };
+      // Snowflake `database.schema.table.column`: other databases are not in the model.
+      if (this.driver === "snowflake" && isP(toks[i + 3], ".") && isP(toks[i + 5], ".") && isName(toks[i + 6]))
+        return { ...span, symbol: null };
       return { ...span, symbol: null, problem: `Unable to resolve symbol '${name}'` };
     }
 
@@ -166,10 +178,12 @@ export class SqlResolver {
         const schema = qualifier?.at(-1) ?? null;
         const cte = schema ? undefined : a.ctes.find((c) => eq(c.name, name));
         if (cte) return { ...span, symbol: { kind: "cte", name: cte.name, def: { from: cte.from, to: cte.to } } };
-        const table = findTable(this.model, schema, name);
+        const table = findTable(this.model, schema, name, this.driver);
         if (table) return { ...span, symbol: { kind: "table", table } };
         if (!loaded || (a.verb !== "DROP" && a.verb !== "ALTER" && !checked)) return { ...span, symbol: null };
         if (schema && !this.model!.tables.some((x) => eq(x.schema, schema))) return { ...span, symbol: null };
+        // Snowflake `database.schema.table`: the table may live in a database the model does not hold.
+        if (this.driver === "snowflake" && qualifier && qualifier.length > 1) return { ...span, symbol: null };
         return { ...span, symbol: null, problem: `Unable to resolve table '${name}'` };
       }
       case "afterTable":
@@ -177,7 +191,8 @@ export class SqlResolver {
       case "insertColumns": {
         const cols = this.columnsOf(ctx.target);
         const col = cols?.find((c) => eq(c.name, name));
-        if (col || !cols) return { ...span, symbol: col ? this.columnSymbol(ctx.target, col) : null };
+        if (col || !cols || ctx.target.database)
+          return { ...span, symbol: col ? this.columnSymbol(ctx.target, col) : null };
         return { ...span, symbol: null, problem: `Unable to resolve column '${name}'` };
       }
       case "afterInsertColumns":
@@ -196,13 +211,21 @@ export class SqlResolver {
       const cols = this.columnsOf(ref);
       const col = cols?.find((c) => eq(c.name, name));
       if (col) return { ...span, symbol: this.columnSymbol(ref, col) };
-      if (!cols || !checked) return { ...span, symbol: null };
+      if (!cols || !checked || ref.database) return { ...span, symbol: null };
       return { ...span, symbol: null, problem: `Unable to resolve column '${name}'` };
     }
 
     // A bare word: a column unless it is a function, a type, a keyword or an alias being defined.
-    if (isP(next, "(") || isP(prev, "::") || (prev?.kind === "word" && prev.upper === "AS")) return null;
-    if (t.kind === "word" && (isReserved(t.text) || NOT_COLUMNS.has(t.upper) || this.words.has(t.upper))) return null;
+    if (isP(next, "(") || isP(next, "=>") || isP(prev, "::") || (prev?.kind === "word" && prev.upper === "AS"))
+      return null;
+    if (
+      t.kind === "word" &&
+      (isReserved(t.text, this.driver) ||
+        NOT_COLUMNS.has(t.upper) ||
+        this.words.has(t.upper) ||
+        (this.driver === "snowflake" && (SNOWFLAKE_NOT_COLUMNS.has(t.upper) || t.upper.startsWith("METADATA$"))))
+    )
+      return null;
     // `count(*) n`, `x total`: an alias after an expression.
     if (
       prev &&
@@ -224,11 +247,11 @@ export class SqlResolver {
       checked &&
       loaded &&
       a.refs.length > 0 &&
-      a.refs.every((r) => this.columnsOf(r) !== null) &&
+      a.refs.every((r) => this.columnsOf(r) !== null && !r.database) &&
       clause !== "other" &&
       clause !== "values" &&
       clause !== "limit" &&
-      !this.outputAliases(i).has(name.toLowerCase());
+      !this.outputAliases(i).has(this.driver === "clickhouse" ? name : name.toLowerCase());
     return judged
       ? { ...span, symbol: null, problem: `Unable to resolve column '${name}'` }
       : { ...span, symbol: null };
@@ -247,15 +270,17 @@ export class SqlResolver {
   }
 
   private schema(name: string, span: Span): Resolved {
+    const eq = nameMatcher(this.driver);
     return { ...span, symbol: this.model?.tables.some((x) => eq(x.schema, name)) ? { kind: "schema", name } : null };
   }
 
   private findRef(refs: readonly TableRef[], schema: string | null, name: string): TableRef | undefined {
+    const eq = nameMatcher(this.driver);
     return refs.find((r) => (r.alias ? eq(r.alias, name) : eq(r.name, name) && (!schema || eq(r.schema, schema))));
   }
 
   private refSymbol(ref: TableRef): SqlSymbol {
-    const table = ref.kind === "table" ? findTable(this.model, ref.schema, ref.name) : undefined;
+    const table = ref.kind === "table" ? findTable(this.model, ref.schema, ref.name, this.driver) : undefined;
     if (ref.alias && ref.aliasAt) return { kind: "alias", name: ref.alias, def: ref.aliasAt, table };
     if (table) return { kind: "table", table };
     return { kind: "cte", name: ref.name, def: { from: ref.from, to: ref.to } };
@@ -264,12 +289,13 @@ export class SqlResolver {
   /** Columns of a FROM item; `null` when unknown (not in the model, `select *` subqueries). */
   private columnsOf(ref: TableRef): Array<{ name: string; column?: DbCompletionColumn }> | null {
     if (ref.columns) return ref.columns.length ? ref.columns.map((name) => ({ name })) : null;
-    const table = findTable(this.model, ref.schema, ref.name);
-    return table ? table.columns.map((c) => ({ name: c.name, column: c })) : null;
+    const table = findTable(this.model, ref.schema, ref.name, this.driver);
+    // A table listed without columns is one whose columns were not read (a large Snowflake database).
+    return table?.columns.length ? table.columns.map((c) => ({ name: c.name, column: c })) : null;
   }
 
   private columnSymbol(ref: TableRef, col: { name: string; column?: DbCompletionColumn }): SqlSymbol {
-    const table = ref.kind === "table" ? findTable(this.model, ref.schema, ref.name) : undefined;
+    const table = ref.kind === "table" ? findTable(this.model, ref.schema, ref.name, this.driver) : undefined;
     return { kind: "column", name: col.name, column: col.column, table, owner: ref.alias ?? ref.name };
   }
 
@@ -287,10 +313,21 @@ export class SqlResolver {
         prev.kind === "number" ||
         prev.kind === "string"
       )
-        out.add(identName(t).toLowerCase());
+        out.add(this.driver === "clickhouse" ? identName(t) : identName(t).toLowerCase());
     }
     return out;
   }
+}
+
+/** Whether name token `i` is a key of a Snowflake VARIANT path: `src:a.b`, `src['a'].b`. */
+function isVariantKey(toks: readonly Token[], i: number): boolean {
+  let j = i;
+  while (isP(toks[j - 1], ".")) {
+    if (isP(toks[j - 2], "]")) return true;
+    if (!isName(toks[j - 2])) return false;
+    j -= 2;
+  }
+  return isP(toks[j - 1], ":") && toks[j - 1]!.to === toks[j]!.from;
 }
 
 /** Whether token `i` follows INSERT / REPLACE INTO (so a `(` after it lists columns). */

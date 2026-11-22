@@ -1,18 +1,25 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { guessOs } from "./platformInfo";
+
 /**
  * Monospace font-family lists shared by every consumer of the editor / terminal
  * font. "JetBrains Mono" is the bundled default, but the bundle registers it as
- * "JetBrains Mono Variable" (`@fontsource-variable/jetbrains-mono`); a list that
- * only names "JetBrains Mono" falls through to the system's generic monospace
- * wherever the font isn't installed (SimSun on Chinese Windows).
+ * "JetBrains Mono Variable" (`@fontsource-variable/jetbrains-mono`); the bundled
+ * variable face stays in the list so the family renders without a system install
+ * (SimSun on Chinese Windows otherwise, #26), but the installed family comes
+ * first: its hinted static outlines render like IntelliJ IDEA's, while the
+ * unhinted variable webfont looks blurred next to them at editor sizes (#2305).
  */
 
 export const BUNDLED_MONO_FAMILY = "JetBrains Mono";
 export const BUNDLED_UI_FAMILY = "Inter";
 const BUNDLED_FACES: ReadonlyMap<string, readonly string[]> = new Map([
-  [BUNDLED_MONO_FAMILY.toLowerCase(), ['"JetBrains Mono Variable"', '"JetBrains Mono"']],
-  [BUNDLED_UI_FAMILY.toLowerCase(), ['"Inter Variable"', '"Inter"']],
+  [BUNDLED_MONO_FAMILY.toLowerCase(), ['"JetBrains Mono"', '"JetBrains Mono Variable"']],
+  ["jetbrains mono variable", ['"JetBrains Mono Variable"']],
+  ["inter variable", ['"Inter Variable"']],
+  [BUNDLED_UI_FAMILY.toLowerCase(), ['"Inter"', '"Inter Variable"']],
 ]);
-const MONO_STACK_FALLBACK = '"JetBrains Mono Variable", "JetBrains Mono", ui-monospace, Menlo, monospace';
+const MONO_STACK_FALLBACK = '"JetBrains Mono", "JetBrains Mono Variable", ui-monospace, Menlo, monospace';
 
 /** Quote one CSS family safely (including quotes, backslashes and control characters). */
 export const quoteFontFamily = (family: string) =>
@@ -22,10 +29,156 @@ export const quoteFontFamily = (family: string) =>
 // Preserve compatibility with previously saved names wrapped in CSS quotes.
 const familyName = (family: string) => family.trim().replace(/^"(.*)"$/, "$1");
 
+// Per webview: the CSS alias stays stable while its faces load; DOM consumers
+// reflow automatically and canvas consumers await the same promise below.
+const userFonts = new Map<string, { alias: string; loaded: Promise<void> }>();
+
+/** WKWebView needs a connected canvas to resolve user fonts. Remove it in finally after probing. */
+export function createFontProbeCanvas(): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.hidden = true;
+  (document.body ?? document.documentElement).append(canvas);
+  return canvas;
+}
+
+/** A pure local-name probe; FontFaceSet.check also returns true for unknown families. */
+export function fontAvailable(name: string): boolean {
+  let canvas: HTMLCanvasElement | undefined;
+  try {
+    canvas = createFontProbeCanvas();
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return true;
+    // Symbol-only Nerd fonts and CJK faces may have no Latin glyphs.
+    return ["mmmmmmmmmmlli1WQ@", "\uF418\uE725\u{F0001}", "汉字かな한글"].some((sample) =>
+      ["monospace", "serif", "sans-serif"].some((base) => {
+        ctx.font = `32px ${base}`;
+        const baseline = ctx.measureText(sample).width;
+        ctx.font = `32px ${quoteFontFamily(name)}, ${base}`;
+        const width = ctx.measureText(sample).width;
+        return Number.isFinite(width) && Number.isFinite(baseline) && width !== baseline;
+      }),
+    );
+  } catch {
+    return true;
+  } finally {
+    canvas?.remove();
+  }
+}
+
+async function loadUserFont(name: string, alias: string): Promise<void> {
+  const buffer = await invoke<ArrayBuffer>("user_font_data", { family: name });
+  const headerLength = new DataView(buffer).getUint32(0, true);
+  const start = 4 + headerLength;
+  const faces: { weight: number; style: string; offset: number; length: number }[] = JSON.parse(
+    new TextDecoder().decode(buffer.slice(4, start)),
+  );
+  await Promise.all(
+    faces.map(async ({ weight, style, offset, length }) => {
+      const face = new FontFace(alias, buffer.slice(start + offset, start + offset + length), {
+        weight: String(weight),
+        style,
+      });
+      document.fonts.add(face);
+      try {
+        await face.load();
+      } catch {
+        document.fonts.delete(face);
+      }
+    }),
+  );
+}
+
 /** One resolver for primary, fallback and UI families, matching the bundled CSS registrations. */
-function familyFaces(family: string): readonly string[] {
+export function familyFaces(family: string): readonly string[] {
   const name = familyName(family);
-  return BUNDLED_FACES.get(name.toLowerCase()) ?? [quoteFontFamily(name)];
+  const bundled = BUNDLED_FACES.get(name.toLowerCase());
+  if (bundled) return bundled;
+  if (!name || !isTauri() || guessOs() !== "macos" || typeof FontFace === "undefined") return [quoteFontFamily(name)];
+  const key = name.toLowerCase();
+  let entry = userFonts.get(key);
+  if (!entry) {
+    if (fontAvailable(name)) return [quoteFontFamily(name)];
+    const alias = `OpenIDEA User Font ${userFonts.size}`;
+    const loaded = loadUserFont(name, alias).catch(() => {
+      /* retain local-name and bundled fallbacks */
+    });
+    entry = { alias, loaded };
+    userFonts.set(key, entry);
+  }
+  return [quoteFontFamily(entry.alias), quoteFontFamily(name)];
+}
+
+/** Common Nerd Font installs; the full-width faces before their Mono variants, which shrink icons to one cell. */
+const NERD_FONTS = [
+  "Symbols Nerd Font",
+  "Symbols Nerd Font Mono",
+  "JetBrainsMono Nerd Font",
+  "JetBrainsMono Nerd Font Mono",
+  "MesloLGS NF",
+  "MesloLGS Nerd Font",
+  "Hack Nerd Font",
+  "FiraCode Nerd Font",
+  "Hasklug Nerd Font",
+  "CaskaydiaCove Nerd Font",
+];
+/** In running text the proportional faces give icons their own width instead of one cell's. */
+const UI_NERD_FONTS = [
+  "JetBrainsMono Nerd Font Propo",
+  "MesloLGS Nerd Font Propo",
+  "Hack Nerd Font Propo",
+  "FiraCode Nerd Font Propo",
+  "Hasklug Nerd Font Propo",
+  "CaskaydiaCove Nerd Font Propo",
+  ...NERD_FONTS,
+];
+
+/** Nerd Font naming: the patched families ("… Nerd Font") and their v3 short forms ("… NF"). */
+const NERD_FONT_NAME = /nerd\s*font|\bnf\b/i;
+const NERD_FONT_MONO = /(?:nerd\s*font|\bnf\b)\s+mono$/i;
+const NERD_FONT_PROPO = /(?:nerd\s*font|\bnf\b)\s+propo$/i;
+
+/**
+ * Nerd Font families among `installed`, full faces first (their icons keep the wide
+ * prompt glyph), then the Mono variants that shrink icons to one cell, Propo last.
+ */
+export function nerdFontFamilies(installed: readonly string[]): string[] {
+  const rank = (name: string) => (NERD_FONT_MONO.test(name) ? 1 : NERD_FONT_PROPO.test(name) ? 2 : 0);
+  return installed.filter((name) => NERD_FONT_NAME.test(name)).sort((a, b) => rank(a) - rank(b));
+}
+
+/** Discovered installs beyond the known list (`discoverNerdFonts`), in the same order. */
+let discoveredNerdFonts: readonly string[] = [];
+
+/**
+ * Feeds the terminal fallback from the native font catalog, loaded off startup: a Nerd
+ * Font outside the known list (Maple Mono NF CN, Cascadia Code NF…) otherwise never
+ * reaches the font stack, and unlike Windows Terminal the webview does no per-glyph
+ * system fallback, so prompt icons (#3723) render as boxes.
+ */
+export function discoverNerdFonts(installed: readonly string[]): void {
+  const known = new Set(NERD_FONTS.map((name) => name.toLowerCase()));
+  discoveredNerdFonts = nerdFontFamilies(installed).filter((name) => !known.has(name.toLowerCase()));
+}
+
+/** Installed Nerd Fonts, resolved like any family, for prompt-theme icons (powerlevel10k, starship). */
+export function nerdFontFaces(): string[] {
+  return [...NERD_FONTS, ...discoveredNerdFonts].flatMap(familyFaces);
+}
+
+/**
+ * The icon font for UI text (Nerd Font icons in agent task titles): the first installed
+ * Nerd Font, proportional faces first. Any one has the whole icon set, so the others aren't
+ * probed or loaded. Without the installed families (browser), every candidate by name.
+ * A family outside the known list fills in from the same discovery, Propo first.
+ */
+export function uiIconFaces(installed?: readonly string[]): string[] {
+  if (!installed) return UI_NERD_FONTS.flatMap(familyFaces);
+  const names = new Set(installed.map((name) => name.toLowerCase()));
+  const family = UI_NERD_FONTS.find((name) => names.has(name.toLowerCase()));
+  if (family) return [...familyFaces(family)];
+  const found = nerdFontFamilies(installed);
+  const pick = found.find((name) => NERD_FONT_PROPO.test(name)) ?? found[0];
+  return pick ? [...familyFaces(pick)] : [];
 }
 
 /** The `--font-mono` stack, resolved (canvas / xterm can't use `var()`). */
@@ -46,6 +199,40 @@ export function monoFontFamily(family: string | undefined, fallback = "", base =
   return [...head, ...(fb ? familyFaces(fb) : []), base].join(", ");
 }
 
+/** Tools › Terminal › Font, shared by the terminal and the Run console. */
+export interface MonoFontChoice {
+  useEditorFont: boolean;
+  fontFamily: string;
+  fallbackFontFamily: string;
+  fontSize: number;
+}
+
+export interface EditorFontChoice {
+  fontFamily?: string | null;
+  fallbackFont?: string | null;
+  fontSize?: number | null;
+}
+
+/**
+ * The family and size Settings › Tools › Terminal resolves against Editor › Font.
+ * The console uses the terminal's choice too, so the font picker there controls
+ * both the terminal and Run output; `base` is `var(--font-mono)` for CSS consumers
+ * and the resolved stack for canvas consumers (xterm).
+ */
+export function resolveMonoFont(
+  choice: MonoFontChoice | undefined,
+  editor: EditorFontChoice | undefined,
+  base = "var(--font-mono)",
+): { family: string; size: number } {
+  const useEditor = choice?.useEditorFont !== false;
+  const family = (useEditor ? editor?.fontFamily : choice?.fontFamily) || BUNDLED_MONO_FAMILY;
+  const fallback = useEditor
+    ? choice?.fallbackFontFamily.trim() || editor?.fallbackFont || ""
+    : choice?.fallbackFontFamily.trim() || "";
+  const size = (useEditor ? editor?.fontSize : choice?.fontSize) || 13;
+  return { family: monoFontFamily(family, fallback, base), size };
+}
+
 /**
  * Resolves once the faces `family` uses at `size` are loaded, so code that measures
  * glyphs (xterm's cell size) measures the real font rather than the swap fallback.
@@ -53,6 +240,8 @@ export function monoFontFamily(family: string | undefined, fallback = "", base =
 export async function fontsLoaded(family: string, size: number): Promise<void> {
   const fonts = typeof document !== "undefined" ? document.fonts : undefined;
   if (!fonts?.load) return;
+  const pending = [...userFonts.values()].filter(({ alias }) => family.includes(quoteFontFamily(alias)));
+  if (pending.length) await Promise.all(pending.map(({ loaded }) => loaded));
   try {
     await Promise.all([fonts.load(`${size}px ${family}`), fonts.load(`bold ${size}px ${family}`)]);
   } catch {
@@ -60,7 +249,8 @@ export async function fontsLoaded(family: string, size: number): Promise<void> {
   }
 }
 
-/** Bundled aliases also apply when selected for the interface. */
-export function uiFontFamily(family: string): string {
-  return [...familyFaces(family), "system-ui", "sans-serif"].join(", ");
+/** Bundled aliases also apply when selected for the interface; `fallback` covers glyphs `family` lacks (empty = none). */
+export function uiFontFamily(family: string, fallback = ""): string {
+  const fb = familyName(fallback);
+  return [...familyFaces(family), ...(fb ? familyFaces(fb) : []), "system-ui", "sans-serif"].join(", ");
 }

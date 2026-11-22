@@ -23,8 +23,22 @@
   height: 32px;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 0 6px;
+}
+.changesToolbar {
+  height: auto;
+  min-height: 32px;
+  flex-wrap: wrap;
+  column-gap: var(--space-2);
+  padding-block: var(--space-0-5);
+}
+.changesTools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-0-5);
+  max-width: 100%;
 }
 .sep {
   width: 1px;
@@ -62,22 +76,30 @@
 .icon {
   flex: none;
 }
+/* The name takes the whole row; when it doesn't fit, the grey detail after it gives way first. */
 .label {
-  flex: 0 0 auto;
-  max-width: 75%;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .groupLabel {
   color: var(--fg-strong);
-  font-weight: 600;
 }
 .detail {
+  flex: 0 10000 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--fg-subtle);
+}
+.nodeCount {
+  flex: none;
+  color: var(--fg-subtle);
+}
+.detailIcon {
+  flex: none;
+  --icon-color: var(--fg-subtle);
 }
 .partial {
   flex: none;
@@ -102,13 +124,12 @@
 }
 .commitBar {
   flex: none;
-  height: 32px;
+  min-height: 32px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
-  padding: 0 6px 0 12px;
-  white-space: nowrap;
-  overflow: hidden;
+  gap: var(--space-0-5) var(--space-1);
+  padding: var(--space-0-5) 6px var(--space-0-5) 12px;
 }
 .grow {
   flex: 1;
@@ -117,6 +138,7 @@
   color: var(--fg-faint);
   font-family: var(--font-mono);
   font-size: var(--fs-tiny);
+  white-space: nowrap;
 }
 .lineLenWarn {
   color: var(--warning);
@@ -132,8 +154,6 @@
   border-top: 1px solid var(--border);
   outline: none;
   color: var(--fg-strong);
-  font-family: var(--font-mono);
-  font-size: var(--fs-code);
   line-height: var(--lh-code);
   -webkit-user-select: text;
   user-select: text;
@@ -159,7 +179,8 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
+  flex-wrap: wrap;
   padding: 8px 6px 10px 10px;
   white-space: nowrap;
 }
@@ -169,33 +190,44 @@
 .commitActions > .pushButton {
   flex: 0 1 auto;
   min-width: 0;
+  min-height: var(--h-button, 28px);
+  height: auto;
+  padding: var(--space-1) var(--space-3);
+  line-height: 1.3;
 }
 .pushButton > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.hint {
-  margin-left: auto;
-  color: var(--fg-faint);
-  font-family: var(--font-keys);
-  font-size: var(--fs-small);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .stashList {
   flex: 1;
+  container: stash-list / inline-size;
 }
 .stashRow {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
+}
+/* The message identifies a stash: the branch gives way first, the time stays whole. */
+.stashRow > .detail {
+  white-space: nowrap;
+}
+.stashRow > .stashTime {
+  flex: none;
 }
 .stashMessage {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 auto;
+  min-width: 4em;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+@container stash-list (max-width: 320px) {
+  .stashBranch {
+    display: none;
+  }
 }
 /* Settings › Commit › Show right margin off. */
 .noMargin {
@@ -215,8 +247,12 @@
   align-self: stretch;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   border-radius: var(--radius-small);
+}
+/* Test files and the folders under a test root, as IDEA's green "Tests" file colour; hover and selection win. */
+.testFile:not(:hover):not([aria-selected="true"]) {
+  background: var(--bg-file-tests);
 }
 .dropTarget {
   box-shadow: inset 0 0 0 1px var(--accent);
@@ -248,7 +284,7 @@
 .optTitle {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   margin: 10px 0 6px;
   color: var(--fg-strong);
   font-size: var(--fs-ui);
@@ -263,7 +299,7 @@
 .optBody {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-1-5);
   padding-left: 16px;
 }
 .optRow {
@@ -274,7 +310,7 @@
 .optField {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   color: var(--fg);
 }
 .optField > :last-child {
@@ -297,7 +333,7 @@
 .checkProblems {
   flex: none;
   display: flex;
-  gap: 6px;
+  gap: var(--space-1-5);
   max-height: 120px;
   overflow: auto;
   padding: 4px 10px 0;
@@ -325,5 +361,27 @@
   cursor: pointer;
 }
 .checkProblemLink:hover {
+  text-decoration: underline;
+}
+/* Staging area: Stage / Unstage on the hovered or selected row, as a hover icon at the row's end. */
+.stageButton {
+  flex: none;
+  margin-left: auto;
+  visibility: hidden;
+}
+[role="treeitem"]:hover .stageButton,
+[role="treeitem"][aria-selected="true"] .stageButton {
+  visibility: visible;
+}
+.inspectionFix {
+  margin-left: var(--space-2);
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--link);
+  font: inherit;
+  cursor: pointer;
+}
+.inspectionFix:hover {
   text-decoration: underline;
 }

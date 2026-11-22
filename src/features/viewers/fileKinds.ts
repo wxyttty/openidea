@@ -1,6 +1,9 @@
 /** Which files open in which viewer, and the editor inputs of the viewers. */
 import type { EditorInput } from "@/workbench/contributions";
+import { hasFileType, wildcardMatch } from "@/platform/fileTypes";
 import type { FileProbe } from "@/platform/ipc";
+import { usePlatform } from "@/platform/platformInfo";
+import { useProject } from "@/platform/project";
 
 export const IMAGE_KIND = "image";
 export const BINARY_KIND = "binary";
@@ -16,7 +19,27 @@ function extension(path: string): string {
 
 export const isImagePath = (path: string) => IMAGE_EXTENSIONS.has(extension(path));
 export const isSvgPath = (path: string) => extension(path) === "svg";
-export const isMarkdownPath = (path: string) => MARKDOWN_EXTENSIONS.has(extension(path));
+
+/**
+ * Whether `path` gets the Markdown preview, decided synchronously so a tab never opens
+ * without it first: Markdown by Settings › File Types.
+ */
+export function isMarkdownPath(path: string): boolean {
+  const { settings, project } = useProject.getState();
+  return hasFileType(path, ["markdown"], MARKDOWN_EXTENSIONS, settings?.files, project?.root ?? null);
+}
+
+/** Whether the file's name matches one of `patterns` (`*.xlsx`); Windows/macOS match case-insensitively. */
+export function associatedApplication(
+  path: string,
+  patterns: readonly string[],
+  os = usePlatform.getState().os,
+): boolean {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const fold = os === "linux" ? (s: string) => s : (s: string) => s.toLowerCase();
+  const folded = fold(name);
+  return patterns.some((pattern) => wildcardMatch(fold(pattern), folded));
+}
 
 export const imageInput = (path: string): EditorInput => ({ kind: IMAGE_KIND, key: `image:${path}`, path });
 

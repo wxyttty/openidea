@@ -6,8 +6,10 @@
  */
 import { executeAction } from "@/platform/actions";
 import { call, commands, isTauri } from "@/platform/ipc";
+import { isDraggingOut } from "@/platform/dragOut";
 import { useProject } from "@/platform/project";
 import { isRemoteWindow } from "@/platform/remote";
+import { nativeDropPoint } from "@/platform/nativeDrop";
 import { editorService, OWNS_FILE_DROP } from "./contributions";
 
 const OWNER_ATTR = Object.keys(OWNS_FILE_DROP)[0]!;
@@ -56,6 +58,8 @@ export function handleFileDrop(
   y: number,
   deps: FileDropDeps = defaultDeps,
 ): Promise<void> | null {
+  // Files dragged out of this window and dropped back on it: nothing to open.
+  if (isDraggingOut()) return Promise.resolve();
   for (const handler of fileDropHandlers) if (paths.length && handler(paths, x, y)) return Promise.resolve();
   const { project, lightEdit } = useProject.getState();
   if (!paths.length || !(project || lightEdit) || isRemoteWindow() || dropOwnedAt(x, y)) return null;
@@ -71,8 +75,8 @@ export function installFileDrop(): () => void {
       .onDragDropEvent((event) => {
         const p = event.payload;
         if (p.type !== "drop") return;
-        const ratio = window.devicePixelRatio || 1;
-        void handleFileDrop(p.paths, p.position.x / ratio, p.position.y / ratio);
+        const { x, y } = nativeDropPoint(p.position);
+        void handleFileDrop(p.paths, x, y);
       })
       .then((u) => {
         if (disposed) u();

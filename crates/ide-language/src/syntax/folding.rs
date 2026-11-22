@@ -2,7 +2,7 @@
 //! comment runs, import runs and `region` / `endregion` marker comments.
 
 use super::grammars::Spec;
-use crate::{FoldKind, FoldRange};
+use crate::{FoldKind, FoldRange, LanguageConfig};
 use tree_sitter::{Language, Node, Tree, TreeCursor};
 
 const PAIRS: &[(&str, &str)] = &[("{", "}"), ("[", "]"), ("(", ")"), ("#{", "}"), ("${", "}"), ("@{", "}")];
@@ -85,7 +85,25 @@ impl KindTable {
     }
 }
 
-pub(crate) fn folding(spec: &Spec, kinds: &KindTable, tree: &Tree, text: &str) -> Vec<FoldRange> {
+#[derive(Default)]
+pub(super) struct CommentTokens {
+    line: Option<String>,
+    block: Option<(String, String)>,
+}
+
+impl From<&LanguageConfig> for CommentTokens {
+    fn from(config: &LanguageConfig) -> Self {
+        Self { line: config.line_comment.clone(), block: config.block_comment.clone() }
+    }
+}
+
+pub(super) fn folding(
+    spec: &Spec,
+    kinds: &KindTable,
+    tree: &Tree,
+    text: &str,
+    tokens: &CommentTokens,
+) -> Vec<FoldRange> {
     let mut out: Vec<FoldRange> = Vec::new();
     let mut comments: Vec<Comment> = Vec::new();
     let mut cursor = tree.walk();
@@ -96,9 +114,19 @@ pub(crate) fn folding(spec: &Spec, kinds: &KindTable, tree: &Tree, text: &str) -
                 start_row: start,
                 end_row: last_content_row(&node, text),
                 own_line: own_line(text, node.start_byte(), node.start_position().column),
-                marker: region_marker(text.get(node.start_byte()..node.end_byte()).unwrap_or_default()),
+                marker: region_marker(text.get(node.start_byte()..node.end_byte()).unwrap_or_default(), tokens),
             });
             return true;
+        }
+        // Some languages write documentation as a string-like node rather than a
+        // lexical comment (Python docstrings, Elixir `@doc` / `@moduledoc`). The
+        // generic comment pass above never sees those, so fold them as documentation.
+        if node.is_named()
+            && start != end
+            && let Some(fold) = docstring_fold(spec, &node, kinds, text)
+        {
+            out.push(fold);
+            return false;
         }
         if start != end && !spec.imports.is_empty() && node.named_child_count() > 1 {
             import_runs(kinds, node, text, &mut out);
@@ -185,7 +213,65 @@ fn visit(cursor: &mut TreeCursor, mut f: impl FnMut(Node) -> bool) {
 }
 
 pub(crate) fn is_comment(kind: &str) -> bool {
-    kind.contains("comment")
+    kind.contains("comment") || kind == "Comment"
+}
+
+/// Folds a documentation string written as a non-comment node. Returns `None`
+/// for every other node; the caller skips its subtree only on a match.
+fn docstring_fold(spec: &Spec, node: &Node, kinds: &KindTable, text: &str) -> Option<FoldRange> {
+    let multi_line = |n: &Node| n.start_position().row != n.end_position().row && kinds.has(n, FOLD_NODE);
+    let range = |n: &Node| FoldRange {
+        start_line: n.start_position().row as u32,
+        end_line: last_content_row(n, text) as u32,
+        kind: FoldKind::Comment,
+    };
+    match spec.name {
+        // A bare string as the first statement of a module/class/function body.
+        "python" if node.kind() == "expression_statement" => {
+            let string = node.named_child(0)?;
+            if string.kind() != "string" || !multi_line(&string) {
+                return None;
+            }
+            let parent = node.parent()?;
+            let mut cursor = parent.walk();
+            if parent.named_children(&mut cursor).find(|c| !kinds.has(c, COMMENT)) != Some(*node) {
+                return None;
+            }
+            Some(range(node))
+        }
+        // `@doc """…"""` / `@moduledoc """…"""`: an @-prefixed call whose
+        // argument is a multi-line string (or a sigil like `~S"""`).
+        "elixir" if node.kind() == "unary_operator" => {
+            let operand = node.child_by_field_name("operand")?;
+            if operand.kind() != "call" || !is_elixir_doc_attr(operand, text) {
+                return None;
+            }
+            // The string is the argument of the attribute call: `@doc """…"""`
+            // parses as unary_operator -> call(target: doc) -> arguments -> string.
+            let mut cursor = operand.walk();
+            let doc_string =
+                operand.named_children(&mut cursor).find(|c| c.kind() == "arguments").and_then(|args| {
+                    let mut args_cursor = args.walk();
+                    args.named_children(&mut args_cursor).find(|c| multi_line(c))
+                })?;
+            if !matches!(doc_string.kind(), "string" | "sigil") {
+                return None;
+            }
+            Some(range(&doc_string))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an Elixir `call` is `@doc` / `@moduledoc` / `@typedoc` (the documented
+/// attributes that take a string argument).
+fn is_elixir_doc_attr(call: Node, text: &str) -> bool {
+    let Some(target) = call.child_by_field_name("target") else { return false };
+    let name = text.get(target.byte_range()).unwrap_or_default();
+    if target.kind() != "identifier" {
+        return false;
+    }
+    matches!(name, "doc" | "moduledoc" | "typedoc")
 }
 
 /// Row of the closing token when `node` is delimited by a matching bracket pair.
@@ -220,19 +306,62 @@ fn own_line(text: &str, byte: usize, column: usize) -> bool {
 }
 
 /// `Some(true)` for a region start marker, `Some(false)` for an end marker.
-fn region_marker(comment: &str) -> Option<bool> {
-    let body = comment
-        .trim_start_matches(['/', '*', '#', '-', ';', '%', '!', '<', ' ', '\t'])
-        .trim_start_matches("--")
-        .trim_start();
-    let lower = body.get(..body.len().min(32))?.to_ascii_lowercase();
-    if lower.starts_with("endregion") || lower.starts_with("#endregion") || lower.starts_with("</editor-fold") {
+/// Strip whole configured delimiters, preserving the `<` in editor-fold tags.
+pub(super) fn region_marker(comment: &str, tokens: &CommentTokens) -> Option<bool> {
+    let comment = comment.trim();
+    let body = if let Some((open, close)) = &tokens.block
+        && let Some(body) = comment.strip_prefix(open.as_str())
+    {
+        let body = body.trim_end().strip_suffix(close.as_str())?;
+        if open == "/*" { body.trim_start_matches('*') } else { body }
+    } else if let Some(open) = &tokens.line
+        && let Some(body) = comment.strip_prefix(open.as_str())
+    {
+        match open.as_str() {
+            "//" => body.trim_start_matches('/'),
+            ";" => body.trim_start_matches(';'),
+            _ => body,
+        }
+    } else {
+        return None;
+    };
+    let body = body.trim();
+    if body.contains(['\n', '\r']) {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    let region = lower.strip_prefix('#').unwrap_or(&lower);
+    let boundary = |tail: &str| !tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+    if region.strip_prefix("endregion").is_some_and(boundary)
+        || lower
+            .strip_prefix("</editor-fold")
+            .and_then(|tail| tail.strip_suffix('>'))
+            .is_some_and(|tail| tail.trim().is_empty())
+    {
         Some(false)
-    } else if lower.starts_with("region") || lower.starts_with("#region") || lower.starts_with("<editor-fold") {
+    } else if region.strip_prefix("region").is_some_and(boundary)
+        || lower.strip_prefix("<editor-fold").is_some_and(|tail| boundary(tail) && tail.contains('>'))
+    {
         Some(true)
     } else {
         None
     }
+}
+
+/// Languages without a bundled grammar still support own-line custom markers.
+pub(super) fn custom_folding(text: &str, tokens: &CommentTokens) -> Vec<FoldRange> {
+    let comments: Vec<_> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(row, line)| {
+            let marker = region_marker(line, tokens)?;
+            Some(Comment { start_row: row, end_row: row, own_line: true, marker: Some(marker) })
+        })
+        .collect();
+    let mut out = Vec::new();
+    comment_folds(&comments, &mut out);
+    out.sort_by_key(|f| f.start_line);
+    out
 }
 
 fn comment_folds(comments: &[Comment], out: &mut Vec<FoldRange>) {

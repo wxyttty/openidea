@@ -4,7 +4,7 @@
  */
 import { tx } from "@/platform/i18n";
 import { workflowSettings } from "@/platform/workflowSettings";
-import { executeAction } from "@/platform/actions";
+import { executeAction, getAction } from "@/platform/actions";
 import { create } from "zustand";
 import { AnsiStream, appendSpans, type Span } from "@/ui/ansi";
 import { setContext } from "@/platform/context";
@@ -16,6 +16,7 @@ import {
   type DebugCapabilities,
   type DebugEvent,
   type DebugSessionId,
+  type JvmBackendState,
   type LaunchConfig,
   type RunId,
   type RunConfig,
@@ -23,14 +24,41 @@ import {
   type ThreadInfo,
   type Variable,
 } from "@/platform/ipc";
-import { maybeEditorService, notifications, toolWindowService, useDebugRunSessions } from "@/workbench/contributions";
+import { confirmTerminate } from "@/workbench/confirmTerminate";
+import {
+  maybeEditorService,
+  notifications,
+  runOutput,
+  SERVICES_WINDOW,
+  toolWindowService,
+  useDebugRunSessions,
+} from "@/workbench/contributions";
+import { startedPort } from "@/platform/serverPort";
 import { breakpointsOf, consumeTemporary, flushBreakpoints, refreshStates, resetStatuses } from "./breakpoints/store";
 import { interpolateLog, logParts, suspends } from "./breakpoints/model";
 import { syncSpecial, useSpecialBreakpoints } from "./breakpoints/special";
 import { refreshExceptionFilters } from "./breakpoints/exceptions";
+import { flashTaskbarForBreakpoint, stopTaskbarFlash } from "./taskbarFlash";
+import { useProject } from "@/platform/project";
+import { isRemoteWindow } from "@/platform/remote";
+import { queueNetworkEvent } from "./js/network";
+import { setRefused } from "./js/refusals";
+import {
+  browserLaunch,
+  installedDebugBrowser,
+  isBrowserLaunch,
+  isNodeLaunch,
+  launchedBrowser,
+  launchedUrl,
+  loopbackUrls,
+} from "./browser";
 import { missingAdapter } from "./missingAdapter";
+import { startFailureMessage } from "./startFailure";
+import { evaluateWithImports, forgetImports } from "./classImports";
+import { JAVA_ADAPTER } from "./java";
+import { isTracing, markTraceStop } from "./streams/streamStore";
 
-export type SessionStatus = "starting" | "running" | "paused" | "terminated";
+export type SessionStatus = "starting" | "running" | "paused" | "stopping" | "terminated";
 
 export interface DebugSession {
   id: DebugSessionId;
@@ -38,25 +66,58 @@ export interface DebugSession {
   /** Originating configuration, retained for toolbar targeting and prepared debug reruns. */
   runConfig?: RunConfig;
   startedAt?: number;
+  /** When it terminated. */
+  endedAt?: number;
   adapter: string;
   parent: DebugSessionId | null;
   /** Launch configuration (root sessions), used by Rerun. */
   launch: LaunchConfig | null;
+  /** The program runs in a terminal the IDE gave it: the console types into it while it runs. */
+  programInput?: boolean;
   /** Process the session is attached to (a Run tab's build tool); stopped with the session. */
   process: RunId | null;
+  /** Pinned tab (root sessions): once finished, a later session opens a new tab instead of taking its place. */
+  pinned?: boolean;
+  /** Started in place from the Services tool window (root sessions): its stops show it there, not in the Debug window. */
+  inPlace?: boolean;
   status: SessionStatus;
   stoppedThread: number | null;
   stopReason: string | null;
   stopDescription: string | null;
+  /**
+   * Threads stopped alone (a `stopped` event without `allThreadsStopped`), oldest first. Adapters
+   * such as java-debug keep them suspended while another thread runs.
+   */
+  suspendedThreads?: SuspendedThread[];
+  /** The last stop suspended every thread. */
+  allThreadsStopped?: boolean;
   threads: ThreadInfo[];
   selectedThread: number | null;
   frames: StackFrame[];
   selectedFrame: number | null;
   /** Breakpoint hits in this session. */
   hits: number;
+  /** `stopped` events of this session; unlike the global `stopSeq`, no other session or value edit moves it. */
+  stops: number;
   exitCode: number | null;
   /** What the adapter supports (fetched after start). */
   caps: DebugCapabilities | null;
+  /** State of the backend that reads a JVM's objects; absent until the backend reports one. */
+  jvmBackend?: JvmBackendState;
+  /** Flutter: the app's VM Service, which DevTools connects to. */
+  vmServiceUri?: string;
+  /** Flutter: the device the app runs on. */
+  flutterDevice?: string | null;
+  /** A cancelled JDT build may have lost class-file deltas needed by this session. */
+  hotSwapNeedsRestart?: boolean;
+  /** `flutter debug_adapter` reported the app as started: it can take a hot reload. */
+  flutterAppStarted?: boolean;
+}
+
+export interface SuspendedThread {
+  id: number;
+  reason: string;
+  description: string | null;
 }
 
 export interface ConsoleLine {
@@ -66,6 +127,8 @@ export interface ConsoleLine {
   text: string;
   /** `text` styled by its ANSI colours. */
   spans: Span[];
+  /** A carriage return ended the output so far: the next text replaces the line. */
+  cr?: boolean;
 }
 
 interface DebugState {
@@ -76,6 +139,11 @@ interface DebugState {
   watches: string[];
   /** Incremented on every stop; views re-pull data when it changes. */
   stopSeq: number;
+  /**
+   * Incremented when the adapter says it has new values for the suspended frame (`invalidated`).
+   * Separate from `stopSeq`: no stop happened, so nothing may count as changed and the Memory view stays put.
+   */
+  variablesEpoch: number;
 }
 
 export const useDebug = create<DebugState>(() => ({
@@ -84,6 +152,7 @@ export const useDebug = create<DebugState>(() => ({
   console: {},
   watches: [],
   stopSeq: 0,
+  variablesEpoch: 0,
 }));
 
 /** Execution point of the selected frame, plus the frame's locals for inline values. */
@@ -93,9 +162,17 @@ interface ExecutionPoint {
   /** The selected frame is the top frame (current position, not a caller). */
   top: boolean;
   values: Record<string, string>;
+  /** Full variables behind `values`, for the click-to-show popup. */
+  variables?: Record<string, Variable>;
 }
 
-export const useExecutionPoint = create<ExecutionPoint>(() => ({ path: null, line: 0, top: true, values: {} }));
+export const useExecutionPoint = create<ExecutionPoint>(() => ({
+  path: null,
+  line: 0,
+  top: true,
+  values: {},
+  variables: {},
+}));
 
 /** Console buffer: at most this many physical lines per session. */
 const MAX_CONSOLE_LINES = 50_000;
@@ -127,6 +204,12 @@ function ansiStream(session: DebugSessionId, category: string): AnsiStream {
   return stream;
 }
 
+/** Styled output, keeping a carriage return (and erase-line) for the console to overwrite its line. */
+function outputSpans(session: DebugSessionId, category: string, raw: string): Span[] {
+  const stream = ansiStream(session, category);
+  return stream.spans(stream.clean(raw).replace(/\r\n/g, "\n"));
+}
+
 // --- accessors ---------------------------------------------------------------
 
 export function activeSession(): DebugSession | null {
@@ -137,6 +220,16 @@ export function activeSession(): DebugSession | null {
 export function isLive(s: DebugSession | null | undefined): boolean {
   return !!s && s.status !== "terminated";
 }
+
+/** The session the Debug tool window's Stop acts on: the selected one while it runs (any live one when none is selected). */
+export function stopTarget(): DebugSession | null {
+  const s = activeSession();
+  if (s) return isLive(s) ? s : null;
+  return Object.values(useDebug.getState().sessions).find(isLive) ?? null;
+}
+
+/** Whether the session with this id is still there and running, as of now. */
+export const isLiveSession = (id: DebugSessionId) => isLive(useDebug.getState().sessions[id]);
 
 /** Root (user-started) session of `s`. */
 export function rootOf(s: DebugSession): DebugSession {
@@ -173,6 +266,7 @@ function blank(id: DebugSessionId, p: Partial<DebugSession> = {}): DebugSession 
     frames: [],
     selectedFrame: null,
     hits: 0,
+    stops: 0,
     exitCode: null,
     caps: null,
     ...p,
@@ -223,14 +317,71 @@ function ownSession(id: DebugSessionId, event: DebugEvent): DebugSession | null 
   return event.kind === "started" ? adoptSession(id, { name: event.name, adapter: event.adapter }) : adoptSession(id);
 }
 
-/** A start finished (`id` on success): sessions no start claimed are failed starts' leftovers. */
-function settleStart(id: DebugSessionId | null) {
+/**
+ * A start finished (`id` on success): sessions no start claimed are failed starts' leftovers,
+ * kept as terminated or, with `discard`, removed.
+ */
+function settleStart(id: DebugSessionId | null, discard = false) {
   pendingStarts = Math.max(0, pendingStarts - 1);
   if (id != null) provisional.delete(id);
   if (pendingStarts > 0) return;
   const leftovers = [...provisional];
   provisional.clear();
+  if (discard) {
+    useDebug.setState((st) => {
+      const sessions = { ...st.sessions };
+      const console = { ...st.console };
+      for (const s of leftovers) {
+        delete sessions[s];
+        delete console[s];
+        ansiStreams.delete(s);
+      }
+      return { sessions, console, active: st.active != null && sessions[st.active] ? st.active : null };
+    });
+    publishContext();
+    return;
+  }
   for (const s of leftovers) if (isLive(useDebug.getState().sessions[s])) markTerminated(s);
+}
+
+/** The session being rerun: its tab is the one the new session takes, pinned or not. */
+let rerunOf: DebugSessionId | null = null;
+
+/**
+ * As IDEA reuses run content: a new session takes the place of one finished tab (with its
+ * children) that isn't pinned, preferring one named like it, then the selected one; other
+ * finished tabs stay. Returns whether the new tab is pinned: as the tab it replaced on a
+ * rerun, else per the settings.
+ */
+function replaceFinished(name: string): boolean | undefined {
+  const { sessions, active } = useDebug.getState();
+  const own = rerunOf != null ? sessions[rerunOf] : undefined;
+  rerunOf = null;
+  if (own && !isLive(own)) {
+    removeSession(own.id);
+    return own.pinned;
+  }
+  const finished = Object.values(sessions).filter((s) => s.parent == null && !isLive(s) && !s.pinned);
+  const selected = active != null ? sessions[active] : undefined;
+  const ordered =
+    selected && finished.includes(selected) ? [selected, ...finished.filter((s) => s !== selected)] : finished;
+  const reused = ordered.find((s) => s.name === name) ?? ordered[0];
+  if (reused) removeSession(reused.id);
+  return workflowSettings().run.pinTabs || undefined;
+}
+
+/**
+ * A JDWP agent in server mode listens again, on a new port, when its debugger detaches; a
+ * debugger that detaches as the JVM exits leaves an announcement of a JVM about to be gone.
+ * An attach to `process` this soon after a session on it ended may be to such a JVM.
+ */
+const RELISTEN_MS = 3000;
+export function justDetached(process: RunId | null | undefined): boolean {
+  if (process == null) return false;
+  const now = Date.now();
+  return Object.values(useDebug.getState().sessions).some(
+    (s) => s.process === process && s.status === "terminated" && s.endedAt != null && now - s.endedAt < RELISTEN_MS,
+  );
 }
 
 export function publishContext() {
@@ -248,7 +399,10 @@ export function publishContext() {
           startedAt: session.startedAt ?? 0,
           status: paused ? ("paused" as const) : session.status,
           processId: session.process,
+          httpPort: sessionHttpPort(session.id),
           rerun: session.runConfig || session.launch ? () => void rerunSession(session.id) : null,
+          rerunInPlace:
+            session.runConfig || session.launch ? () => void rerunSession(session.id, { show: false }) : null,
           stop: (options?: { stopProcess?: boolean }) => stopSession(session.id, options),
           show: () => {
             if (!useDebug.getState().sessions[session.id]) return;
@@ -269,6 +423,7 @@ export function publishContext() {
           configId: session.runConfig?.id ?? null,
           name: session.runConfig?.name ?? session.name,
           startedAt: session.startedAt ?? 0,
+          status: session.status,
           paused: !!paused,
           rerun: session.runConfig || session.launch ? () => void rerunSession(session.id) : null,
           stop: () => void stopSession(session.id),
@@ -281,21 +436,74 @@ export function publishContext() {
   });
   const anyLive = Object.values(useDebug.getState().sessions).some(isLive);
   setContext("debugSessionActive", anyLive);
+  // Stop acts on the selected session tab, so a finished one doesn't stop another session.
+  setContext("debugCanStop", !!stopTarget());
   setContext("debugSessionRunning", s?.status === "running");
   setContext("debugSessionPaused", s?.status === "paused");
+  // Dart and Flutter sessions: Hot Reload / Hot Restart.
+  setContext("debugSessionDart", !!s && rootOf(s).adapter === "dart");
   setContext("debugCanRerun", !!s && !!(rootOf(s).runConfig || rootOf(s).launch));
   setContext(
     "debugCanHotSwap",
     Object.values(useDebug.getState().sessions).some((x) => isLive(x) && !!x.caps?.hotCodeReplace),
   );
+  setContext("debugHasVmService", !!s && isLive(s) && !!rootOf(s).vmServiceUri);
+  // Refresh Memory View acts on the selected session only.
+  setContext("debugHasJvmMemory", !!s && isLive(s) && sessionSupports("jvmMemory", s));
+  setContext("debugHasJsPage", !!s && isLive(s) && sessionSupports("jsPage", s));
+  setContext("debugStreamTracing", !!s && isTracing(s.id));
+  setContext(
+    "debugAnyStreamTracing",
+    Object.values(useDebug.getState().sessions).some((x) => isTracing(x.id)),
+  );
+  setContext("debugCanTraceStream", canTraceStream(s));
 }
 
 // --- console -----------------------------------------------------------------
 
+/**
+ * The HTTP port the session's application announced on its console ("Tomcat started on
+ * port 8080"), the same embedded web server line the Run console is parsed for. Kept per
+ * session, so the Services node keeps the port after the line scrolls out of the buffer.
+ */
+const announcedPorts = new Map<DebugSessionId, number>();
+
+export function sessionHttpPort(id: DebugSessionId): number | undefined {
+  let port: number | undefined;
+  for (const line of useDebug.getState().console[id] ?? []) {
+    const found = startedPort(line.text);
+    if (found !== null) port = found;
+  }
+  if (port !== undefined) announcedPorts.set(id, port);
+  else port = announcedPorts.get(id);
+  return port;
+}
+
+/** Republishes Services metadata only when a console announced a port it had not shown yet. */
+function republishForPorts() {
+  const published = useDebugRunSessions.getState().serviceSessions;
+  if (published.some((d) => d.httpPort !== sessionHttpPort(d.id))) publishContext();
+}
+
+/** Sessions attached to a process Run started: their Console follows its output. */
+const processOutput = new Map<DebugSessionId, () => void>();
+
+/** Shows the output of the Run process `process` in the Console of `session`, as a launched program's. */
+function followProcessOutput(session: DebugSessionId, process: RunId) {
+  processOutput.get(session)?.();
+  const unsubscribe = runOutput()?.subscribe(process, (kind, text) => appendConsoleQueued(session, kind, text));
+  if (unsubscribe) processOutput.set(session, unsubscribe);
+}
+
+function unfollowProcessOutput(session: DebugSessionId) {
+  processOutput.get(session)?.();
+  processOutput.delete(session);
+}
+
 export function appendConsole(session: DebugSessionId, category: string, raw: string) {
   if (!raw) return;
   flushConsoleOutput();
-  const spans = ansiStream(session, category).parse(raw);
+  const spans = outputSpans(session, category, raw);
   const text = spans.map((sp) => sp.text).join("");
   if (!text) return;
   useDebug.setState((s) => {
@@ -305,6 +513,7 @@ export function appendConsole(session: DebugSessionId, category: string, raw: st
     trimConsole(next);
     return { console: { ...s.console, [session]: next } };
   });
+  republishForPorts();
 }
 
 /**
@@ -332,13 +541,15 @@ function flushConsoleOutput() {
   cancelOutputFlush();
   if (pendingOutput.length === 0) return;
   const chunks = pendingOutput.splice(0);
+  const printed: Array<[DebugSessionId, string]> = [];
   useDebug.setState((s) => {
     const consoleBySession = { ...s.console };
     for (const { session, category, raw } of chunks) {
       if (!s.sessions[session]) continue;
-      const spans = ansiStream(session, category).parse(raw);
+      const spans = outputSpans(session, category, raw);
       const text = spans.map((sp) => sp.text).join("");
       if (!text) continue;
+      printed.push([session, text]);
       const prev = consoleBySession[session] ?? [];
       const next = [...prev];
       appendConsoleLines(next, category, spans);
@@ -347,28 +558,147 @@ function flushConsoleOutput() {
     }
     return { console: consoleBySession };
   });
+  republishForPorts();
+  for (const [session, text] of printed) debugServerPage(session, text);
 }
 
-/** Split styled output at real line breaks, retaining partial lines across events. */
+/**
+ * A browser launch shows as its page (`sessionTabs`), so a selected launch passes the selection
+ * to its page. Either may exist first: the page's `started` event can precede the launch's result.
+ */
+function selectBrowserPage(launch: DebugSessionId) {
+  const st = useDebug.getState();
+  if (st.active !== launch || !isBrowserLaunch(st.sessions[launch]?.launch ?? null)) return;
+  const page = Object.values(st.sessions).find((s) => s.parent === launch);
+  if (!page) return;
+  useDebug.setState({ active: page.id });
+  publishContext();
+}
+
+/** `url` as `location.href` spells it (`http://localhost:5173` → `http://localhost:5173/`). */
+function canonicalUrl(url: string): string {
+  try {
+    return new URL(url).href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Debugs the page `launch` opens. A project has one browser of a kind under the debugger (a
+ * second one can't share its profile), so when it is already running its page goes to the URL
+ * instead and becomes the selected session.
+ */
+export async function startBrowserSession(
+  launch: LaunchConfig,
+  options: Parameters<typeof startSession>[1] = {},
+): Promise<DebugSessionId | null> {
+  const { sessions } = useDebug.getState();
+  const browser = launchedBrowser(launch);
+  const running = Object.values(sessions).find(
+    (s) => s.parent == null && isLive(s) && s.launch?.cwd === launch.cwd && launchedBrowser(s.launch) === browser,
+  );
+  if (!running) return startSession(launch, options);
+  const page = Object.values(sessions).find((s) => s.parent === running.id && isLive(s));
+  if (!page) return running.id;
+  selectSession(page.id);
+  const url = launchedUrl(launch);
+  if (url) {
+    // The page may have moved on since the browser started (an earlier launch, a link): it
+    // compares its own address, so a page already there isn't reloaded. The address is made
+    // canonical here, the page's own `URL` may be anything.
+    const target = JSON.stringify(canonicalUrl(url));
+    const go = `location.href !== ${target} && location.assign(${target})`;
+    await call(commands.debugEvaluateIn(page.id, null, go, "repl")).catch(() => undefined);
+  }
+  return running.id;
+}
+
+/**
+ * What a debugged Node.js program has shown about its page: the URLs already asked, and the
+ * browser session on the one that answered (null while it starts, undefined until one does).
+ */
+interface ServerPage {
+  asked: Set<string>;
+  page: DebugSessionId | null | undefined;
+}
+
+const serverPages = new Map<DebugSessionId, ServerPage>();
+
+/** URLs asked per run: a program that keeps logging addresses isn't probed without end. */
+const SERVER_URLS_ASKED = 5;
+
+/**
+ * Debugging a program that serves a page (a dev server behind an npm script, an app with
+ * server-side rendering) also debugs the page: each address of this machine it prints is
+ * asked whether it answers with an HTML document, and a browser session opens on the first
+ * that does. An API never gets one. The session ends with the server (`markTerminated`);
+ * closing the browser leaves the server running.
+ */
+function debugServerPage(id: DebugSessionId, output: string) {
+  if (!workflowSettings().debugger.debugServerPage || isRemoteWindow()) return;
+  const s = useDebug.getState().sessions[id];
+  const root = s && rootOf(s);
+  if (!root || !isLive(root) || !isNodeLaunch(root.launch)) return;
+  const known = serverPages.get(root.id) ?? { asked: new Set<string>(), page: undefined };
+  if (known.page !== undefined) return;
+  for (const url of loopbackUrls(output)) {
+    if (known.asked.has(url) || known.asked.size >= SERVER_URLS_ASKED) continue;
+    known.asked.add(url);
+    serverPages.set(root.id, known);
+    void openServerPage(root, known, url);
+  }
+}
+
+async function openServerPage(server: DebugSession, known: ServerPage, url: string) {
+  const isPage = await call(commands.webServesPage(url)).catch(() => false);
+  // Another address may have answered first, or the server stopped meanwhile.
+  if (!isPage || known.page !== undefined || serverPages.get(server.id) !== known) return;
+  known.page = null;
+  const root = useProject.getState().project?.root ?? server.launch?.cwd ?? "";
+  // The server's directory holds the page's sources; the session itself is the project's.
+  const launch = {
+    ...browserLaunch(new URL(url).host, url, await installedDebugBrowser(), server.launch?.cwd ?? root),
+    cwd: root,
+  };
+  const before = useDebug.getState().sessions;
+  const page = await startBrowserSession(launch, { show: false }).catch(() => null);
+  // A browser the user was already debugging in is theirs to stop.
+  if (page == null || before[page]) return;
+  if (serverPages.get(server.id) === known) known.page = page;
+  else void stopSession(page);
+}
+
+/**
+ * Split styled output at real line breaks, retaining partial lines across events. As in the
+ * Run console, a carriage return makes the next text replace the line (progress bars).
+ */
 function appendConsoleLines(lines: ConsoleLine[], category: string, spans: Span[]) {
   const last = lines.at(-1);
   let line =
     last && last.category === category && !last.text.endsWith("\n") ? { ...last, spans: [...last.spans] } : undefined;
   if (line) lines[lines.length - 1] = line;
   for (const span of spans) {
-    let start = 0;
-    while (start < span.text.length) {
-      const newline = span.text.indexOf("\n", start);
-      const end = newline < 0 ? span.text.length : newline + 1;
-      const text = span.text.slice(start, end);
+    for (const piece of span.text.split(/(\r|\n)/)) {
+      if (piece === "\r") {
+        if (line) line.cr = true;
+        continue;
+      }
+      if (!piece) continue;
       if (!line) {
         line = { id: ++lineSeq, category, text: "", spans: [] };
         lines.push(line);
       }
-      line.text += text;
-      line.spans = appendSpans(line.spans, [{ ...span, text }]);
-      if (newline >= 0) line = undefined;
-      start = end;
+      if (line.cr) {
+        line.cr = undefined;
+        if (piece !== "\n") {
+          line.text = "";
+          line.spans = [];
+        }
+      }
+      line.text += piece;
+      line.spans = appendSpans(line.spans, [{ ...span, text: piece }]);
+      if (piece === "\n") line = undefined;
     }
   }
 }
@@ -409,21 +739,30 @@ const preparations = new Map<DebugSessionId, AbortController>();
 export async function startPreparedSession(
   config: RunConfig,
   prepare: (signal: AbortSignal, report: (text: string, kind?: "system" | "stderr") => void) => Promise<LaunchConfig>,
+  options: { show?: boolean } = {},
 ): Promise<DebugSessionId | null> {
   const id = --preparationSeq as DebugSessionId;
   const controller = new AbortController();
   preparations.set(id, controller);
+  // The new tab takes the place of a finished one while its build runs, not once the adapter starts.
+  const pinned = replaceFinished(config.name);
   useDebug.setState((s) => ({
     sessions: {
       ...s.sessions,
-      [id]: blank(id, { name: config.name, adapter: config.debugAdapter ?? "", runConfig: config }),
+      [id]: blank(id, {
+        name: config.name,
+        adapter: config.debugAdapter ?? "",
+        runConfig: config,
+        pinned,
+        inPlace: options.show === false,
+      }),
     },
     console: { ...s.console, [id]: [] },
     active: id,
   }));
   publishContext();
   try {
-    if (workflowSettings().run.showOnStart) toolWindowService().show("debug");
+    if (options.show !== false && workflowSettings().run.showOnStart) toolWindowService().show("debug");
   } catch {
     /* no workbench (tests) */
   }
@@ -434,7 +773,11 @@ export async function startPreparedSession(
     report(tx`Starting debugger for ${config.name}…` + "\n");
     const launch = await prepare(controller.signal, report);
     controller.signal.throwIfAborted();
-    return await startSession(launch, { runConfig: config, preparation: { id, signal: controller.signal } });
+    return await startSession(launch, {
+      runConfig: config,
+      preparation: { id, signal: controller.signal },
+      show: options.show,
+    });
   } catch (e) {
     if (controller.signal.aborted || isCancelled(e)) return null;
     report((e instanceof Error ? e.message : String(e)) + "\n", "stderr");
@@ -454,22 +797,20 @@ export async function startSession(
     process?: RunId | null;
     /** Rerun repeats the launch (false for attaching to a process that is gone afterwards). */
     rerunnable?: boolean;
+    /** `false`: keep the current tool window (the Services panel starts debuggers in place). */
+    show?: boolean;
   } = {},
 ): Promise<DebugSessionId | null> {
   if (!isTauri()) {
     notifications().notify({ group: "run", level: "warning", title: "Debugging needs the desktop app" });
     return null;
   }
-  // Drop finished sessions; keep running ones (multiple concurrent sessions are fine).
-  useDebug.setState((s) => {
-    const sessions = Object.fromEntries(Object.entries(s.sessions).filter(([, v]) => isLive(v)));
-    const consoleLines = Object.fromEntries(Object.entries(s.console).filter(([k]) => sessions[+k]));
-    for (const id of ansiStreams.keys()) if (!sessions[id]) ansiStreams.delete(id);
-    return { sessions, console: consoleLines, active: s.active != null && sessions[s.active] ? s.active : null };
-  });
-  publishContext();
+  // Attaching to a JVM that may be gone: the finished session stays until the attach succeeds.
+  const afterDetach = justDetached(options.process);
+  const previousActive = useDebug.getState().active;
+  let pinned = !afterDetach && !options.preparation ? replaceFinished(launch.name) : undefined;
   try {
-    if (workflowSettings().run.showOnStart) toolWindowService().show("debug");
+    if (options.show !== false && workflowSettings().run.showOnStart) toolWindowService().show("debug");
   } catch {
     // Workbench not ready (tests).
   }
@@ -482,6 +823,7 @@ export async function startSession(
     const id = await call(commands.debugStart(launch));
     console.info("Debug adapter started", { name: launch.name, ms: performance.now() - adapterStarted });
     owned.add(id);
+    if (afterDetach && !options.preparation) pinned = replaceFinished(launch.name);
     if (options.preparation?.signal.aborted) {
       await call(commands.debugStop(id)).catch(() => undefined);
       settleStart(id);
@@ -509,9 +851,12 @@ export async function startSession(
             name: launch.name,
             runConfig: options.runConfig,
             startedAt: preparation?.startedAt ?? startedAt,
-            adapter: launch.adapter,
+            // The backend may start another adapter than the one asked for; `launch` keeps the request for Rerun.
+            adapter: cur.adapter || launch.adapter,
             launch: options.rerunnable === false ? null : launch,
             process: options.process ?? null,
+            pinned: preparation ? preparation.pinned : pinned,
+            inPlace: options.show === false,
             status: cur.status === "starting" ? "running" : cur.status,
           },
         },
@@ -519,6 +864,8 @@ export async function startSession(
       };
     });
     settleStart(id);
+    if (options.process != null) followProcessOutput(id, options.process);
+    selectBrowserPage(id);
     publishContext();
     void refreshExceptionFilters();
     void loadCapabilities(id);
@@ -526,7 +873,16 @@ export async function startSession(
     void syncSpecial();
     return id;
   } catch (e) {
-    settleStart(null);
+    settleStart(null, afterDetach);
+    if (afterDetach) {
+      // The JVM that announced the port ended as its previous debugger detached.
+      console.info("Debugger not attached: the JVM is gone", { name: launch.name, error: e });
+      const { sessions, active } = useDebug.getState();
+      if (active == null && previousActive != null && sessions[previousActive])
+        useDebug.setState({ active: previousActive });
+      publishContext();
+      return null;
+    }
     if (options.preparation?.signal.aborted || isCancelled(e)) return null;
     if (options.preparation)
       appendConsole(options.preparation.id, "stderr", (e instanceof Error ? e.message : String(e)) + "\n");
@@ -541,7 +897,7 @@ export async function startSession(
         sticky: true,
         actions: [
           {
-            label: "Install and Debug",
+            label: missing.action ?? "Install and Debug",
             run: () => void executeAction("tools.install", missing.tool).then(() => startSession(launch, options)),
           },
         ],
@@ -552,11 +908,17 @@ export async function startSession(
       group: "run",
       level: "error",
       title: `Cannot start debugger for ${launch.name}`,
-      body: e instanceof Error ? e.message : String(e),
+      body: startFailureMessage(e),
       key: "debug.start",
     });
     return null;
   }
+}
+
+/** Stops an associated Run process through its owner, which records the user's stop intent. */
+export async function stopAssociatedProcess(process: RunId): Promise<void> {
+  if (getAction("run.stopProcess")) await executeAction("run.stopProcess", process);
+  else await call(commands.runStop(process)).catch(() => undefined);
 }
 
 export async function stopSession(id: DebugSessionId, options: { stopProcess?: boolean } = {}) {
@@ -570,6 +932,14 @@ export async function stopSession(id: DebugSessionId, options: { stopProcess?: b
     markTerminated(root.id);
     return;
   }
+  // Between the Stop press and the adapter's terminated event the session is shutting down:
+  // keep it live (Run stays disabled) and let the toolbar show the spinner.
+  for (const sid of new Set([root.id, s.id])) {
+    const target = useDebug.getState().sessions[sid];
+    if (target && isLive(target)) patch(sid, { status: "stopping" });
+  }
+  const stoppingProcess =
+    options.stopProcess !== false && root.process != null ? stopAssociatedProcess(root.process) : null;
   try {
     await call(commands.debugStop(root.id));
   } catch (e) {
@@ -577,24 +947,98 @@ export async function stopSession(id: DebugSessionId, options: { stopProcess?: b
     console.warn("debugStop failed", e);
     markTerminated(root.id);
   }
-  // Detaching leaves an attached JVM running: stop the process it belongs to, like IDEA.
-  if (options.stopProcess !== false && root.process != null)
-    await call(commands.runStop(root.process)).catch(() => undefined);
+  await stoppingProcess;
 }
 
-export async function rerunSession(id: DebugSessionId) {
+/**
+ * Closes a session's tab: a live session is stopped first once the user agrees (the Run
+ * tab's question), then the window forgets it — and its children.
+ */
+export async function closeSessionTab(id: DebugSessionId): Promise<boolean> {
+  const s = useDebug.getState().sessions[id];
+  if (!s) return false;
+  if (isLive(s)) {
+    if (workflowSettings().run.confirmTerminate && !(await confirmTerminate(s.name))) return false;
+    await stopSession(s.id);
+  }
+  removeSession(s.id);
+  // As in IDEA, the tool window and its stripe button go away with its last tab.
+  if (!Object.keys(useDebug.getState().sessions).length) {
+    try {
+      toolWindowService().hide("debug", { removeFromStripe: true });
+    } catch {
+      // Workbench not ready (tests).
+    }
+  }
+  return true;
+}
+
+/** Pins or unpins a session's tab. */
+export function pinSession(id: DebugSessionId, pinned: boolean) {
+  patch(id, { pinned });
+}
+
+/**
+ * Forgets a session and its descendants (Node's `pnpm` → `pnpm.cjs` → `rspack.js`); a selected
+ * one passes the selection to the tab on its left.
+ */
+export function removeSession(id: DebugSessionId) {
+  const st = useDebug.getState();
+  const gone = new Set<DebugSessionId>([id]);
+  for (let added = true; added;) {
+    added = false;
+    for (const s of Object.values(st.sessions))
+      if (s.parent != null && gone.has(s.parent) && !gone.has(s.id)) {
+        gone.add(s.id);
+        added = true;
+      }
+  }
+
+  const order = Object.values(st.sessions).map((s) => s.id);
+  const sessions: Record<number, DebugSession> = {};
+  for (const s of Object.values(st.sessions)) if (!gone.has(s.id)) sessions[s.id] = s;
+  const console = { ...st.console };
+  for (const goneId of gone) delete console[goneId];
+  const at = order.indexOf(id);
+  const neighbour =
+    order
+      .slice(0, at)
+      .reverse()
+      .find((n) => sessions[n]) ??
+    order.slice(at + 1).find((n) => sessions[n]) ??
+    null;
+
+  useDebug.setState({
+    sessions,
+    active: st.active != null && sessions[st.active] ? st.active : neighbour,
+    console,
+  });
+  for (const goneId of gone) {
+    owned.delete(goneId);
+    ansiStreams.delete(goneId);
+    unfollowProcessOutput(goneId);
+  }
+  updateExecutionPoint();
+  publishContext();
+}
+
+export async function rerunSession(id: DebugSessionId, options: { show?: boolean } = {}) {
   const s = useDebug.getState().sessions[id];
   if (!s) return;
   const root = rootOf(s);
-  if (root.runConfig) {
-    if (isLive(root)) await stopSession(root.id);
-    await executeAction("run.debugConfig", root.runConfig);
-    return;
-  }
   const launch = root.launch;
-  if (!launch) return;
+  if (!root.runConfig && !launch) return;
   if (isLive(root)) await stopSession(root.id);
-  await startSession(launch);
+  rerunOf = root.id;
+  // A session debugged in place from Services reruns there too.
+  const show = options.show ?? (root.inPlace ? false : undefined);
+  try {
+    if (root.runConfig)
+      await executeAction("run.debugConfig", show === false ? { config: root.runConfig, show: false } : root.runConfig);
+    else await startSession(launch!, { show });
+  } finally {
+    rerunOf = null;
+  }
 }
 
 async function loadCapabilities(id: DebugSessionId) {
@@ -611,8 +1055,36 @@ export function sessionSupports(cap: keyof DebugCapabilities, s: DebugSession | 
   return !!s?.caps?.[cap];
 }
 
+export function canTraceStream(s: DebugSession | null): boolean {
+  return !!s && s.status === "paused" && sessionSupports("streamTrace", s) && !isTracing(s.id);
+}
+
+/** The thread a paused session's actions act on. */
+export function pausedThread(s: DebugSession): number | null {
+  return s.selectedThread ?? s.stoppedThread ?? s.threads[0]?.id ?? null;
+}
+
+export function isThreadSuspended(s: DebugSession, threadId: number): boolean {
+  if (s.status !== "paused") return false;
+  return !!s.allThreadsStopped || s.stoppedThread === threadId || !!s.suspendedThreads?.some((t) => t.id === threadId);
+}
+
+/** The selected frame of the paused session (top frame when none is selected). */
+export function selectedFrame(s: DebugSession): StackFrame | null {
+  return s.frames.find((f) => f.id === s.selectedFrame) ?? s.frames[0] ?? null;
+}
+
+/** The frame a stop selects: the first with source. */
+export function topFrame(frames: StackFrame[]): StackFrame | null {
+  return frames.find((f) => f.path && f.presentationHint !== "label") ?? frames[0] ?? null;
+}
+
 function markTerminated(id: DebugSessionId) {
-  patch(id, { status: "terminated", frames: [], selectedFrame: null, stoppedThread: null });
+  stopTaskbarFlash();
+  forgetImports(id);
+  const page = serverPages.get(id)?.page;
+  if (serverPages.delete(id) && page != null) void stopSession(page);
+  patch(id, { status: "terminated", endedAt: Date.now(), frames: [], selectedFrame: null, stoppedThread: null });
   const st = useDebug.getState();
   if (st.active === id) {
     // Prefer another live session (e.g. the parent of a finished child).
@@ -644,6 +1116,7 @@ export function selectSession(id: DebugSessionId) {
 
 export async function selectThread(id: DebugSessionId, threadId: number) {
   patch(id, { selectedThread: threadId, frames: [], selectedFrame: null });
+  updateExecutionPoint();
   await loadFrames(id, threadId, true);
 }
 
@@ -652,7 +1125,7 @@ export function selectFrame(id: DebugSessionId, frameId: number, reveal = true) 
   updateExecutionPoint();
   const s = useDebug.getState().sessions[id];
   const frame = s?.frames.find((f) => f.id === frameId);
-  if (reveal && frame?.path) {
+  if (reveal && useDebug.getState().active === id && frame?.path) {
     void maybeEditorService()?.openFile(frame.path, {
       selection: { line: frame.line, col: frame.column },
       focus: false,
@@ -661,7 +1134,9 @@ export function selectFrame(id: DebugSessionId, frameId: number, reveal = true) 
   void loadLocals(id, frameId);
 }
 
-async function loadFrames(id: DebugSessionId, threadId: number, reveal: boolean) {
+/** `newStop`: false when returning to an earlier stop, whose breakpoint hit was handled when it happened. */
+async function loadFrames(id: DebugSessionId, threadId: number, reveal: boolean, newStop = true) {
+  const before = useDebug.getState().sessions[id];
   let frames: StackFrame[] = [];
   try {
     frames = await call(commands.debugStackTrace(id, threadId));
@@ -669,10 +1144,10 @@ async function loadFrames(id: DebugSessionId, threadId: number, reveal: boolean)
     console.warn("stackTrace failed", e);
   }
   const s = useDebug.getState().sessions[id];
-  if (!s || s.status !== "paused" || s.selectedThread !== threadId) return;
+  if (!s || s.status !== "paused" || s.selectedThread !== threadId || s.frames !== before?.frames) return;
   patch(id, { frames });
-  const top = frames.find((f) => f.path && f.presentationHint !== "label") ?? frames[0];
-  if (top?.path && (s.stopReason === "breakpoint" || s.stopReason === "function breakpoint")) {
+  const top = topFrame(frames);
+  if (newStop && top?.path && (s.stopReason === "breakpoint" || s.stopReason === "function breakpoint")) {
     void logSuspendingHit(id, top);
     consumeTemporary(top.path, top.line);
   }
@@ -707,20 +1182,27 @@ async function loadThreads(id: DebugSessionId) {
 
 /** Locals of `frameId` (first non-expensive scope) for inline values. */
 async function loadLocals(id: DebugSessionId, frameId: number) {
-  const values: Record<string, string> = {};
+  const frames = useDebug.getState().sessions[id]?.frames;
+  const values: Record<string, string> = Object.create(null);
+  const variables: Record<string, Variable> = Object.create(null);
   try {
     const scopes = await call(commands.debugScopes(id, frameId));
     const scope = scopes.find((sc) => !sc.expensive);
     if (scope) {
       const vars = await call(commands.debugVariables(id, scope.variablesReference));
-      for (const v of vars) if (v.name && !(v.name in values)) values[v.name] = v.value;
+      for (const v of vars)
+        if (v.name && !Object.hasOwn(values, v.name)) {
+          values[v.name] = v.value;
+          variables[v.name] = v;
+        }
     }
   } catch {
     // No inline values.
   }
   const s = useDebug.getState().sessions[id];
-  if (useDebug.getState().active !== id || s?.selectedFrame !== frameId) return;
-  useExecutionPoint.setState({ values });
+  if (useDebug.getState().active !== id || s?.status !== "paused" || s.selectedFrame !== frameId || s.frames !== frames)
+    return;
+  useExecutionPoint.setState({ values, variables });
 }
 
 /** Show Execution Point (⌥F10): back to the suspended thread's top frame, revealed and focused. */
@@ -729,6 +1211,7 @@ export async function showExecutionPoint(id: DebugSessionId) {
   if (!s || s.status !== "paused" || s.stoppedThread == null) return;
   if (s.selectedThread !== s.stoppedThread) {
     patch(id, { selectedThread: s.stoppedThread, frames: [], selectedFrame: null });
+    updateExecutionPoint();
     await loadFrames(id, s.stoppedThread, false);
   }
   const cur = useDebug.getState().sessions[id];
@@ -748,13 +1231,40 @@ export function updateExecutionPoint() {
   const s = activeSession();
   const frame = s && s.status === "paused" ? s.frames.find((f) => f.id === s.selectedFrame) : undefined;
   if (!s || !frame || !frame.path) {
-    if (useExecutionPoint.getState().path !== null) useExecutionPoint.setState({ path: null, values: {} });
+    if (useExecutionPoint.getState().path !== null)
+      useExecutionPoint.setState({ path: null, values: {}, variables: {} });
     return;
   }
   const top = s.frames.find((f) => f.path && f.presentationHint !== "label")?.id === frame.id;
   const cur = useExecutionPoint.getState();
   if (cur.path === frame.path && cur.line === frame.line && cur.top === top) return;
-  useExecutionPoint.setState({ path: frame.path, line: frame.line, top, values: {} });
+  useExecutionPoint.setState({ path: frame.path, line: frame.line, top, values: {}, variables: {} });
+}
+
+/** Invalidate suspended data before sending a command that resumes execution. */
+export async function resumeExecution(id: DebugSessionId, request: () => Promise<unknown>) {
+  const before = useDebug.getState().sessions[id];
+  if (!before || before.status !== "paused") return;
+  const frames: StackFrame[] = [];
+  patch(id, { status: "running", frames, selectedFrame: null, stoppedThread: null });
+  updateExecutionPoint();
+  try {
+    await request();
+  } catch (e) {
+    const current = useDebug.getState().sessions[id];
+    // A stop/continue/termination received during the request owns the newer state.
+    if (current?.status === "running" && current.frames === frames) {
+      patch(id, {
+        status: before.status,
+        frames: before.frames,
+        selectedFrame: before.selectedFrame,
+        stoppedThread: before.stoppedThread,
+      });
+      updateExecutionPoint();
+      if (before.selectedFrame != null) void loadLocals(id, before.selectedFrame);
+    }
+    throw e;
+  }
 }
 
 // --- watches -------------------------------------------------------------------
@@ -771,23 +1281,43 @@ export function removeWatch(expression: string) {
   persistWatches();
 }
 
-const WATCH_KEY = "openidea.debugger.watches";
+export function removeAllWatches() {
+  useDebug.setState({ watches: [] });
+  persistWatches();
+}
+
+/** Watches used to be one list for every project; it is only read now, as a project's first list. */
+const SHARED_WATCH_KEY = "openidea.debugger.watches";
+const watchKey = (root: string) => `${SHARED_WATCH_KEY}:${root}`;
+
+/** The project whose watches are loaded; without one they aren't stored. */
+let watchRoot: string | null = null;
 
 function persistWatches() {
+  if (watchRoot == null) return;
   try {
-    localStorage.setItem(WATCH_KEY, JSON.stringify(useDebug.getState().watches));
+    localStorage.setItem(watchKey(watchRoot), JSON.stringify(useDebug.getState().watches));
   } catch {
     // ignore
   }
 }
 
-export function loadWatches() {
+function storedWatches(key: string): string[] | null {
   try {
-    const raw = JSON.parse(localStorage.getItem(WATCH_KEY) ?? "[]") as unknown;
-    if (Array.isArray(raw)) useDebug.setState({ watches: raw.filter((w): w is string => typeof w === "string") });
+    const stored = localStorage.getItem(key);
+    const raw = stored == null ? null : (JSON.parse(stored) as unknown);
+    return Array.isArray(raw) ? raw.filter((w): w is string => typeof w === "string") : null;
   } catch {
-    // ignore
+    return null;
   }
+}
+
+/** The watches of the project at `root`. */
+export function loadWatches(root: string | null) {
+  watchRoot = root;
+  const own = root == null ? [] : storedWatches(watchKey(root));
+  useDebug.setState({ watches: own ?? storedWatches(SHARED_WATCH_KEY) ?? [] });
+  if (own == null) persistWatches();
 }
 
 /**
@@ -815,13 +1345,24 @@ export async function setVariableValue(
   return result;
 }
 
+/** Whether the console types into the session's program (it runs, in a terminal the IDE gave it). */
+export function readsProgramInput(s: DebugSession): boolean {
+  return !!s.programInput && s.status === "running";
+}
+
+/** Types `text` into the session's program; its terminal echoes it to the console. */
+export async function sendProgramInput(session: DebugSession, text: string): Promise<void> {
+  await call(commands.debugSendInput(session.id, text));
+}
+
 export async function evaluate(
   expression: string,
   context: "repl" | "watch" | "hover" | "clipboard",
   session: DebugSession | null = activeSession(),
 ): Promise<Variable> {
   if (!session || !isLive(session)) throw new Error("No active debug session");
-  return call(commands.debugEvaluateIn(session.id, session.selectedFrame, expression, context));
+  const run = (expr: string) => call(commands.debugEvaluateIn(session.id, session.selectedFrame, expr, context));
+  return session.adapter === JAVA_ADAPTER ? evaluateWithImports(session.id, expression, run) : run(expression);
 }
 
 /** Settings › Debugger › Focus application on breakpoint. */
@@ -842,16 +1383,26 @@ export function handleDebugEvent(id: DebugSessionId, event: DebugEvent) {
   const s = ownSession(id, event);
   if (!s) return;
   switch (event.kind) {
-    case "started":
+    case "started": {
       if (!s.launch) patch(id, { name: event.name, adapter: event.adapter, parent: event.parent });
+      if (event.parent != null) selectBrowserPage(event.parent);
       break;
+    }
     case "initialized":
       if (s.status === "starting") patch(id, { status: "running" });
       break;
+    case "flutterAppStarted":
+      patch(id, { flutterAppStarted: true });
+      break;
     case "stopped": {
       const isBp = event.reason === "breakpoint" || event.reason === "function breakpoint";
+      const alone = (s.suspendedThreads ?? []).filter((t) => t.id !== event.threadId);
+      if (!event.allThreadsStopped)
+        alone.push({ id: event.threadId, reason: event.reason, description: event.description });
       patch(id, {
         status: "paused",
+        suspendedThreads: event.allThreadsStopped ? [] : alone,
+        allThreadsStopped: event.allThreadsStopped,
         stoppedThread: event.threadId,
         selectedThread: event.threadId,
         stopReason: event.reason,
@@ -859,28 +1410,63 @@ export function handleDebugEvent(id: DebugSessionId, event: DebugEvent) {
         frames: [],
         selectedFrame: null,
         hits: s.hits + (isBp ? 1 : 0),
+        stops: s.stops + 1,
       });
       useDebug.setState((st) => ({ active: id, stopSeq: st.stopSeq + 1 }));
       publishContext();
+      updateExecutionPoint();
       void loadThreads(id);
-      void loadFrames(id, event.threadId, true);
+      // The stop a stream trace ends in would bring the source tab over the trace tab that shows its result.
+      void loadFrames(id, event.threadId, !markTraceStop(id, event.threadId, s.stops + 1));
       const dbg = workflowSettings().debugger;
       try {
-        if (dbg.showOnBreakpoint) toolWindowService().show("debug");
+        // A session debugged in place from Services shows its debugger there (#4773).
+        if (dbg.showOnBreakpoint) toolWindowService().show(rootOf(s).inPlace ? SERVICES_WINDOW : "debug");
       } catch {
         // ignore
       }
+      // Attention for a background window: focusing the app and flashing the taskbar are
+      // alternatives (IDEA), so a window configured to grab focus does not also flash.
       if (dbg.focusAppOnBreakpoint) focusAppWindow();
+      else if (isBp) flashTaskbarForBreakpoint();
       break;
     }
     case "continued": {
       const cur = useDebug.getState().sessions[id]!;
       if (cur.status === "terminated") break;
+      const rest = event.allThreadsContinued ? [] : (cur.suspendedThreads ?? []).filter((t) => t.id !== event.threadId);
+      if (!event.allThreadsContinued && event.threadId !== (cur.selectedThread ?? cur.stoppedThread)) {
+        patch(id, { suspendedThreads: rest });
+        break;
+      }
+      stopTaskbarFlash();
+      const next = rest.at(-1);
+      if (next) {
+        // Like IDEA, the session stays suspended on a thread its own breakpoint still holds.
+        patch(id, {
+          status: "paused",
+          suspendedThreads: rest,
+          stoppedThread: next.id,
+          selectedThread: next.id,
+          stopReason: next.reason,
+          stopDescription: next.description,
+          frames: [],
+          selectedFrame: null,
+        });
+        useDebug.setState((st) => ({ stopSeq: st.stopSeq + 1 }));
+        publishContext();
+        updateExecutionPoint();
+        void loadThreads(id);
+        void loadFrames(id, next.id, true, false);
+        break;
+      }
       patch(id, {
         status: "running",
         frames: [],
         selectedFrame: null,
         stoppedThread: null,
+        suspendedThreads: [],
+        allThreadsStopped: false,
       });
       updateExecutionPoint();
       break;
@@ -890,6 +1476,9 @@ export function handleDebugEvent(id: DebugSessionId, event: DebugEvent) {
       break;
     case "thread":
       if (s.status === "paused") void loadThreads(id);
+      break;
+    case "programInput":
+      patch(id, { programInput: true });
       break;
     case "breakpointsChanged":
       void refreshStates(event.path);
@@ -901,6 +1490,35 @@ export function handleDebugEvent(id: DebugSessionId, event: DebugEvent) {
     case "terminated":
       markTerminated(id);
       break;
+    case "capabilities":
+      void loadCapabilities(id);
+      break;
+    case "jvmBackend":
+      patch(id, { jvmBackend: event.state });
+      break;
+    case "jsNetwork":
+      queueNetworkEvent(id, event.event);
+      break;
+    case "flutterVmService":
+      patch(id, { vmServiceUri: event.uri, flutterDevice: event.device });
+      break;
+    case "flutterNavigate":
+      // Focus stays in the inspector, where the next widget gets picked.
+      void maybeEditorService()?.openFile(event.path, {
+        selection: { line: event.line, col: event.column },
+        preview: true,
+        focus: false,
+      });
+      break;
+    case "jsNetworkUnavailable":
+      setRefused(id, "network", "");
+      break;
+    case "invalidated":
+      if (s.status !== "paused") break;
+      if (event.areas.length && !event.areas.some((a) => a === "variables" || a === "all")) break;
+      useDebug.setState((st) => ({ variablesEpoch: st.variablesEpoch + 1 }));
+      if (s.selectedFrame != null) void loadLocals(id, s.selectedFrame);
+      break;
   }
 }
 
@@ -908,11 +1526,14 @@ export function handleDebugEvent(id: DebugSessionId, event: DebugEvent) {
 export function resetSessions() {
   const { sessions } = useDebug.getState();
   for (const s of Object.values(sessions)) if (s.parent == null && isLive(s)) void stopSession(s.id);
+  for (const id of [...processOutput.keys()]) unfollowProcessOutput(id);
   pendingOutput.length = 0;
   cancelOutputFlush();
   ansiStreams.clear();
-  useDebug.setState({ sessions: {}, active: null, console: {}, stopSeq: 0 });
-  useExecutionPoint.setState({ path: null, line: 0, top: true, values: {} });
+  announcedPorts.clear();
+  serverPages.clear();
+  useDebug.setState({ sessions: {}, active: null, console: {}, stopSeq: 0, variablesEpoch: 0 });
+  useExecutionPoint.setState({ path: null, line: 0, top: true, values: {}, variables: {} });
   publishContext();
 }
 

@@ -41,6 +41,7 @@ export function stashTabs({ combine, shelfCount, stashCount, tab }: StashTabsInp
 
 /** Title of a log tab of its own. */
 export function logTabLabel(t: LogTab): string {
+  if (t.kind === "update") return tx`Update Info: ${t.target}`;
   return t.kind === "history" ? tx`History: ${baseName(t.target)}` : tx`Log: ${t.target}`;
 }
 
@@ -54,7 +55,9 @@ export function gitTabs(input: GitTabsInput): ContentTab[] {
   return [
     ...(input.modal ? [{ id: "changes", label: "Local Changes" }, ...stashTabs(input)] : []),
     { id: "log", label: "Log" },
-    ...input.logTabs.map((t) => ({ id: t.id, label: logTabLabel(t), closable: true })),
+    ...input.logTabs
+      .filter((t) => t.location !== "editor")
+      .map((t) => ({ id: t.id, label: logTabLabel(t), closable: true })),
     { id: "console", label: "Console" },
     { id: "worktrees", label: "Worktrees" },
   ];

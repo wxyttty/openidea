@@ -13,23 +13,26 @@ import {
 } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
-import { getAction, isActionEnabled, executeAction } from "@/platform/actions";
+import { getAction, isActionEnabled, executeActionFrom, actionToggled } from "@/platform/actions";
 import { useContextKeys } from "@/platform/context";
-import { shortcutLabel } from "@/platform/keymap";
+import { hasPrimaryModifier, shortcutLabel } from "@/platform/keymap";
 import { Icon, type IconName } from "./icons";
 import { Popup, type PopupAnchor } from "./Popup";
 import type { Placement } from "@floating-ui/react-dom";
 import styles from "./Menu.module.css";
 import { tx } from "@/platform/i18n";
+import { isSubmenuAim, type MenuPointer } from "./menuAim";
 
 export type MenuItem =
   | { kind: "separator" }
-  | { kind: "header"; label: string }
+  | { kind: "header"; label: string; asTitle?: boolean }
   | {
       kind: "action";
       action: string;
       arg?: unknown;
       label?: string;
+      /** A check mark in this state instead of the action's own `toggled` (one row per argument). */
+      checked?: boolean;
       icon?: IconName | (string & {});
       disabled?: boolean;
     }
@@ -43,22 +46,38 @@ export type MenuItem =
       shortcut?: string;
       disabled?: boolean;
       checked?: boolean;
+      current?: boolean;
       danger?: boolean;
       run?: () => void;
+      /** Run instead of `run` on ⌘-click (macOS) / Ctrl-click, e.g. "only this one" in a multi-choice filter. */
+      runWithModifier?: () => void;
+      /** Tooltip of the whole row (the label's own tooltip shows a truncated label). */
+      hint?: string;
+      /** The pointer or the keyboard made it the active item (not on opening the menu). */
+      onActive?: () => void;
       submenu?: MenuItem[];
+      /** Run the item when activated. Hover, Right Arrow and the chevron open its submenu. */
+      performOnSelect?: boolean;
+      /** The text the item copies, for choosers that show it (Copy Path/Reference…). */
+      preview?: string;
     };
 
 interface Resolved {
-  kind: "item" | "separator" | "header";
+  kind: "item" | "separator" | "header" | "title";
   key: string;
   label: string;
   icon?: string;
   shortcut?: string;
   disabled?: boolean;
   checked?: boolean;
+  current?: boolean;
   danger?: boolean;
   run?: () => void;
+  runWithModifier?: () => void;
+  hint?: string;
+  onActive?: () => void;
   submenu?: MenuItem[];
+  performOnSelect?: boolean;
 }
 
 export function resolveMenuItems(items: MenuItem[]): Resolved[] {
@@ -70,7 +89,7 @@ export function resolveMenuItems(items: MenuItem[]): Resolved[] {
       return;
     }
     if (item.kind === "header") {
-      out.push({ kind: "header", key: `h${i}`, label: tx(item.label) });
+      out.push({ kind: item.asTitle ? "title" : "header", key: `h${i}`, label: tx(item.label) });
       return;
     }
     if (item.kind === "action") {
@@ -78,12 +97,13 @@ export function resolveMenuItems(items: MenuItem[]): Resolved[] {
       if (!a) return;
       out.push({
         kind: "item",
-        key: item.action,
+        key: typeof item.arg === "string" ? `${item.action}|${item.arg}` : item.action,
         label: tx(item.label) ?? a.title,
         icon: item.icon ?? a.icon,
         shortcut: shortcutLabel(item.action),
-        disabled: !!item.disabled || !isActionEnabled(a),
-        run: () => void executeAction(item.action, item.arg),
+        disabled: !!item.disabled || !isActionEnabled(a, undefined, item.arg),
+        checked: item.checked ?? actionToggled(a),
+        run: () => void executeActionFrom("menu", item.action, item.arg),
       });
       return;
     }
@@ -100,8 +120,19 @@ export function resolveMenuItems(items: MenuItem[]): Resolved[] {
 
 const selectable = (r: Resolved | undefined) => !!r && r.kind === "item" && !r.disabled;
 
+function focusMenuItem(item: HTMLButtonElement | null | undefined) {
+  if (!item) return;
+  item.focus({ preventScroll: true });
+  const popup = item.closest<HTMLElement>("[data-popup]");
+  if (popup && popup.scrollHeight > popup.clientHeight) {
+    item.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
 interface MenuListProps {
   items: MenuItem[];
+  /** Reserve space for item icons even when an item has none. */
+  iconColumn?: boolean;
   /** Called after an item ran (closes the whole menu chain). */
   onDone: () => void;
   /** Close just this level (submenus). */
@@ -109,27 +140,69 @@ interface MenuListProps {
   "aria-label"?: string;
   /** Focus the first item on mount. */
   autoFocusFirst?: boolean;
+  /**
+   * Numeric mnemonics, like IDEA's Select In popup: label the first nine
+   * enabled rows 1–9 and activate one on that digit. Submenus never inherit it.
+   */
+  numbers?: boolean;
 }
 
-export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, ...aria }: MenuListProps) {
+export function MenuList({
+  items,
+  iconColumn = true,
+  onDone,
+  onCloseLevel,
+  autoFocusFirst = true,
+  numbers = false,
+  ...aria
+}: MenuListProps) {
   // Action enablement follows the context keys: opening the menu moves focus
   // (e.g. editorTextFocus → popupOpen) right after the first render.
   useContextKeys();
   const resolved = resolveMenuItems(items);
+  const title = resolved.find((item) => item.kind === "title")?.label;
+  const hasSubmenus = resolved.some((item) => item.submenu);
+  // IDEA numeric mnemonics: the first nine selectable rows, in display order.
+  const numbersOf: Array<number | undefined> = [];
+  if (numbers) {
+    let n = 0;
+    resolved.forEach((r, i) => {
+      if (n < 9 && selectable(r)) numbersOf[i] = ++n;
+    });
+  }
   const [active, setActive] = useState(() => (autoFocusFirst ? resolved.findIndex(selectable) : -1));
   const [openSub, setOpenSubIndex] = useState<number | null>(null);
   const [subAnchor, setSubAnchor] = useState<HTMLElement | null>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const submenuRef = useRef<HTMLDivElement | null>(null);
+  const pointer = useRef<MenuPointer | null>(null);
+  const previousPointer = useRef<MenuPointer | null>(null);
+  const pendingAim = useRef<number | null>(null);
+  // Pointer movement highlights a row without focusing it. Focusing on every
+  // enter drops the hover paint in the Windows webview, so the menu looks frozen.
+  const pointerHover = useRef(false);
+  // Row the pointer last entered: pointerenter and mouseenter both report it.
+  const hovered = useRef(-1);
   const setOpenSub = (i: number | null) => {
     setSubAnchor(i === null ? null : (itemRefs.current[i] ?? null));
     setOpenSubIndex(i);
   };
 
   useLayoutEffect(() => {
-    if (active >= 0 && openSub === null) itemRefs.current[active]?.focus({ preventScroll: false });
+    if (pointerHover.current) {
+      pointerHover.current = false;
+      return;
+    }
+    if (active >= 0 && openSub === null) focusMenuItem(itemRefs.current[active]);
   }, [active, openSub]);
   useEffect(() => () => clearTimeout(hoverTimer.current), []);
+
+  const focusItem = (i: number) => {
+    if (i === active && openSub === null) focusMenuItem(itemRefs.current[i]);
+    setActive(i);
+    resolved[i]?.onActive?.();
+  };
 
   const move = (delta: number, from = active) => {
     const n = resolved.length;
@@ -138,25 +211,105 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
     for (let step = 0; step < n; step++) {
       i = (i + delta + n) % n;
       if (selectable(resolved[i])) {
-        setActive(i);
+        focusItem(i);
         return;
       }
     }
   };
 
-  const activate = (i: number) => {
+  const activate = (i: number, modifiers?: Pick<KeyboardEvent, "metaKey" | "ctrlKey">, openChild = false) => {
+    cancelHover();
     const item = resolved[i];
     if (!selectable(item)) return;
-    if (item!.submenu) {
+    if (item!.submenu && (openChild || !item!.performOnSelect)) {
       setActive(i);
       setOpenSub(i);
       return;
     }
     onDone();
-    item!.run?.();
+    if (item!.runWithModifier && modifiers && hasPrimaryModifier(modifiers)) item!.runWithModifier();
+    else item!.run?.();
+  };
+
+  const cancelHover = () => {
+    clearTimeout(hoverTimer.current);
+    pendingAim.current = null;
+  };
+
+  const applyHover = (i: number, immediate = false) => {
+    cancelHover();
+    if (i !== active) {
+      pointerHover.current = true;
+      focusItem(i);
+    }
+    const next = resolved[i]?.submenu ? i : null;
+    if (immediate) setOpenSub(next);
+    else hoverTimer.current = setTimeout(() => setOpenSub(next), next === null ? 200 : 120);
+  };
+
+  const recordPointer = (point: MenuPointer) => {
+    if (pointer.current?.x === point.x && pointer.current.y === point.y) return false;
+    previousPointer.current = pointer.current;
+    pointer.current = point;
+    return true;
+  };
+
+  const aiming = () => {
+    const rect = submenuRef.current?.parentElement?.getBoundingClientRect();
+    return !!rect && !!pointer.current && isSubmenuAim(previousPointer.current, pointer.current, rect);
+  };
+
+  const deferHover = (i: number) => {
+    cancelHover();
+    pendingAim.current = i;
+    hoverTimer.current = setTimeout(() => applyHover(i, true), 300);
+  };
+
+  const pointerMove = (point: MenuPointer) => {
+    if (!recordPointer(point) || pendingAim.current === null) return;
+    const i = pendingAim.current;
+    if (aiming()) deferHover(i);
+    else applyHover(i);
+  };
+
+  const enterSubmenu = () => {
+    cancelHover();
+    hovered.current = -1;
+    pointer.current = previousPointer.current = null;
+    if (openSub !== null && active !== openSub) {
+      pointerHover.current = true;
+      setActive(openSub);
+    }
+  };
+
+  // Track movement across the gap too; submenu portals are outside this level's DOM.
+  useEffect(() => {
+    if (openSub === null) return;
+    const onMove = (e: PointerEvent) => {
+      if (submenuRef.current?.parentElement?.contains(e.target as Node)) enterSubmenu();
+      else pointerMove({ x: e.clientX, y: e.clientY });
+    };
+    document.addEventListener("pointermove", onMove);
+    return () => document.removeEventListener("pointermove", onMove);
+  });
+
+  const hover = (i: number, point: MenuPointer) => {
+    const item = resolved[i];
+    if (!selectable(item) || hovered.current === i) return;
+    hovered.current = i;
+    recordPointer(point);
+    if (openSub !== null && openSub !== i && aiming()) deferHover(i);
+    else applyHover(i);
+  };
+
+  const leave = (i: number) => {
+    // A compatibility mouseleave can follow pointerenter on the next row.
+    if (hovered.current === i) hovered.current = -1;
   };
 
   const onKeyDown = (e: ReactKeyboardEvent) => {
+    cancelHover();
+    pointer.current = previousPointer.current = null;
     switch (e.key) {
       case "ArrowDown":
         move(1);
@@ -180,17 +333,26 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
         break;
       case "Enter":
       case " ":
-        activate(active);
+        activate(active, e);
         break;
       default:
         if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          if (numbers && /^[1-9]$/.test(e.key)) {
+            const index = numbersOf.indexOf(Number(e.key));
+            if (index >= 0) {
+              e.preventDefault();
+              e.stopPropagation();
+              activate(index);
+            }
+            return;
+          }
           const ch = e.key.toLowerCase();
           const n = resolved.length;
           for (let s = 1; s <= n; s++) {
             const i = (active + s + n) % n;
             const r = resolved[i]!;
             if (selectable(r) && r.label.toLowerCase().startsWith(ch)) {
-              setActive(i);
+              focusItem(i);
               break;
             }
           }
@@ -203,12 +365,23 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
   };
 
   return (
-    <div role="menu" aria-label={aria["aria-label"]} className={styles.menu} onKeyDown={onKeyDown}>
+    <div
+      role="menu"
+      aria-label={title ?? aria["aria-label"]}
+      className={styles.menu}
+      onKeyDown={onKeyDown}
+      // A right-click in an open menu does nothing; without this it reaches whatever is under the
+      // menu in the component tree, e.g. the title bar's toolbar menu behind File › Open Recent.
+      onContextMenu={(e) => e.preventDefault()}
+      onPointerMove={(e) => {
+        if (e.currentTarget.contains(e.target as Node)) pointerMove({ x: e.clientX, y: e.clientY });
+      }}
+    >
       {resolved.map((r, i) => {
         if (r.kind === "separator") return <div key={r.key} role="separator" className={styles.separator} />;
-        if (r.kind === "header")
+        if (r.kind === "header" || r.kind === "title")
           return (
-            <div key={r.key} role="presentation" className={styles.header}>
+            <div key={r.key} role="presentation" className={r.kind === "title" ? styles.title : styles.header}>
               {r.label}
             </div>
           );
@@ -222,6 +395,7 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
               type="button"
               role={r.checked !== undefined ? "menuitemcheckbox" : "menuitem"}
               aria-checked={r.checked}
+              aria-current={r.current || undefined}
               aria-disabled={r.disabled || undefined}
               aria-haspopup={hasSub ? "menu" : undefined}
               aria-expanded={hasSub ? openSub === i : undefined}
@@ -232,20 +406,39 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
                 r.disabled && styles.disabled,
                 r.danger && styles.danger,
               )}
-              onPointerEnter={() => {
-                if (r.disabled) return;
-                setActive(i);
-                clearTimeout(hoverTimer.current);
-                hoverTimer.current = setTimeout(() => setOpenSub(hasSub ? i : null), hasSub ? 120 : 200);
+              onPointerEnter={(e) => hover(i, { x: e.clientX, y: e.clientY })}
+              onMouseEnter={(e) => hover(i, { x: e.clientX, y: e.clientY })}
+              onPointerLeave={() => leave(i)}
+              onMouseLeave={() => leave(i)}
+              onClick={(e) => {
+                const openChild = e.target instanceof Element && e.target.closest("[data-menu-submenu-arrow]") !== null;
+                activate(i, e, openChild);
               }}
-              onClick={() => activate(i)}
+              title={r.hint}
             >
-              <span className={styles.icon} data-menu-icon={!r.checked && r.icon ? "" : undefined}>
-                {r.checked ? <Icon name="check" size={13} /> : r.icon ? <Icon name={r.icon} size={14} /> : null}
+              {numbers && (
+                <span className={styles.mnemonic} data-menu-number={numbersOf[i]} aria-hidden={true}>
+                  {numbersOf[i] ?? ""}
+                </span>
+              )}
+              {iconColumn && (
+                <span className={styles.icon} data-menu-icon={!r.checked && r.icon ? "" : undefined}>
+                  {r.checked ? <Icon name="check" size={13} /> : r.icon ? <Icon name={r.icon} size={14} /> : null}
+                </span>
+              )}
+              <span className={styles.label} title={r.hint ? undefined : r.label}>
+                {r.label}
               </span>
-              <span className={styles.label}>{r.label}</span>
-              {r.shortcut && <span className={styles.shortcut}>{r.shortcut}</span>}
-              {hasSub && <Icon name="chevron-right" size={14} className={styles.subArrow} />}
+              {r.shortcut && (
+                <span className={styles.shortcut} title={r.shortcut}>
+                  {r.shortcut}
+                </span>
+              )}
+              {hasSubmenus && (
+                <span className={styles.subArrow} aria-hidden="true" data-menu-submenu-arrow={hasSub || undefined}>
+                  {hasSub && <Icon name="chevron-right" size={14} />}
+                </span>
+              )}
             </button>
             {hasSub && openSub === i && subAnchor && (
               <Popup
@@ -258,14 +451,16 @@ export function MenuList({ items, onDone, onCloseLevel, autoFocusFirst = true, .
                 onClose={() => setOpenSub(null)}
                 className={styles.popup}
               >
-                <MenuList
-                  items={r.submenu!}
-                  onDone={onDone}
-                  onCloseLevel={() => {
-                    setOpenSub(null);
-                    itemRefs.current[i]?.focus();
-                  }}
-                />
+                <div ref={submenuRef} onPointerEnter={enterSubmenu}>
+                  <MenuList
+                    items={r.submenu!}
+                    onDone={onDone}
+                    onCloseLevel={() => {
+                      setOpenSub(null);
+                      focusMenuItem(itemRefs.current[i]);
+                    }}
+                  />
+                </div>
               </Popup>
             )}
           </Fragment>
@@ -280,12 +475,27 @@ export interface MenuProps {
   onClose: () => void;
   anchor: PopupAnchor;
   items: MenuItem[];
+  title?: string;
+  iconColumn?: boolean;
   placement?: Placement;
   "aria-label"?: string;
+  /** Numeric mnemonics on the first nine rows; see `MenuList`. */
+  numbers?: boolean;
 }
 
 /** A dropdown menu anchored to an element or point. */
-export function Menu({ open, onClose, anchor, items, placement = "bottom-start", ...aria }: MenuProps) {
+export function Menu({
+  open,
+  onClose,
+  anchor,
+  items,
+  title,
+  placement = "bottom-start",
+  iconColumn,
+  numbers,
+  ...aria
+}: MenuProps) {
+  const heading = title ? tx(title) : undefined;
   return (
     <Popup
       open={open}
@@ -294,9 +504,16 @@ export function Menu({ open, onClose, anchor, items, placement = "bottom-start",
       placement={placement}
       role="presentation"
       autoFocus={false}
-      className={styles.popup}
+      className={clsx(styles.popup, heading && styles.titledPopup)}
     >
-      <MenuList items={items} onDone={onClose} aria-label={aria["aria-label"]} />
+      {heading && <div className={styles.menuHeading}>{heading}</div>}
+      <MenuList
+        items={items}
+        onDone={onClose}
+        iconColumn={iconColumn}
+        numbers={numbers}
+        aria-label={aria["aria-label"] ?? heading}
+      />
     </Popup>
   );
 }
@@ -304,20 +521,70 @@ export function Menu({ open, onClose, anchor, items, placement = "bottom-start",
 // ---------------------------------------------------------------------------
 // Context menus
 
+type ContextMenuAnchor = { x: number; y: number } | "center";
+type ContextMenuPosition = { x: number; y: number; centered?: false } | { centered: true };
+
 interface ContextMenuState {
-  menu: { x: number; y: number; items: MenuItem[]; id: number } | null;
+  menu:
+    | (ContextMenuPosition & {
+        items: MenuItem[];
+        title?: string;
+        numbers: boolean;
+        id: number;
+        /** The text selection the menu was opened on (see `restoreSelection`). */
+        selection: Range[] | null;
+        owner: Element | null;
+      })
+    | null;
 }
 
 export const useContextMenuStore = create<ContextMenuState>(() => ({ menu: null }));
 let menuSeq = 0;
 
 export function showContextMenu(
-  at: { clientX: number; clientY: number } | { x: number; y: number },
+  at: { clientX: number; clientY: number } | ContextMenuAnchor,
   items: MenuItem[],
+  options?: { numbers?: boolean; owner?: Element | null; title?: string },
 ) {
-  const x = "clientX" in at ? at.clientX : at.x;
-  const y = "clientY" in at ? at.clientY : at.y;
-  useContextMenuStore.setState({ menu: { x, y, items, id: ++menuSeq } });
+  const position: ContextMenuPosition =
+    at === "center"
+      ? { centered: true }
+      : { x: "clientX" in at ? at.clientX : at.x, y: "clientY" in at ? at.clientY : at.y };
+  const title = options?.title;
+  useContextMenuStore.setState({
+    menu: {
+      ...position,
+      items: title ? [{ kind: "header", label: title }, ...items] : items,
+      title,
+      numbers: !!options?.numbers,
+      id: ++menuSeq,
+      selection: textSelection(),
+      owner: options?.owner ?? null,
+    },
+  });
+}
+
+/** The page's text selection, unless it is in an editable element (editors keep their own). */
+function textSelection(): Range[] | null {
+  const sel = document.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const node = sel.anchorNode;
+  const el = node instanceof Element ? node : node?.parentElement;
+  if (!el || el.closest("input, textarea, [contenteditable]:not([contenteditable='false'])")) return null;
+  return Array.from({ length: sel.rangeCount }, (_, i) => sel.getRangeAt(i).cloneRange());
+}
+
+/**
+ * WebKit drops a page's text selection when focus moves to another element, as when the menu
+ * focuses its first row and when it gives focus back: put the selection the menu was opened on
+ * back, so it stays highlighted while its Copy / Quote apply to it.
+ */
+function restoreSelection(ranges: readonly Range[]) {
+  const sel = document.getSelection();
+  if (!sel || !sel.isCollapsed) return;
+  if (!ranges.every((r) => r.startContainer.isConnected && r.endContainer.isConnected)) return;
+  sel.removeAllRanges();
+  for (const r of ranges) sel.addRange(r);
 }
 
 export function hideContextMenu() {
@@ -327,12 +594,26 @@ export function hideContextMenu() {
 /** Renders the active context menu; mount once (the workbench does). */
 export function ContextMenuHost() {
   const menu = useContextMenuStore((s) => s.menu);
+  const selection = menu?.selection ?? null;
+  const owner = menu?.owner ?? null;
+  useLayoutEffect(() => {
+    if (!owner) return;
+    owner.setAttribute("data-context-menu-open", "");
+    return () => owner.removeAttribute("data-context-menu-open");
+  }, [owner]);
+  // After the rows' layout effects: the first row has taken focus.
+  useLayoutEffect(() => {
+    if (!selection) return;
+    restoreSelection(selection);
+    // After the popup has given focus back; a click elsewhere selects afresh after this.
+    return () => queueMicrotask(() => restoreSelection(selection));
+  }, [selection]);
   if (!menu) return null;
   return (
     <Popup
       key={menu.id}
       open
-      anchor={{ x: menu.x, y: menu.y }}
+      anchor={menu.centered ? "center" : { x: menu.x, y: menu.y }}
       placement="bottom-start"
       offset={2}
       role="presentation"
@@ -340,7 +621,12 @@ export function ContextMenuHost() {
       onClose={hideContextMenu}
       className={styles.popup}
     >
-      <MenuList items={menu.items} onDone={hideContextMenu} aria-label="Context menu" />
+      <MenuList
+        items={menu.items}
+        numbers={menu.numbers}
+        onDone={hideContextMenu}
+        aria-label={menu.title ? tx(menu.title) : "Context menu"}
+      />
     </Popup>
   );
 }

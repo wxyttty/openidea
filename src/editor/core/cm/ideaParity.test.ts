@@ -23,7 +23,7 @@ import {
   foldSelectionEffects,
 } from "./folding";
 import { columnModeExtension, extendBlock, toggleColumnMode } from "./columnMode";
-import { nearestMark, unfoldAround } from "./lanes";
+import { nearestMark, scrollbarThumb, unfoldAround } from "./lanes";
 import { lineRangeSelection } from "./gutterDrag";
 import { matchBraceTarget } from "./caretCommands";
 import { overwriteField, toggleOverwrite } from "./overwrite";
@@ -66,6 +66,7 @@ function show(view: EditorView): string {
 }
 
 const javascript = await languages.find((l) => l.name === "JavaScript")!.load();
+const yaml = await languages.find((l) => l.name === "YAML")!.load();
 
 describe("Move Statement", () => {
   it("moves a multi-line statement as a whole, never one of its lines", () => {
@@ -203,6 +204,19 @@ describe("paste reformatting", () => {
     paste(v, "a();\n    b();\n  c();");
     expect(v.state.doc.toString()).toBe("if {\n  a();\n    b();\n  c();\n}");
   });
+
+  it("pastes onto a blank line at the previous line's indent when the language has no indent engine", () => {
+    const doc = "service:\n  database:\n    query-timeout: 30\n    pool:\n      validation-query: SELECT 1\n";
+    const v = make(doc + "|", [yaml, pasteReindentFilter("indentEachLine")]);
+    paste(v, "query-timeout: 30");
+    expect(v.state.doc.toString()).toBe(doc + "      query-timeout: 30");
+  });
+
+  it("pastes a block onto a blank line at the indent of the nearest non-empty line above", () => {
+    const v = make("outer:\n  key: 1\n\n|\ntrailing: 2", [yaml, pasteReindentFilter("indentBlock")]);
+    paste(v, "a: 1\n      b: 2");
+    expect(v.state.doc.toString()).toBe("outer:\n  key: 1\n\n  a: 1\n  b: 2\ntrailing: 2");
+  });
 });
 
 describe("closing quotes", () => {
@@ -289,6 +303,18 @@ describe("error stripe", () => {
     expect(nearestMark(marks, 15)?.pos).toBe(1);
     expect(nearestMark(marks, 27)?.pos).toBe(2);
     expect(nearestMark(marks, 21)).toBeNull();
+  });
+
+  it("finds the scrollbar thumb the marks must let through", () => {
+    // Nothing to scroll: no thumb.
+    expect(scrollbarThumb(0, 400, 400)).toBeNull();
+    expect(scrollbarThumb(0, 401, 400)).toBeNull();
+    expect(scrollbarThumb(0, 402, 400)).not.toBeNull();
+    // A quarter of the document visible: a 100px thumb, at the top, then at the bottom.
+    expect(scrollbarThumb(0, 1600, 400)).toEqual({ top: 0, bottom: 100 });
+    expect(scrollbarThumb(1200, 1600, 400)).toEqual({ top: 300, bottom: 400 });
+    // A long document keeps the 32px minimum thumb; halfway down it sits mid-track.
+    expect(scrollbarThumb(49800, 100000, 400)).toEqual({ top: 184, bottom: 216 });
   });
 
   it("unfolds what hides the target line", () => {

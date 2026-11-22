@@ -7,15 +7,16 @@ import {
   type DuplicateOptions,
   type StructuralFile,
   type StructuralLanguage,
+  type WorkspaceEdit,
 } from "@/platform/ipc";
 import { executeAction } from "@/platform/actions";
 import { activeProfileId, listProfiles, validateInspections, type ProfileId } from "@/platform/inspections";
-import { basename, useProject } from "@/platform/project";
+import { basename, relativePath, useProject } from "@/platform/project";
 import { Button, Checkbox, Dialog, Input, Select, Spinner, T } from "@/ui";
 import { ScopeFields, openDialog } from "./dialogs";
 import { locateDuplicates, loadDuplicateOptions } from "./duplicates";
 import { runInspection } from "./inspect";
-import { runCodeCleanup, type CleanupOptions } from "./cleanup";
+import { runCodeCleanup, runReformat, type CleanupOptions, type ReformatOptions, type ReformatTarget } from "./cleanup";
 import { currentFile, defaultScope, type ScopeChoice } from "./scope";
 import {
   applyStructuralReplace,
@@ -28,7 +29,9 @@ import {
   type StructuralForm,
 } from "./structural";
 import styles from "./Analysis.module.css";
+import fieldsetStyles from "@/ui/DialogFieldset.module.css";
 import { tx } from "@/platform/i18n";
+import { notifications } from "@/workbench/contributions";
 
 function InspectCodeDialog({ onClose }: { onClose: () => void }) {
   const [scope, setScope] = useState<ScopeChoice>(() => defaultScope());
@@ -128,6 +131,90 @@ function CodeCleanupDialog({ onClose }: { onClose: () => void }) {
         />
         <div className={styles.hint}>
           <T>Files are cleaned up by their language servers and saved; files without one are skipped.</T>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/** The Reformat Code dialog's last choices, remembered as IDEA does. */
+let lastReformat: ReformatOptions & { useMask: boolean } = {
+  recursive: true,
+  optimizeImports: false,
+  mask: "",
+  useMask: false,
+  changedTextOnly: false,
+};
+
+/** IDEA's Reformat Code dialog for a directory or several files of the project view. */
+function ReformatCodeDialog({ targets, onClose }: { targets: readonly ReformatTarget[]; onClose: () => void }) {
+  const [options, setOptions] = useState(lastReformat);
+  const root = useProject((s) => s.project?.root ?? "");
+  const only = targets.length === 1 ? targets[0]! : null;
+  const subject = only ? relativePath(root, only.path) || basename(only.path) : tx`${targets.length} selected items`;
+  const ok = () => {
+    lastReformat = options;
+    onClose();
+    const { useMask, ...run } = options;
+    void runReformat(targets, { ...run, mask: useMask ? run.mask : "" });
+  };
+  return (
+    <Dialog
+      open
+      title="Reformat Code"
+      onClose={onClose}
+      width={440}
+      buttons={[
+        { label: "Run", role: "default", onClick: ok },
+        { label: "Cancel", role: "cancel" },
+      ]}
+    >
+      <div className={fieldsetStyles.body}>
+        <div className={styles.reformatSubject}>{subject}</div>
+        <fieldset className={fieldsetStyles.group}>
+          <legend className={fieldsetStyles.legend}>
+            <T>Options</T>
+          </legend>
+          <Checkbox
+            checked={options.optimizeImports}
+            onChange={(optimizeImports) => setOptions({ ...options, optimizeImports })}
+            label="Optimize imports"
+          />
+          <Checkbox
+            checked={options.changedTextOnly}
+            onChange={(changedTextOnly) => setOptions({ ...options, changedTextOnly })}
+            label="Only VCS changed text"
+          />
+          {targets.some((t) => t.dir) && (
+            <Checkbox
+              checked={options.recursive}
+              onChange={(recursive) => setOptions({ ...options, recursive })}
+              label="Include subdirectories"
+            />
+          )}
+        </fieldset>
+        <fieldset className={fieldsetStyles.group}>
+          <legend className={fieldsetStyles.legend}>
+            <T>Filters</T>
+          </legend>
+          <div className={styles.reformatMask}>
+            <Checkbox
+              checked={options.useMask}
+              onChange={(useMask) => setOptions({ ...options, useMask })}
+              label="File mask:"
+            />
+            <Input
+              className={styles.reformatMaskInput}
+              value={options.mask}
+              disabled={!options.useMask}
+              placeholder="*.sh, *.py"
+              onChange={(e) => setOptions({ ...options, mask: e.target.value })}
+              aria-label="File mask"
+            />
+          </div>
+        </fieldset>
+        <div className={styles.hint}>
+          <T>Files are reformatted by their language's formatter and saved; files without one are skipped.</T>
         </div>
       </div>
     </Dialog>
@@ -254,7 +341,7 @@ function StructuralDialog({ replace, onClose }: { replace: boolean; onClose: () 
     } else if (!result.files.length) {
       await showStructuralResults(form.pattern, result.files, result.summary);
     } else {
-      showReplacePreview(result.files);
+      await showReplacePreview(result.files);
     }
   };
 
@@ -322,7 +409,15 @@ function StructuralDialog({ replace, onClose }: { replace: boolean; onClose: () 
   );
 }
 
-function ReplacePreviewDialog({ files, onClose }: { files: StructuralFile[]; onClose: () => void }) {
+function ReplacePreviewDialog({
+  files,
+  preconditions,
+  onClose,
+}: {
+  files: StructuralFile[];
+  preconditions: WorkspaceEdit["preconditions"];
+  onClose: () => void;
+}) {
   const [excluded, setExcluded] = useState<Set<string>>(() => new Set());
   const edit = useMemo(() => buildReplaceEdit(files, excluded), [files, excluded]);
   const count = edit.files.reduce((n, f) => n + (f.kind === "edit" ? f.edits.length : 0), 0);
@@ -351,7 +446,7 @@ function ReplacePreviewDialog({ files, onClose }: { files: StructuralFile[]; onC
           disabled: count === 0,
           onClick: () => {
             onClose();
-            void applyStructuralReplace(edit);
+            void applyStructuralReplace({ ...edit, preconditions });
           },
         },
         { label: "Cancel", role: "cancel" },
@@ -387,7 +482,22 @@ function ReplacePreviewDialog({ files, onClose }: { files: StructuralFile[]; onC
 export const showInspectCodeDialog = () => openDialog((close) => <InspectCodeDialog onClose={close} />);
 export const showDuplicatesDialog = () => openDialog((close) => <DuplicatesDialog onClose={close} />);
 export const showCodeCleanupDialog = () => openDialog((close) => <CodeCleanupDialog onClose={close} />);
+export const showReformatCodeDialog = (targets: readonly ReformatTarget[]) =>
+  openDialog((close) => <ReformatCodeDialog targets={targets} onClose={close} />);
 export const showStructuralDialog = (replace: boolean) =>
   openDialog((close) => <StructuralDialog replace={replace} onClose={close} />);
-export const showReplacePreview = (files: StructuralFile[]) =>
-  openDialog((close) => <ReplacePreviewDialog files={files} onClose={close} />);
+export const showReplacePreview = async (files: StructuralFile[]) => {
+  try {
+    const edit = buildReplaceEdit(files, new Set());
+    const prepared = isTauri() ? await call(commands.prepareWorkspaceEdit(edit)) : edit;
+    openDialog((close) => (
+      <ReplacePreviewDialog files={files} preconditions={prepared.preconditions} onClose={close} />
+    ));
+  } catch (error) {
+    notifications().notify({
+      level: "error",
+      title: "Cannot preview replacements",
+      body: error instanceof Error ? error.message : String(error),
+    });
+  }
+};

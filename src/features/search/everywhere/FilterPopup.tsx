@@ -1,11 +1,13 @@
 /**
  * The funnel popup of a Search Everywhere tab: checklists of file types /
- * languages / symbol kinds (with "All") or the Text tab's file mask.
+ * languages / symbol kinds or the Text tab's file mask.
  * Changes apply immediately and are remembered per tab.
  */
-import { useEffect, useMemo, useState } from "react";
-import { Button, Checkbox, Input, Popup, T, type PopupAnchor } from "@/ui";
-import { recentMasks } from "../find/store";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { useTx } from "@/platform/i18n";
+import { Button, Checkbox, Icon, Input, Popup, T, fileIconName, type PopupAnchor } from "@/ui";
+import { listNavigate } from "@/ui/List";
+import { recentMasks, refreshProjectMasks, useProjectMasks } from "../find/store";
 import { KIND_LABELS, kindsFor, type FilterTab, type SeFilters } from "./filters";
 import { loadLanguages } from "./deps";
 import { setSearchEverywhereFilter } from "./store";
@@ -14,6 +16,7 @@ import styles from "./SearchEverywhere.module.css";
 interface Option {
   id: string;
   label: string;
+  icon: string;
   /** A UI string (kinds), translated; language names are shown as is. */
   translate?: boolean;
 }
@@ -29,30 +32,52 @@ function Checklist({
   excluded: readonly string[];
   onChange: (excluded: string[]) => void;
 }) {
+  const tr = useTx();
   const off = new Set(excluded);
-  const shown = options.filter((o) => !off.has(o.id)).length;
+  const moveFocus = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const boxes = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>("input[type=checkbox]"));
+    const active = event.target instanceof HTMLInputElement ? boxes.indexOf(event.target) : -1;
+    const next = listNavigate(event.key, { items: boxes, active });
+    if (next === null) return;
+    event.preventDefault();
+    boxes[next]?.focus();
+  };
   return (
-    <div className={styles.filterGroup} role="group" aria-label={title}>
-      <div className={styles.filterTitle}>
-        <T>{title}</T>
-      </div>
-      <Checkbox
-        className={styles.filterAll}
-        checked={shown === options.length}
-        indeterminate={shown > 0 && shown < options.length}
-        label="All"
-        onChange={(v) => onChange(v ? [] : options.map((o) => o.id))}
-      />
-      <div className={styles.filterItems}>
+    <div className={styles.checklistGroup} role="group" aria-label={tr(title)}>
+      <div className={styles.checklistTitle}>{tr(title)}</div>
+      <div className={styles.checklistRows} onKeyDown={moveFocus}>
         {options.map((o) => (
           <Checkbox
             key={o.id}
+            className={styles.checklistRow}
             checked={!off.has(o.id)}
-            label={o.translate ? o.label : <span>{o.label}</span>}
-            aria-label={o.label}
+            label={
+              <span className={styles.checklistLabel}>
+                <Icon name={o.icon} size={16} />
+                <span className={styles.checklistName} title={o.translate ? tr(o.label) : o.label}>
+                  {o.translate ? tr(o.label) : o.label}
+                </span>
+              </span>
+            }
             onChange={(v) => onChange(v ? excluded.filter((x) => x !== o.id) : [...excluded, o.id])}
           />
         ))}
+      </div>
+      <div className={styles.checklistActions}>
+        <Button size="small" disabled={!options.length} onClick={() => onChange([])}>
+          All
+        </Button>
+        <Button size="small" disabled={!options.length} onClick={() => onChange(options.map((o) => o.id))}>
+          None
+        </Button>
+        <Button
+          size="small"
+          disabled={!options.length}
+          onClick={() => onChange(options.filter((o) => !off.has(o.id)).map((o) => o.id))}
+        >
+          Invert
+        </Button>
       </div>
     </div>
   );
@@ -78,7 +103,7 @@ export function FilterPopup({
       setLanguages(
         list
           .filter((l) => l.extensions.length > 0)
-          .map((l) => ({ id: l.id, label: l.name }))
+          .map((l) => ({ id: l.id, label: l.name, icon: fileIconName(`file.${l.extensions[0]}`) }))
           .sort((a, b) => a.label.localeCompare(b.label)),
       );
     });
@@ -89,7 +114,7 @@ export function FilterPopup({
   const kinds = useMemo<Option[]>(
     () =>
       tab === "classes" || tab === "symbols"
-        ? kindsFor(tab).map((k) => ({ id: k, label: KIND_LABELS[k] ?? k, translate: true }))
+        ? kindsFor(tab).map((k) => ({ id: k, label: KIND_LABELS[k] ?? k, icon: `symbol-${k}`, translate: true }))
         : [],
     [tab],
   );
@@ -100,7 +125,7 @@ export function FilterPopup({
       anchor={anchor}
       placement="bottom-end"
       onClose={onClose}
-      className={styles.filterPopup}
+      className={tab === "text" ? styles.filterPopup : styles.checklistPopup}
       aria-label="Filter"
       trapFocus
     >
@@ -135,6 +160,8 @@ export function FilterPopup({
 
 function MaskFilter({ mask, onClose }: { mask: string; onClose: () => void }) {
   const [value, setValue] = useState(mask);
+  const projectMasks = useProjectMasks((p) => p.masks);
+  useEffect(() => void refreshProjectMasks(), []);
   const apply = (m: string) => setSearchEverywhereFilter("text", { mask: m.trim() });
   return (
     <div className={styles.filterGroup}>
@@ -145,7 +172,7 @@ function MaskFilter({ mask, onClose }: { mask: string; onClose: () => void }) {
         id="se-file-mask"
         data-autofocus
         value={value}
-        placeholder="*.ts, !*.test.*"
+        placeholder={projectMasks[0] ?? ""}
         spellCheck={false}
         onChange={(e) => {
           setValue(e.target.value);

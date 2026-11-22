@@ -746,6 +746,7 @@ mod tests {
             version: "HTTP/1.1".into(),
             headers: Vec::new(),
             content_type: content_type.map(str::to_owned),
+            redirects: Vec::new(),
             body: body.map(str::to_owned),
             size: body.map_or(0., |body| body.len() as f64),
             truncated: false,

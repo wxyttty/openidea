@@ -15,6 +15,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
@@ -26,13 +27,20 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Icon, type IconName } from "./icons";
 import { HighlightedText } from "./HighlightedText";
 import { Spinner } from "./Feedback";
+import { IconButton } from "./Button";
 import { fuzzyMatch } from "./match";
 import { acquirePopup } from "./popupState";
 import styles from "./Tree.module.css";
 import { T } from "./T";
-import { tx } from "@/platform/i18n";
+import { setContext } from "@/platform/context";
+import { isMacHost, registerKeyClaim } from "@/platform/keymap";
+import { useGivenTx } from "@/platform/i18n";
 import { useTreeReorder, type TreeReorder } from "./treeReorder";
+import { startPointerDrag, type DragData } from "./pointerDrag";
 import { useTreeDirectoryContext } from "./treeDirectoryContext";
+import { useRowHeight } from "./density";
+import { useIconRowHeight } from "./iconAppearance";
+
 export type { TreeReorder } from "./treeReorder";
 
 export interface TreeRowState {
@@ -56,8 +64,9 @@ export interface TreeOccurrence {
 
 export interface TreeHandle {
   focus(): void;
-  /** Selects `key` (must be visible, i.e. ancestors expanded) and scrolls to it. */
-  reveal(key: string): void;
+  /** Selects `key` (must be visible, i.e. ancestors expanded) and scrolls to it; false when no row has `key`. */
+  reveal(key: string): boolean;
+  clearSelection(): void;
   leadKey(): string | null;
   /** Selects the next (1) / previous (-1) row, for a filter field that keeps the focus (Settings search). */
   moveSelection(dir: 1 | -1): void;
@@ -82,8 +91,8 @@ export interface TreeProps<T> {
   /** Custom row content (after the chevron). Defaults to icon + highlighted label + `getDetail`. */
   renderNode?: (node: T, state: TreeRowState) => ReactNode;
   getIcon?: (node: T, expanded: boolean) => IconName | (string & {}) | undefined;
-  /** Muted trailing text (e.g. a path next to the project root). */
-  getDetail?: (node: T) => string | undefined;
+  /** Muted trailing detail (e.g. a path next to the project root); may include styled content. */
+  getDetail?: (node: T) => ReactNode;
   /** Label colour, e.g. VCS status. */
   getColor?: (node: T) => string | undefined;
   /** Filesystem directory for actions on the focused selection; groups return null. */
@@ -95,29 +104,51 @@ export interface TreeProps<T> {
 
   selected?: ReadonlySet<string>;
   defaultSelected?: Iterable<string>;
-  onSelectionChange?: (selected: Set<string>, lead: T | null) => void;
+  /** Context-menu selection can update the action target without navigating to it. */
+  onSelectionChange?: (selected: Set<string>, lead: T | null, reason?: "contextMenu") => void;
   multiSelect?: boolean;
 
   /** Enter / double-click on a leaf (or on nodes `activateExpandable` accepts). */
   onActivate?: (node: T, e: KeyboardEvent | MouseEvent) => void;
   activateExpandable?: boolean | ((node: T) => boolean);
+  /**
+   * Jump to Source (F4 / ⌘↓) on the lead row. Without it the key activates like Enter; trees
+   * whose activation opens a diff pass this to open the file itself.
+   */
+  onJumpToSource?: (node: T, selection: ReadonlySet<string>) => void;
   /** Nodes Next / Previous Occurrence stops at (`TreeHandle.selectOccurrence`); default: leaves. */
   isOccurrence?: (node: T) => boolean;
   onContextMenu?: (node: T | null, selection: Set<string>, e: MouseEvent) => void;
 
   speedSearch?: boolean;
   speedSearchMode?: "highlight" | "filter";
+  /** Fit the passive speed-search field above the tree when its panel has a header. */
+  speedSearchAbove?: boolean;
+  /**
+   * Speed search shows as a field over the bar right above the tree (a tool window's toolbar)
+   * instead of a popup over its first rows, with a toggle to show only the matches.
+   */
+  speedSearchField?: boolean;
   rowHeight?: number;
   indent?: number;
+  /** CSS length limiting the leading inset of deeply nested rows. */
+  maxRowInset?: string;
   className?: string;
   rowClassName?: (node: T) => string | undefined;
+  /** CSS colour the row background is tinted with (File Colors). */
+  rowTint?: (node: T) => string | undefined;
   "aria-label"?: string;
   handleRef?: Ref<TreeHandle>;
+  /** Context key set while the tree itself has keyboard focus. */
+  focusContext?: string;
   empty?: ReactNode;
   /** Rows wider than the pane scroll horizontally instead of clipping. */
   horizontalScroll?: boolean;
   /** Optional display reordering between siblings; the caller owns the order. */
   reorder?: TreeReorder<T>;
+  /** Rows can be dragged to other components: what dragging `nodes` (the pressed row, or the
+   *  selection containing it) carries, or null when they can't be dragged. */
+  getDragData?: (nodes: T[]) => DragData | null;
 }
 
 /** Remember intrinsic widths by identity, including rows outside the virtual window. */
@@ -127,33 +158,34 @@ function useContentWidth<T>(
   enabled: boolean,
 ): number {
   const [width, setWidth] = useState(0);
-  const cache = useRef(new Map<string, number>());
-  const measuredRows = useRef<readonly Row<T>[] | null>(null);
-  const maximum = useRef(0);
-  useLayoutEffect(() => {
-    if (!enabled) {
-      cache.current.clear();
-      measuredRows.current = null;
-      maximum.current = 0;
-      return;
-    }
+  const latestRows = useRef(rows);
+  const schedule = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
     const element = scroller.current;
     if (!element) return;
-    const mounted = [...element.querySelectorAll<HTMLElement>("[data-row]")];
+    const cache = new Map<string, number>();
+    const observed = new Set<HTMLElement>();
+    let measuredRows: readonly Row<T>[] | null = null;
+    let maximum = 0;
+    let frame = 0;
     const measure = () => {
+      frame = 0;
       // Hidden tool windows have no layout. Keep their estimates until shown;
       // the observer remains attached so showing the window resumes measurement.
       if (element.clientWidth === 0) return;
+      const rows = latestRows.current;
+      const mounted = [...element.querySelectorAll<HTMLElement>("[data-row]")];
       let recompute = false;
-      if (measuredRows.current !== rows) {
+      if (measuredRows !== rows) {
         const keys = new Set(rows.map((row) => row.key));
-        for (const [key, value] of cache.current) {
+        for (const [key, value] of cache) {
           if (!keys.has(key)) {
-            cache.current.delete(key);
-            if (value === maximum.current) recompute = true;
+            cache.delete(key);
+            if (value === maximum) recompute = true;
           }
         }
-        measuredRows.current = rows;
+        measuredRows = rows;
       }
       // Measure max-content, not the viewport's min-width floor. Batch writes and
       // restore before paint so selection backgrounds still fill the viewport.
@@ -162,27 +194,47 @@ function useContentWidth<T>(
       const widths = mounted.map((row) => row.offsetWidth);
       mounted.forEach((row, index) => {
         row.style.minWidth = minimums[index]!;
-        const key = rows[Number(row.dataset.row)]!.key;
+        const key = rows[Number(row.dataset.row)]?.key;
+        if (key === undefined) return;
         const value = widths[index]!;
-        if (cache.current.get(key) === maximum.current && value < maximum.current) recompute = true;
-        cache.current.set(key, value);
-        maximum.current = Math.max(maximum.current, value);
+        if (cache.get(key) === maximum && value < maximum) recompute = true;
+        cache.set(key, value);
+        maximum = Math.max(maximum, value);
       });
       // Ordinary scrolling only touches mounted rows. Scan cached widths only
       // when the previous maximum was removed or actually became narrower.
       if (recompute) {
-        maximum.current = 0;
-        for (const value of cache.current.values()) maximum.current = Math.max(maximum.current, value);
-        recompute = false;
+        maximum = 0;
+        for (const value of cache.values()) maximum = Math.max(maximum, value);
       }
       // Reconcile and measure together: never publish an intermediate shrink.
-      setWidth(maximum.current);
+      setWidth(maximum);
+      // Rows resize without a render when fonts or zoom change.
+      const current = new Set(mounted);
+      for (const row of observed) if (!current.has(row)) observer.unobserve(row);
+      for (const row of mounted) if (!observed.has(row)) observer.observe(row);
+      observed.clear();
+      for (const row of mounted) observed.add(row);
     };
-    measure();
-    const observer = new ResizeObserver(measure);
+    // Measuring forces layout: coalesce renders and resizes into one pass per
+    // frame instead of measuring inside every commit.
+    const request = () => {
+      frame ||= requestAnimationFrame(measure);
+    };
+    const observer = new ResizeObserver(request);
     observer.observe(element);
-    for (const row of mounted) observer.observe(row);
-    return () => observer.disconnect();
+    schedule.current = request;
+    request();
+    return () => {
+      schedule.current = null;
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [enabled, scroller]);
+  // Rows or the virtual window may have changed; keep `rows` in step with the DOM.
+  useLayoutEffect(() => {
+    latestRows.current = rows;
+    schedule.current?.();
   });
   // Offscreen widths are estimates after label/font/indent changes; mounting
   // measures them afresh, including decreases for the same key.
@@ -206,6 +258,7 @@ function useControllableSet(value: ReadonlySet<string> | undefined, initial: Ite
 }
 
 export function Tree<T>(props: TreeProps<T>) {
+  const given = useGivenTx();
   const {
     roots,
     getKey,
@@ -219,14 +272,18 @@ export function Tree<T>(props: TreeProps<T>) {
     getColor,
     multiSelect = true,
     onActivate,
+    onJumpToSource,
     activateExpandable = false,
     onContextMenu,
     speedSearch = true,
     speedSearchMode = "highlight",
-    rowHeight = 24,
+    speedSearchAbove = false,
+    speedSearchField = false,
+    rowHeight: fixedRowHeight,
     indent = 20,
     className,
     rowClassName,
+    rowTint,
     handleRef,
     empty,
   } = props;
@@ -236,6 +293,15 @@ export function Tree<T>(props: TreeProps<T>) {
   const [lead, setLead] = useState<string | null>(() => [...selected][0] ?? null);
   const [anchor, setAnchor] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  // ⌘F / Ctrl+F opens speed search before anything is typed (IDEA's Find in a tree).
+  const [armed, setArmed] = useState(false);
+  const searching = !!query || armed;
+  const endSearch = () => {
+    setQuery("");
+    setArmed(false);
+  };
+  const [onlyMatches, setOnlyMatches] = useState(false);
+  const filterMatches = speedSearchMode === "filter" || (speedSearchField && onlyMatches);
   const scrollRef = useRef<HTMLDivElement>(null);
   const baseId = useId();
 
@@ -281,14 +347,14 @@ export function Tree<T>(props: TreeProps<T>) {
   }, [allRows, query, getLabel]);
 
   const rows = useMemo(() => {
-    if (!query || speedSearchMode !== "filter") return allRows;
+    if (!query || !filterMatches) return allRows;
     const keep = new Set<number>();
     allRows.forEach((r, i) => {
       if (!matchMap.has(r.key)) return;
       for (let j = i; j >= 0 && !keep.has(j); j = allRows[j]!.parent) keep.add(j);
     });
     return allRows.filter((_, i) => keep.has(i));
-  }, [allRows, matchMap, query, speedSearchMode]);
+  }, [allRows, matchMap, query, filterMatches]);
 
   const byKey = useMemo(() => new Map(allRows.map((r) => [r.key, r])), [allRows]);
   const emptyState = !rows.length && !!empty && !query;
@@ -299,6 +365,9 @@ export function Tree<T>(props: TreeProps<T>) {
   const indexOfKey = useMemo(() => new Map(rows.map((r, i) => [r.key, i])), [rows]);
   const leadIndex = lead != null ? (indexOfKey.get(lead) ?? -1) : -1;
 
+  const themedRowHeight = useIconRowHeight();
+  const defaultRowHeight = useRowHeight();
+  const rowHeight = fixedRowHeight ?? themedRowHeight ?? defaultRowHeight;
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
@@ -306,44 +375,78 @@ export function Tree<T>(props: TreeProps<T>) {
     overscan: 12,
     getItemKey: (i) => rows[i]!.key,
   });
+  useEffect(() => virtualizer.measure(), [virtualizer, rowHeight]);
 
+  // Keep the keyboard lead in view when the lead changes — not when its index
+  // shifts because expanding or collapsing elsewhere inserted rows above it:
+  // following the index would yank the viewport from the folder the user just
+  // opened back to the selection.
+  const pendingScrollToLead = useRef<string | null>(null);
   useEffect(() => {
-    if (leadIndex >= 0) virtualizer.scrollToIndex(leadIndex, { align: "auto" });
-  }, [leadIndex, virtualizer]);
+    pendingScrollToLead.current = lead;
+  }, [lead]);
+  // A preselected lead may arrive before its row is loaded. Retry until it
+  // appears, then stop following index changes for that selection.
+  useEffect(() => {
+    const key = pendingScrollToLead.current;
+    if (key == null) return;
+    const i = indexOfKey.get(key);
+    if (i === undefined) return;
+    virtualizer.scrollToIndex(i, { align: "auto" });
+    pendingScrollToLead.current = null;
+  }, [lead, indexOfKey, virtualizer]);
 
-  // Speed search owns Escape while active.
+  // Speed search owns Escape while active, and ⌫ with any modifier: the query is edited like a
+  // text field instead of the view's shortcuts running (⌘⌫ is Drop… in the Database view).
   useEffect(() => {
-    if (!query) return;
-    return acquirePopup();
-  }, [query]);
+    if (!searching) return;
+    const release = acquirePopup();
+    const unclaim = registerKeyClaim(
+      (e) => e.key === "Backspace" && e.target instanceof Node && !!scrollRef.current?.contains(e.target),
+    );
+    return () => {
+      release();
+      unclaim();
+    };
+  }, [searching]);
 
   const setExpanded = (row: Row<T>, open: boolean) => {
     if (!row.expandable || row.expanded === open) return;
     const next = new Set(expanded);
     if (open) next.add(row.key);
-    else next.delete(row.key);
+    else {
+      // Collapsing a node also collapses everything expanded below it, so expanding it again
+      // shows only its direct children.
+      next.delete(row.key);
+      const stack = [...(getChildren(row.node) ?? [])];
+      while (next.size && stack.length) {
+        const n = stack.pop()!;
+        if (next.delete(getKey(n)) || isExpandable(n)) stack.push(...(getChildren(n) ?? []));
+      }
+    }
     if (!expandedControlled) setExpandedInner(next);
     props.onExpandedChange?.(next, row.node, open);
     if (open && getChildren(row.node) === undefined) void loadChildren?.(row.node);
   };
 
   const commitSelection = useCallback(
-    (next: Set<string>, leadKey: string | null) => {
+    (next: Set<string>, leadKey: string | null, reason?: "contextMenu") => {
       if (!selectedControlled) setSelectedInner(next);
       setLead(leadKey);
       const leadRow = leadKey != null ? rows[indexOfKey.get(leadKey) ?? -1] : undefined;
-      props.onSelectionChange?.(next, leadRow?.node ?? null);
+      if (reason) props.onSelectionChange?.(next, leadRow?.node ?? null, reason);
+      else props.onSelectionChange?.(next, leadRow?.node ?? null);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [rows, indexOfKey, selectedControlled, props.onSelectionChange],
   );
 
-  const selectIndex = (i: number, mode: "single" | "toggle" | "range" = "single") => {
+  const selectIndex = (i: number, mode: "single" | "toggle" | "range" = "single", reason?: "contextMenu") => {
     const row = rows[i];
     if (!row || row.loading) return;
     if (mode === "single" || !multiSelect) {
       setAnchor(row.key);
-      commitSelection(new Set([row.key]), row.key);
+      commitSelection(new Set([row.key]), row.key, reason);
     } else if (mode === "toggle") {
       const next = new Set(selected);
       if (next.has(row.key)) next.delete(row.key);
@@ -364,10 +467,15 @@ export function Tree<T>(props: TreeProps<T>) {
     focus: () => scrollRef.current?.focus(),
     reveal: (key: string) => {
       const i = indexOfKey.get(key);
-      if (i === undefined) return;
+      if (i === undefined) return false;
       setAnchor(key);
       commitSelection(new Set([key]), key);
       virtualizer.scrollToIndex(i, { align: "center" });
+      return true;
+    },
+    clearSelection: () => {
+      setAnchor(null);
+      commitSelection(new Set(), null);
     },
     leadKey: () => lead,
     moveSelection: (dir: 1 | -1) => {
@@ -440,6 +548,18 @@ export function Tree<T>(props: TreeProps<T>) {
     const pageSize = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / rowHeight) - 1);
     const typed =
       speedSearch && e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey && !(e.key === " " && !query);
+    if (
+      speedSearch &&
+      e.key.toLowerCase() === "f" &&
+      (isMacHost() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) &&
+      !e.altKey &&
+      !e.shiftKey
+    ) {
+      setArmed(true);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (typed) {
       const q = query + e.key;
       setQuery(q);
@@ -449,23 +569,26 @@ export function Tree<T>(props: TreeProps<T>) {
       return;
     }
     const range = e.shiftKey && multiSelect;
-    // Jump to Source (F4 / ⌘↓) activates like Enter.
+    // Jump to Source (F4 / ⌘↓): the tree's own handler, else it activates like Enter.
     if (e.key === "F4" || (e.key === "ArrowDown" && e.metaKey && !e.shiftKey && !e.altKey)) {
       if (!row) return;
-      setQuery("");
-      activate(row, e);
+      endSearch();
+      if (onJumpToSource) {
+        if (!row.loading) onJumpToSource(row.node, selected);
+      } else activate(row, e);
       e.preventDefault();
       e.stopPropagation();
       return;
     }
     switch (e.key) {
       case "Escape":
-        if (!query) return;
-        setQuery("");
+        if (!searching) return;
+        endSearch();
         break;
       case "Backspace":
         if (!query) return;
-        setQuery(query.slice(0, -1));
+        // ⌘⌫ erases the query, ⌥⌫ / Ctrl+⌫ its last word, as in a text field.
+        setQuery(e.metaKey ? "" : e.altKey || e.ctrlKey ? query.replace(/\w*\W*$/, "") : query.slice(0, -1));
         break;
       case "ArrowDown":
       case "ArrowUp": {
@@ -481,14 +604,14 @@ export function Tree<T>(props: TreeProps<T>) {
         break;
       }
       case "ArrowRight":
-        setQuery("");
+        endSearch();
         if (!row) return;
         if (row.expandable && !row.expanded) setExpanded(row, true);
         else if (row.expanded && rows[leadIndex + 1]?.parentKey === row.key && !rows[leadIndex + 1]!.loading)
           selectIndex(leadIndex + 1);
         break;
       case "ArrowLeft":
-        setQuery("");
+        endSearch();
         if (!row) return;
         if (row.expanded) setExpanded(row, false);
         else if (row.parentKey != null) {
@@ -506,16 +629,16 @@ export function Tree<T>(props: TreeProps<T>) {
         break;
       }
       case "PageDown":
-        setQuery("");
+        endSearch();
         selectIndex(Math.min(rows.length - 1, Math.max(0, leadIndex) + pageSize), range ? "range" : "single");
         break;
       case "PageUp":
-        setQuery("");
+        endSearch();
         selectIndex(Math.max(0, leadIndex - pageSize), range ? "range" : "single");
         break;
       case "Enter":
         if (!row) return;
-        setQuery("");
+        endSearch();
         activate(row, e);
         break;
       case "a":
@@ -531,12 +654,23 @@ export function Tree<T>(props: TreeProps<T>) {
   };
 
   const onRowMouseDown = (e: MouseEvent, i: number) => {
-    if (e.button === 2) {
-      if (!selected.has(rows[i]!.key)) selectIndex(i);
+    if (e.button === 2 || (e.button === 0 && e.ctrlKey && isMacHost())) {
+      if (!selected.has(rows[i]!.key)) selectIndex(i, "single", "contextMenu");
       return;
     }
     if (e.button !== 0) return;
-    setQuery("");
+    // The second press of a double-click starts the browser's word selection,
+    // which in a virtualized tree spills onto the rows an expanding folder just
+    // inserted and highlights neighbouring labels. Prevent it: rows are
+    // controls, not text (the shared List does the same via `user-select`), the
+    // first press already selected, and the dblclick below still fires, so
+    // activation keeps working. Rows can host editors (inline rename), so this
+    // is scoped to repeated clicks instead of unselecting all row content.
+    if (e.detail >= 2) {
+      e.preventDefault();
+      return;
+    }
+    endSearch();
     if (e.shiftKey) selectIndex(i, "range");
     else if (e.metaKey || e.ctrlKey) selectIndex(i, "toggle");
     else selectIndex(i);
@@ -550,6 +684,31 @@ export function Tree<T>(props: TreeProps<T>) {
   );
   const noMatch = !!query && matchMap.size === 0;
 
+  const { focusContext } = props;
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!focusContext || !element) return;
+    let focused = false;
+    const focus = () => {
+      focused = true;
+      setContext(focusContext, true);
+    };
+    const blur = () => {
+      if (!focused) return;
+      focused = false;
+      setContext(focusContext, false);
+    };
+    element.addEventListener("focus", focus);
+    element.addEventListener("blur", blur);
+    if (element.ownerDocument.activeElement === element) focus();
+    return () => {
+      element.removeEventListener("focus", focus);
+      element.removeEventListener("blur", blur);
+      // Removing a focused tree can skip blur, leaving its shortcuts active.
+      blur();
+    };
+  }, [emptyState, focusContext]);
+
   if (emptyState) return <div className={clsx(styles.tree, styles.emptyWrap, className)}>{empty}</div>;
 
   return (
@@ -557,7 +716,7 @@ export function Tree<T>(props: TreeProps<T>) {
       <div
         ref={scrollRef}
         role="tree"
-        aria-label={tx(props["aria-label"])}
+        aria-label={given(props["aria-label"])}
         aria-multiselectable={multiSelect || undefined}
         aria-activedescendant={
           leadRow && !leadRow.loading && virtualizer.getVirtualItems().some((v) => v.index === leadIndex)
@@ -568,7 +727,8 @@ export function Tree<T>(props: TreeProps<T>) {
         className={styles.tree}
         onKeyDown={onKeyDown}
         onBlur={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setQuery("");
+          if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+          endSearch();
         }}
         onContextMenu={
           onContextMenu
@@ -590,14 +750,20 @@ export function Tree<T>(props: TreeProps<T>) {
           )}
           {virtualizer.getVirtualItems().map((v) => {
             const row = rows[v.index]!;
-            const pad = 4 + row.depth * indent;
-            const style = { transform: `translateY(${v.start}px)`, height: v.size, paddingLeft: pad };
+            // Settings › Appearance › "Use smaller indents in trees" sets `--tree-indent`
+            // on the root; reading it here applies the setting to every tree at once,
+            // instantly, and keeps chevrons and level alignment consistent with it.
+            const pad = (extra = 0) => {
+              const offset = `calc(${4 + extra}px + ${row.depth} * var(--tree-indent, ${indent}px))`;
+              return props.maxRowInset ? `min(${offset}, ${props.maxRowInset})` : offset;
+            };
+            const style = { transform: `translateY(${v.start}px)`, height: v.size, paddingLeft: pad() };
             if (row.loading) {
               return (
                 <div
                   key={v.key}
                   className={clsx(styles.row, styles.loading)}
-                  style={{ ...style, paddingLeft: pad + 20 }}
+                  style={{ ...style, paddingLeft: pad(20) }}
                   role="presentation"
                 >
                   <Spinner size={12} /> <T>Loading…</T>
@@ -605,6 +771,10 @@ export function Tree<T>(props: TreeProps<T>) {
               );
             }
             const isSelected = selected.has(row.key);
+            const prevRow = rows[v.index - 1];
+            const nextRow = rows[v.index + 1];
+            const joinPrev = isSelected && !!prevRow && !prevRow.loading && selected.has(prevRow.key);
+            const joinNext = isSelected && !!nextRow && !nextRow.loading && selected.has(nextRow.key);
             const isLead = v.index === leadIndex;
             const matches = matchMap.get(row.key) ?? null;
             const state: TreeRowState = {
@@ -618,6 +788,7 @@ export function Tree<T>(props: TreeProps<T>) {
             const icon = getIcon?.(row.node, row.expanded);
             const detail = getDetail?.(row.node);
             const color = getColor?.(row.node);
+            const tint = rowTint?.(row.node);
             return (
               <div
                 key={v.key}
@@ -633,12 +804,27 @@ export function Tree<T>(props: TreeProps<T>) {
                   styles.row,
                   props.horizontalScroll && styles.wideRow,
                   rowClassName?.(row.node),
+                  tint && styles.tinted,
                   isSelected && styles.selected,
+                  joinPrev && styles.joinPrev,
+                  joinNext && styles.joinNext,
                   isLead && styles.lead,
                   reordering.drop?.key === row.key && styles[reordering.drop.position],
                 )}
-                style={style}
-                onPointerDown={props.reorder ? (e) => reordering.start(e, row) : undefined}
+                style={tint ? ({ ...style, "--row-tint": tint } as CSSProperties) : style}
+                onPointerDown={
+                  props.reorder
+                    ? (e) => reordering.start(e, row)
+                    : props.getDragData
+                      ? (e) => {
+                          const nodes = selected.has(row.key)
+                            ? rows.filter((r) => selected.has(r.key)).map((r) => r.node)
+                            : [row.node];
+                          const data = props.getDragData!(nodes);
+                          if (data) startPointerDrag(e, e.currentTarget, data, { always: true });
+                        }
+                      : undefined
+                }
                 onMouseDown={(e) => onRowMouseDown(e, v.index)}
                 onDoubleClick={(e) => {
                   if (!props.reorder || !reordering.suppressActivation.current) activate(row, e);
@@ -670,7 +856,9 @@ export function Tree<T>(props: TreeProps<T>) {
                       indices={matches}
                       tone="accent"
                     />
-                    {detail && <span className={styles.detail}>{detail}</span>}
+                    {detail != null && detail !== false && detail !== "" && (
+                      <span className={styles.detail}>{detail}</span>
+                    )}
                   </>
                 )}
               </div>
@@ -678,12 +866,38 @@ export function Tree<T>(props: TreeProps<T>) {
           })}
         </div>
       </div>
-      {query && (
-        <div className={clsx(styles.speedSearch, noMatch && styles.noMatch)} role="status" aria-live="polite">
-          <Icon name="search" size={12} />
-          <span className={styles.speedQuery}>{query}</span>
-        </div>
-      )}
+      {searching &&
+        (speedSearchField ? (
+          // Typing stays in the tree: a press here must not take its focus, which would end the search.
+          <div
+            className={clsx(styles.speedSearch, styles.speedField, noMatch && styles.noMatch)}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <Icon name="search" size={14} />
+            <span className={styles.speedQuery} role="status" aria-live="polite">
+              {query}
+            </span>
+            <span className={styles.caret} aria-hidden="true" />
+            <IconButton
+              icon="filter"
+              size="small"
+              className={styles.onlyMatches}
+              title="Show Only Matches"
+              pressed={onlyMatches}
+              onClick={() => setOnlyMatches(!onlyMatches)}
+            />
+          </div>
+        ) : (
+          <div
+            className={clsx(styles.speedSearch, speedSearchAbove && styles.speedAbove, noMatch && styles.noMatch)}
+            role="status"
+            aria-live="polite"
+          >
+            <Icon name="search" size={speedSearchAbove ? 16 : 12} />
+            <span className={styles.speedQuery}>{query}</span>
+            {speedSearchAbove && <span className={styles.caret} aria-hidden="true" />}
+          </div>
+        ))}
     </div>
   );
 }

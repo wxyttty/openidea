@@ -1,10 +1,9 @@
 use crate::editorconfig::{EditorConfig, EditorConfigProps};
 use crate::file_defaults::FileDefaults;
 use ide_core::error::ErrorKind;
-use ide_core::event::NotifyLevel;
 use ide_core::{ChangeSet, DocId, IdeError, IdeEvent, IdeResult, LanguageId, SharedSink, TextEdit};
 use ide_text::{AppliedChange, ByteEdit, Document, LineEnding};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, ReentrantMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::HashMap;
@@ -21,9 +20,15 @@ pub struct DocumentInfo {
     pub version: u32,
     pub language: LanguageId,
     pub encoding: String,
+    pub has_bom: bool,
     pub line_ending: LineEnding,
     pub read_only: bool,
     pub dirty: bool,
+    /// Whether "Reload with Encoding" can re-decode this document's source
+    /// bytes: true for files and virtual documents the backend can re-read
+    /// (archive entries, JDT sources with an editable attachment encoding,
+    /// Git revisions); false for server-generated content (decompiled code).
+    pub can_reload_encoding: bool,
     /// Larger than `ide_vfs::LARGE_FILE_THRESHOLD`: language servers, syntax
     /// structure and folding are disabled; the editor should drop heavy features.
     #[specta(optional)]
@@ -41,6 +46,24 @@ pub struct DocumentInfo {
     pub ui_mode: Option<String>,
 }
 
+/// The language and CodeMirror mode a file is shown with, like `DocumentInfo`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentLanguage {
+    pub language: LanguageId,
+    /// CodeMirror mode replacing the language's own one (`DocumentInfo::ui_mode`).
+    #[specta(optional)]
+    pub ui_mode: Option<String>,
+}
+
+/// Encoding and BOM currently applied to an open document.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentEncoding {
+    pub encoding: String,
+    pub has_bom: bool,
+}
+
 /// Current text and identity of a document, for analyses (outline, folding).
 #[derive(Clone, Debug)]
 pub struct TextSnapshot {
@@ -56,12 +79,25 @@ pub type DetectLanguage = dyn Fn(&Path, Option<&str>) -> LanguageId + Send + Syn
 /// CodeMirror mode of a file replacing its language's own one; `None` keeps it.
 pub type DetectUiMode = dyn Fn(&Path, &LanguageId) -> Option<String> + Send + Sync;
 
+struct DocumentPatch<'a> {
+    base_version: u32,
+    changes: ChangeSet,
+    applied: &'a [AppliedChange],
+    edits: &'a [ByteEdit],
+    workspace_edit: bool,
+}
+
 /// Registry of open documents keyed by path, with ref-counting so split
 /// editors on the same file share one buffer.
 ///
 /// Every document has its own lock; operations on one document are serialized
 /// and observers see them in version order.
 pub struct Documents {
+    /// Workspace transactions hold this across preflight/commit/rollback; ordinary
+    /// operations re-enter it while accessing the individual document locks.
+    operations: ReentrantMutex<()>,
+    workspace_edits: Arc<Mutex<workspace_edit::History>>,
+    workspace_edit_active: std::sync::atomic::AtomicBool,
     registry: Mutex<Registry>,
     observers: RwLock<Vec<Arc<dyn DocumentObserver>>>,
     sink: SharedSink,
@@ -96,6 +132,8 @@ pub trait DocumentObserver: Send + Sync {
     fn closed(&self, _doc: DocId, _path: &Path) {}
 }
 
+mod workspace_edit;
+
 type Slot = Arc<Mutex<DocState>>;
 
 #[derive(Default)]
@@ -111,6 +149,7 @@ struct RegEntry {
     keys: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
 struct DocState {
     path: PathBuf,
     doc: Document,
@@ -126,9 +165,15 @@ struct DocState {
     observed: bool,
     binary: bool,
     dirty: bool,
+    can_reload_encoding: bool,
+    /// The user picked `encoding`; reloads keep it instead of detecting again.
+    encoding_chosen: bool,
     /// Disk state we last loaded or wrote; changes matching it are our own.
     disk_mtime: f64,
     disk_len: u64,
+    /// The file changed on disk while this buffer had unsaved changes; autosave leaves it
+    /// alone until the user saves explicitly or the buffer is reloaded.
+    disk_conflict: bool,
     closed: bool,
     /// URI of a virtual document (no file behind it).
     uri: Option<String>,
@@ -160,9 +205,18 @@ fn read_only_error(path: &Path) -> IdeError {
     IdeError::new(ErrorKind::PermissionDenied, format!("{} is read-only", path.display()))
 }
 
+/// The synthetic key of an unsaved new-file buffer (`untitled:Untitled-1`);
+/// minted by [`Documents::open_untitled`], replaced by a real path on save.
+fn is_untitled(path: &Path) -> bool {
+    path.to_str().is_some_and(|p| p.starts_with("untitled:"))
+}
+
 impl Documents {
     pub fn new(sink: SharedSink, detect_language: Box<DetectLanguage>) -> Self {
         Self {
+            operations: ReentrantMutex::new(()),
+            workspace_edits: Arc::default(),
+            workspace_edit_active: std::sync::atomic::AtomicBool::new(false),
             registry: Mutex::default(),
             observers: RwLock::default(),
             sink,
@@ -179,10 +233,18 @@ impl Documents {
         self
     }
 
-    /// The `DocumentInfo::ui_mode` `path` gets when opened, without opening it
-    /// (previews of other files).
-    pub fn ui_mode_of(&self, path: &Path) -> Option<String> {
-        (self.detect_ui_mode)(path, &(self.detect_language)(path, None))
+    /// The language and mode `path` gets when opened, without opening it (previews, diffs
+    /// of other revisions), detected from `first_line` (hashbangs) or, without one, the
+    /// first line of its open buffer or of the file on disk.
+    pub fn language_of(&self, path: &Path, first_line: Option<&str>) -> DocumentLanguage {
+        let current = match first_line {
+            Some(_) => None,
+            None => self.text_of(path).or_else(|| first_line_on_disk(path)),
+        };
+        let first_line = first_line.or(current.as_deref()).and_then(|l| l.lines().next());
+        let language = (self.detect_language)(path, first_line);
+        let ui_mode = (self.detect_ui_mode)(path, &language);
+        DocumentLanguage { language, ui_mode }
     }
 
     /// Settings-derived defaults for new files, fallback decoding and EditorConfig support.
@@ -204,6 +266,7 @@ impl Documents {
                 st.native_to_ascii = enabled;
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 Ok(())
             });
             if let Err(e) = result {
@@ -244,6 +307,16 @@ impl Documents {
         Self::load_with_defaults(path, &self.file_defaults())
     }
 
+    /// Bounded closed-file snapshots use the same project defaults as open documents.
+    pub fn load_file_bounded(&self, path: &Path, max_bytes: usize) -> IdeResult<ide_vfs::LoadedText> {
+        let defaults = self.file_defaults();
+        let mut loaded = ide_vfs::load_text_bounded(path, defaults.fallback_for(&absolute(path)), max_bytes)?;
+        if !loaded.binary && defaults.native_to_ascii_for(path) {
+            loaded.text = ide_vfs::decode_properties_escapes(&loaded.text);
+        }
+        Ok(loaded)
+    }
+
     pub fn load_file_as(&self, path: &Path, encoding: &str) -> IdeResult<ide_vfs::LoadedText> {
         Self::load_as(path, encoding, self.native_to_ascii_for(path))
     }
@@ -279,6 +352,7 @@ impl Documents {
 
     /// Locks a document, failing if it was closed concurrently.
     fn with_doc<T>(&self, doc: DocId, f: impl FnOnce(&mut DocState) -> IdeResult<T>) -> IdeResult<T> {
+        let _operation = self.operations.lock();
         let slot = self.slot(doc)?;
         let mut st = slot.lock();
         if st.closed {
@@ -304,9 +378,11 @@ impl Documents {
             version: st.doc.version(),
             language: st.language.clone(),
             encoding: st.encoding.clone(),
+            has_bom: st.has_bom,
             line_ending: st.doc.line_ending(),
             read_only: st.read_only,
             dirty: st.dirty,
+            can_reload_encoding: st.can_reload_encoding,
             large: st.large,
             editorconfig: st.editorconfig.clone(),
             uri: st.uri.clone(),
@@ -326,6 +402,7 @@ impl Documents {
 
     /// Opens (or re-references) the document at `path`.
     pub fn open(&self, path: &Path) -> IdeResult<DocumentInfo> {
+        let _operation = self.operations.lock();
         if let Some(info) = self.reopen(path) {
             return Ok(info);
         }
@@ -379,8 +456,11 @@ impl Documents {
             observed,
             binary: loaded.binary,
             dirty: false,
+            can_reload_encoding: true,
+            encoding_chosen: false,
             disk_mtime: loaded.mtime_ms,
             disk_len: disk_len(path),
+            disk_conflict: false,
             closed: false,
             uri: None,
         };
@@ -416,8 +496,20 @@ impl Documents {
 
     /// Opens (or re-references) a read-only virtual document: contents a
     /// language server provides for a non-`file:` URI. It is keyed by the URI,
-    /// never touches the disk and cannot be edited or saved.
-    pub fn open_virtual(&self, uri: &str, language: LanguageId, text: &str) -> IdeResult<DocumentInfo> {
+    /// never touches the disk and cannot be edited or saved. `encoding` /
+    /// `has_bom` describe how the content was decoded (not a guess);
+    /// `can_reload_encoding` tells whether [`Documents::replace_virtual`] can
+    /// re-decode it ("Reload with Encoding").
+    pub fn open_virtual(
+        &self,
+        uri: &str,
+        language: LanguageId,
+        text: &str,
+        encoding: &str,
+        has_bom: bool,
+        can_reload_encoding: bool,
+    ) -> IdeResult<DocumentInfo> {
+        let _operation = self.operations.lock();
         let key = PathBuf::from(uri);
         if let Some(info) = self.reopen(&key) {
             return Ok(info);
@@ -428,8 +520,8 @@ impl Documents {
             doc: Document::new(text),
             language,
             ui_mode: None,
-            encoding: "utf-8".into(),
-            has_bom: false,
+            encoding: encoding.into(),
+            has_bom,
             native_to_ascii: false,
             read_only: true,
             large,
@@ -437,8 +529,11 @@ impl Documents {
             observed: true,
             binary: false,
             dirty: false,
+            can_reload_encoding,
+            encoding_chosen: false,
             disk_mtime: 0.0,
             disk_len: 0,
+            disk_conflict: false,
             closed: false,
             uri: Some(uri.to_owned()),
         };
@@ -463,6 +558,76 @@ impl Documents {
         Ok(info)
     }
 
+    /// Opens (or re-references) an editable buffer without a file behind it:
+    /// a new-file tab ("Untitled-1"). Keyed by an `untitled:` URI like virtual
+    /// documents, so it never touches the disk until [`Documents::save_as`]
+    /// gives it a path (which also re-detects the language). Encoding, BOM and
+    /// line ending come from the file defaults. `name` re-references an
+    /// existing buffer (`Some("untitled:Untitled-1")`); `None` mints the
+    /// first free one.
+    pub fn open_untitled(&self, name: Option<&str>) -> IdeResult<DocumentInfo> {
+        let _operation = self.operations.lock();
+        let key = name.map(PathBuf::from).unwrap_or_else(|| self.next_untitled_key());
+        if let Some(info) = self.reopen(&key) {
+            return Ok(info);
+        }
+        let defaults = self.file_defaults();
+        let mut doc = Document::new("");
+        doc.set_line_ending(defaults.line_ending);
+        let state = DocState {
+            path: key.clone(),
+            doc,
+            language: LanguageId::plain_text(),
+            ui_mode: None,
+            encoding: defaults.encoding.clone(),
+            has_bom: defaults.encoding == "utf-8" && defaults.utf8_bom,
+            native_to_ascii: false,
+            read_only: false,
+            large: false,
+            editorconfig: None,
+            observed: true,
+            binary: false,
+            dirty: false,
+            can_reload_encoding: false,
+            encoding_chosen: false,
+            disk_mtime: 0.0,
+            disk_len: 0,
+            disk_conflict: false,
+            closed: false,
+            uri: Some(key.to_string_lossy().into_owned()),
+        };
+        let slot: Slot = Arc::new(Mutex::new(state));
+        let st = slot.lock();
+        let id = {
+            let mut reg = self.registry.lock();
+            if reg.by_key.contains_key(&key) {
+                // Lost a race with a concurrent open of the same untitled buffer.
+                drop(reg);
+                drop(st);
+                return self.reopen(&key).ok_or_else(|| IdeError::internal("document vanished while opening"));
+            }
+            let id = DocId::next();
+            reg.by_key.insert(key.clone(), id);
+            reg.docs.insert(id, RegEntry { slot: slot.clone(), refs: 1, keys: vec![key] });
+            id
+        };
+        let info = Self::info(id, &st);
+        for o in self.observers() {
+            o.opened(&info);
+        }
+        Ok(info)
+    }
+
+    /// The first free `untitled:Untitled-N` key.
+    fn next_untitled_key(&self) -> PathBuf {
+        let reg = self.registry.lock();
+        let mut n = 1;
+        while reg.by_key.contains_key(&PathBuf::from(format!("untitled:Untitled-{n}"))) {
+            n += 1;
+        }
+        PathBuf::from(format!("untitled:Untitled-{n}"))
+    }
+
     fn reopen(&self, path: &Path) -> Option<DocumentInfo> {
         let slot = {
             let mut reg = self.registry.lock();
@@ -476,6 +641,7 @@ impl Documents {
     }
 
     pub fn close(&self, doc: DocId) {
+        let _operation = self.operations.lock();
         let slot = {
             let mut reg = self.registry.lock();
             let Some(entry) = reg.docs.get_mut(&doc) else { return };
@@ -493,6 +659,8 @@ impl Documents {
         };
         let mut st = slot.lock();
         st.closed = true;
+        // A buffer closed with changes (Don't Save) has nothing left to save.
+        self.set_dirty(doc, &mut st, false);
         if st.observed {
             for o in self.observers() {
                 o.closed(doc, &st.path);
@@ -503,7 +671,7 @@ impl Documents {
     fn set_dirty(&self, doc: DocId, st: &mut DocState, dirty: bool) {
         if st.dirty != dirty {
             st.dirty = dirty;
-            self.sink.emit(IdeEvent::DocDirty { doc, dirty });
+            self.sink.emit(IdeEvent::DocDirty { doc, dirty, version: st.doc.version() });
         }
     }
 
@@ -522,9 +690,15 @@ impl Documents {
     pub fn edit(&self, doc: DocId, base_version: u32, changes: ChangeSet) -> IdeResult<u32> {
         self.with_doc(doc, |st| {
             if st.read_only {
+                tracing::warn!("edit rejected: {} is read-only", st.path.display());
                 return Err(read_only_error(&st.path));
             }
-            let (applied, edits) = st.doc.apply_detailed(base_version, &changes)?;
+            let (applied, edits) = st.doc.apply_detailed(base_version, &changes).inspect_err(|e| {
+                // A stale version is routine (the UI rebases); anything else makes the editor drop the edit.
+                if e.kind != ErrorKind::OutOfSync {
+                    tracing::warn!("edit of {} rejected: {e}", st.path.display());
+                }
+            })?;
             self.set_dirty(doc, st, true);
             self.notify_changed(doc, st, &applied, &edits);
             Ok(st.doc.version())
@@ -542,23 +716,74 @@ impl Documents {
             }
             let base_version = st.doc.version();
             let (set, applied, bytes) = st.doc.apply_edits_detailed(edits)?;
-            self.patched(doc, st, base_version, set, &applied, &bytes);
+            self.patched(
+                doc,
+                st,
+                DocumentPatch { base_version, changes: set, applied: &applied, edits: &bytes, workspace_edit: false },
+            );
             self.set_dirty(doc, st, true);
             Ok(st.doc.version())
         })
     }
 
-    fn patched(
+    /// [`apply_edits`](Self::apply_edits) only if the document is still at
+    /// `version` (checked under the document's lock). `Ok(None)` when it
+    /// changed since; nothing is applied then.
+    pub fn apply_edits_at(&self, doc: DocId, version: u32, edits: &[TextEdit]) -> IdeResult<Option<u32>> {
+        self.versioned_edits(doc, version, edits, false)
+    }
+
+    /// [`apply_edits_at`](Self::apply_edits_at) for a background caller (a plugin
+    /// event, not a command in the editor): the editor gets no Undo entry for it,
+    /// and it isn't reported back as a local change.
+    pub fn apply_background_edits_at(&self, doc: DocId, version: u32, edits: &[TextEdit]) -> IdeResult<Option<u32>> {
+        self.versioned_edits(doc, version, edits, true)
+    }
+
+    fn versioned_edits(
         &self,
         doc: DocId,
-        st: &DocState,
-        base_version: u32,
-        set: ChangeSet,
-        applied: &[AppliedChange],
-        edits: &[ByteEdit],
-    ) {
-        self.notify_changed(doc, st, applied, edits);
-        self.sink.emit(IdeEvent::DocPatched { doc, base_version, version: st.doc.version(), changes: set.changes });
+        version: u32,
+        edits: &[TextEdit],
+        background: bool,
+    ) -> IdeResult<Option<u32>> {
+        self.with_doc(doc, |st| {
+            if st.doc.version() != version {
+                return Ok(None);
+            }
+            if st.read_only {
+                return Err(read_only_error(&st.path));
+            }
+            if edits.is_empty() {
+                return Ok(Some(version));
+            }
+            let (set, applied, bytes) = st.doc.apply_edits_detailed(edits)?;
+            self.patched(
+                doc,
+                st,
+                DocumentPatch {
+                    base_version: version,
+                    changes: set,
+                    applied: &applied,
+                    edits: &bytes,
+                    workspace_edit: background,
+                },
+            );
+            self.set_dirty(doc, st, true);
+            Ok(Some(st.doc.version()))
+        })
+    }
+
+    fn patched(&self, doc: DocId, st: &DocState, patch: DocumentPatch<'_>) {
+        self.notify_changed(doc, st, patch.applied, patch.edits);
+        self.sink.emit(IdeEvent::DocPatched {
+            doc,
+            base_version: patch.base_version,
+            version: st.doc.version(),
+            changes: patch.changes.changes,
+            workspace_edit: patch.workspace_edit
+                || self.workspace_edit_active.load(std::sync::atomic::Ordering::Relaxed),
+        });
     }
 
     /// Minimal-diff replacement; no event when the text is unchanged.
@@ -569,7 +794,11 @@ impl Documents {
         }
         let base_version = st.doc.version();
         let (applied, edits) = st.doc.apply_detailed(base_version, &set)?;
-        self.patched(doc, st, base_version, set, &applied, &edits);
+        self.patched(
+            doc,
+            st,
+            DocumentPatch { base_version, changes: set, applied: &applied, edits: &edits, workspace_edit: false },
+        );
         Ok(true)
     }
 
@@ -589,7 +818,22 @@ impl Documents {
     /// Writes the document with its original encoding, BOM and line ending.
     /// A clean document is not rewritten.
     pub fn save(&self, doc: DocId) -> IdeResult<()> {
+        self.with_doc(doc, |st| self.write(doc, st))
+    }
+
+    /// An automatic save (switching tabs, the window losing focus): `false` when the file changed
+    /// on disk after this buffer was edited, which only an explicit save may overwrite.
+    pub fn autosave(&self, doc: DocId) -> IdeResult<bool> {
         self.with_doc(doc, |st| {
+            if st.dirty && st.disk_conflict {
+                return Ok(false);
+            }
+            self.write(doc, st).map(|()| true)
+        })
+    }
+
+    fn write(&self, doc: DocId, st: &mut DocState) -> IdeResult<()> {
+        {
             if !st.dirty || st.uri.is_some() {
                 return Ok(());
             }
@@ -601,6 +845,7 @@ impl Documents {
             };
             st.disk_mtime = mtime;
             st.disk_len = disk_len(&st.path);
+            st.disk_conflict = false;
             self.set_dirty(doc, st, false);
             if st.observed {
                 let text = st.doc.text();
@@ -609,6 +854,90 @@ impl Documents {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Save As for an untitled buffer: writes it to `target` (creating missing
+    /// parent folders) and turns it into a regular file document — the buffer
+    /// keeps its identity (undo history, version), the registry is re-keyed and
+    /// the language is re-detected from the new path. The target path must not
+    /// be open as another document.
+    pub fn save_as(&self, doc: DocId, target: &Path) -> IdeResult<DocumentInfo> {
+        let _operation = self.operations.lock();
+        // The caller picks a real file path; an `untitled:` key is never one
+        // (and must not be resolved against the working directory either).
+        if is_untitled(target) {
+            return Err(IdeError::invalid("cannot save over an untitled buffer"));
+        }
+        let target = absolute(target);
+        {
+            let reg = self.registry.lock();
+            if let Some(other) = Self::lookup(&reg, &target)
+                && other != doc
+            {
+                return Err(IdeError::invalid(format!("{} is already open", target.display())));
+            }
+        }
+        self.with_doc(doc, |st| {
+            if st.uri.is_none() || !is_untitled(&st.path) {
+                return Err(IdeError::invalid("only an untitled document can be saved to a new path"));
+            }
+            let text = st.doc.text_for_save();
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mtime = if st.native_to_ascii {
+                ide_vfs::save_properties_text(&target, &text)?
+            } else {
+                ide_vfs::save_text(&target, &text, &st.encoding, st.has_bom)?
+            };
+            // Re-key the registry before anyone opens the new path in parallel.
+            let keys = keys_for(&target);
+            {
+                let mut reg = self.registry.lock();
+                let old_keys = match reg.docs.get_mut(&doc) {
+                    Some(entry) => std::mem::take(&mut entry.keys),
+                    None => return Err(IdeError::not_found("document closed while saving")),
+                };
+                for k in &old_keys {
+                    if reg.by_key.get(k) == Some(&doc) {
+                        reg.by_key.remove(k);
+                    }
+                }
+                for k in &keys {
+                    reg.by_key.insert(k.clone(), doc);
+                }
+                if let Some(entry) = reg.docs.get_mut(&doc) {
+                    entry.keys = keys;
+                }
+            }
+            let old_path = std::mem::replace(&mut st.path, target.clone());
+            st.uri = None;
+            let defaults = self.file_defaults();
+            let first_line = st.doc.text();
+            let first_line = first_line.lines().next();
+            let language = (self.detect_language)(&st.path, first_line);
+            let ui_mode = (self.detect_ui_mode)(&st.path, &language);
+            let language_changed = language != st.language;
+            st.language = language.clone();
+            st.ui_mode = ui_mode;
+            st.editorconfig = if defaults.editorconfig { self.editorconfig.resolve(&st.path) } else { None };
+            st.native_to_ascii = defaults.native_to_ascii_for(&st.path);
+            st.disk_mtime = mtime;
+            st.disk_len = disk_len(&st.path);
+            self.set_dirty(doc, st, false);
+            let info = Self::info(doc, st);
+            if st.observed {
+                for o in self.observers() {
+                    o.closed(doc, &old_path);
+                    o.opened(&info);
+                    o.saved(doc, &st.path, &st.doc.text());
+                }
+            }
+            if language_changed {
+                self.sink.emit(IdeEvent::DocLanguage { doc, language, ui_mode: st.ui_mode.clone() });
+            }
+            Ok(info)
         })
     }
 
@@ -693,6 +1022,16 @@ impl Documents {
         self.with_doc(doc, |st| Ok(st.dirty))
     }
 
+    /// Path and version for navigation queries, without copying document text.
+    pub fn identity(&self, doc: DocId) -> IdeResult<(PathBuf, u32)> {
+        self.with_doc(doc, |st| Ok((st.path.clone(), st.doc.version())))
+    }
+
+    /// Current generation without copying the document text.
+    pub fn version(&self, doc: DocId) -> IdeResult<u32> {
+        self.with_doc(doc, |st| Ok(st.doc.version()))
+    }
+
     /// Ids of all open documents.
     pub fn open_documents(&self) -> Vec<DocId> {
         self.registry.lock().docs.keys().copied().collect()
@@ -705,6 +1044,7 @@ impl Documents {
     /// for the observers, so it moves to the matching language servers and
     /// syntax tree. Returns the changed documents.
     pub fn redetect_languages(&self) -> Vec<DocId> {
+        let _operation = self.operations.lock();
         let slots: Vec<(DocId, Slot)> = self.registry.lock().docs.iter().map(|(id, e)| (*id, e.slot.clone())).collect();
         let mut changed = Vec::new();
         for (id, slot) in slots {
@@ -753,10 +1093,13 @@ impl Documents {
     /// Changes the document's encoding. `reload`: re-decode the file on disk with
     /// it (refused while there are unsaved changes); otherwise convert: the text
     /// is kept and the next save writes it in the new encoding.
-    pub fn set_encoding(&self, doc: DocId, encoding: &str, reload: bool) -> IdeResult<String> {
+    pub fn set_encoding(&self, doc: DocId, encoding: &str, reload: bool) -> IdeResult<DocumentEncoding> {
         self.with_doc(doc, |st| {
-            if st.uri.is_some() {
+            if st.uri.is_some() && !is_untitled(&st.path) {
                 return Err(read_only_error(&st.path));
+            }
+            if reload && st.uri.is_some() {
+                return Err(IdeError::invalid("save the file before reloading it with another encoding"));
             }
             ide_vfs::encode("", encoding, false)?;
             if reload {
@@ -767,13 +1110,15 @@ impl Documents {
                 let loaded = Self::load_as(&st.path, encoding, enabled)?;
                 st.native_to_ascii = enabled;
                 st.encoding = loaded.encoding.clone();
+                st.encoding_chosen = true;
                 st.has_bom = loaded.has_bom;
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 self.replace_locked(doc, st, &loaded.text)?;
                 // Reloading is not an edit: the buffer matches the file again.
                 self.set_dirty(doc, st, false);
-                return Ok(loaded.encoding);
+                return Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom });
             }
             if st.read_only {
                 return Err(read_only_error(&st.path));
@@ -785,15 +1130,130 @@ impl Documents {
                 ide_vfs::encode(&st.doc.text_for_save(), encoding, has_bom)?;
             }
             st.encoding = encoding.to_owned();
+            st.encoding_chosen = true;
             st.has_bom = has_bom;
             self.set_dirty(doc, st, true);
-            Ok(st.encoding.clone())
+            Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
+        })
+    }
+
+    /// Load Changes from Disk: drops the buffer's unsaved changes and reads its file again in
+    /// the buffer's encoding, after the file changed on disk (`IdeEvent::DocDiskConflict`).
+    pub fn discard_and_reload(&self, doc: DocId) -> IdeResult<()> {
+        self.with_doc(doc, |st| {
+            if st.uri.is_some() || st.binary {
+                return Err(IdeError::invalid("only a file's text can be reloaded from disk"));
+            }
+            let loaded = Self::load_as(&st.path, &st.encoding, st.native_to_ascii)?;
+            st.has_bom = loaded.has_bom;
+            st.disk_mtime = loaded.mtime_ms;
+            st.disk_len = disk_len(&st.path);
+            st.disk_conflict = false;
+            self.replace_locked(doc, st, &loaded.text)?;
+            self.set_dirty(doc, st, false);
+            Ok(())
+        })
+    }
+
+    /// The URI of a virtual document, or `None` for a file-backed one.
+    pub fn virtual_uri(&self, doc: DocId) -> IdeResult<Option<String>> {
+        self.with_doc(doc, |st| Ok(st.uri.clone()))
+    }
+
+    /// Whether this is an untitled (new-file) buffer: editable, no file behind
+    /// it until [`Documents::save_as`].
+    pub fn is_untitled(&self, doc: DocId) -> IdeResult<bool> {
+        self.with_doc(doc, |st| Ok(is_untitled(&st.path)))
+    }
+
+    /// The open untitled buffers: `(key, text, dirty)` — they belong to the
+    /// window rather than a project, and [`Documents::restore_untitled_buffer`]
+    /// carries them into a project's fresh document registry.
+    pub fn untitled_buffers(&self) -> Vec<(String, String, bool)> {
+        let slots: Vec<Slot> = self.registry.lock().docs.values().map(|e| e.slot.clone()).collect();
+        let mut out = Vec::new();
+        for slot in slots {
+            let st = slot.lock();
+            if !st.closed && is_untitled(&st.path) {
+                out.push((st.path.to_string_lossy().into_owned(), st.doc.text(), st.dirty));
+            }
+        }
+        out
+    }
+
+    /// Recreates an untitled buffer carried over from the window's previous
+    /// project: same key, same text, same dirty flag.
+    pub fn restore_untitled_buffer(&self, key: &str, text: &str, dirty: bool) -> IdeResult<()> {
+        let info = self.open_untitled(Some(key))?;
+        if info.text != text {
+            self.replace_all(info.id, text)?;
+        }
+        // `replace_all` marks the buffer dirty; the carried flag is authoritative.
+        self.with_doc(info.id, |st| {
+            self.set_dirty(info.id, st, dirty);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Re-decoded content of a virtual document ("Reload with Encoding"):
+    /// replaces the text and the encoding label, keeping the document
+    /// read-only and clean. The caller re-reads the origin (archive entry,
+    /// language server, Git blob) with the chosen encoding first.
+    pub fn replace_virtual(
+        &self,
+        doc: DocId,
+        text: &str,
+        encoding: &str,
+        has_bom: bool,
+    ) -> IdeResult<DocumentEncoding> {
+        self.with_doc(doc, |st| {
+            if st.uri.is_none() {
+                return Err(IdeError::invalid("not a virtual document"));
+            }
+            ide_vfs::encode("", encoding, false)?;
+            st.doc.set_line_ending(LineEnding::detect(text));
+            self.replace_locked(doc, st, text)?;
+            st.encoding = encoding.to_owned();
+            st.has_bom = has_bom;
+            st.large = text.len() as u64 > ide_vfs::LARGE_FILE_THRESHOLD;
+            // Reloading is not an edit: the buffer matches its source again.
+            self.set_dirty(doc, st, false);
+            Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
+        })
+    }
+
+    /// Adds or removes the BOM on a UTF-8 document; the change is written on save.
+    pub fn set_bom(&self, doc: DocId, has_bom: bool) -> IdeResult<DocumentEncoding> {
+        self.with_doc(doc, |st| {
+            if st.read_only || (st.uri.is_some() && !is_untitled(&st.path)) {
+                return Err(read_only_error(&st.path));
+            }
+            if st.encoding != "utf-8" || st.native_to_ascii {
+                return Err(IdeError::invalid("the BOM can only be changed for UTF-8 documents"));
+            }
+            if st.has_bom != has_bom {
+                st.has_bom = has_bom;
+                self.set_dirty(doc, st, true);
+            }
+            Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
         })
     }
 
     /// Re-checks open file buffers, including files outside the watched roots.
     /// Call from a blocking worker; unchanged files only need their metadata.
     pub fn sync_from_disk(&self) {
+        self.sync_open_documents(false);
+    }
+
+    /// Refreshes clean buffers after an IDE operation rewrites files. Such an
+    /// operation can preserve both file length and the timestamp's millisecond.
+    /// The open document's selected codec is retained.
+    pub fn sync_after_disk_change(&self) {
+        self.sync_open_documents(true);
+    }
+
+    fn sync_open_documents(&self, force_clean: bool) {
         let slots: Vec<Slot> = self.registry.lock().docs.values().map(|e| e.slot.clone()).collect();
         let paths: Vec<PathBuf> = slots
             .iter()
@@ -803,13 +1263,18 @@ impl Documents {
                     .then(|| st.path.clone())
             })
             .collect();
-        self.on_disk_changed(&paths);
+        self.reload_from_disk(&paths, force_clean, true);
     }
 
     /// Re-reads from disk after an external change. Clean documents reload
-    /// silently; dirty ones are left alone and reported via `IdeEvent::Notify`.
+    /// silently; dirty ones are left alone and reported via `IdeEvent::DocDiskConflict`.
     /// Changes matching our own last save are ignored.
     pub fn on_disk_changed(&self, paths: &[PathBuf]) {
+        self.reload_from_disk(paths, false, false);
+    }
+
+    /// `dedup`: blind scans skip files whose `(mtime, length)` stamp still matches.
+    fn reload_from_disk(&self, paths: &[PathBuf], force_clean: bool, dedup: bool) {
         for path in paths {
             let Some(id) = self.by_path(path) else { continue };
             let result = self.with_doc(id, |st| {
@@ -818,29 +1283,48 @@ impl Documents {
                 }
                 let Ok(meta) = std::fs::metadata(&st.path) else { return Ok(()) };
                 let mtime = ide_vfs::mtime_ms(&meta);
-                if mtime == st.disk_mtime && meta.len() == st.disk_len {
+                let unchanged = mtime == st.disk_mtime && meta.len() == st.disk_len;
+                // Blind scans trust the stamp. OS events are authoritative, but they also
+                // echo our own saves: a clean document whose stamp matches is re-checked by
+                // bytes — an external write that preserved both length and mtime differs
+                // from what saving this buffer would write, our own save's echo does not.
+                // Native-to-ascii properties documents and dirty documents keep the stamp
+                // dedup: the former's disk bytes legitimately differ from the buffer text,
+                // the latter warn once per disk state.
+                if unchanged
+                    && (!force_clean || st.dirty)
+                    && (dedup
+                        || st.dirty
+                        || st.native_to_ascii
+                        || ide_vfs::encode(&st.doc.text_for_save(), &st.encoding, st.has_bom)
+                            .map(|bytes| bytes == std::fs::read(&st.path).unwrap_or_default())
+                            .unwrap_or(true))
+                {
                     return Ok(());
                 }
                 if st.dirty {
                     st.disk_mtime = mtime;
                     st.disk_len = meta.len();
-                    let name = st.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.sink.emit(IdeEvent::Notify {
-                        level: NotifyLevel::Warning,
-                        title: format!("{name} changed on disk"),
-                        body: Some(format!(
-                            "{} was modified externally but has unsaved changes in the editor. \
-                             Saving will overwrite the external changes.",
-                            st.path.display()
-                        )),
-                    });
+                    st.disk_conflict = true;
+                    self.sink.emit(IdeEvent::DocDiskConflict { doc: id, path: st.path.to_string_lossy().into_owned() });
                     return Ok(());
                 }
-                let defaults = self.file_defaults();
-                let loaded = Self::load_with_defaults(&st.path, &defaults)?;
-                st.native_to_ascii = defaults.native_to_ascii_for(&st.path);
+                let loaded = if force_clean {
+                    Self::load_as(&st.path, &st.encoding, st.native_to_ascii)?
+                } else {
+                    let defaults = self.file_defaults();
+                    let native_to_ascii = defaults.native_to_ascii_for(&st.path);
+                    let loaded = if st.encoding_chosen {
+                        Self::load_as(&st.path, &st.encoding, native_to_ascii)?
+                    } else {
+                        Self::load_with_defaults(&st.path, &defaults)?
+                    };
+                    st.native_to_ascii = native_to_ascii;
+                    loaded
+                };
                 st.disk_mtime = loaded.mtime_ms;
                 st.disk_len = disk_len(&st.path);
+                st.disk_conflict = false;
                 if loaded.binary || st.binary {
                     return Ok(());
                 }
@@ -857,4 +1341,12 @@ impl Documents {
             }
         }
     }
+}
+
+/// The first line of a file, read no further than a hashbang needs; `None` when it can't be read.
+fn first_line_on_disk(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    std::io::BufReader::new(std::fs::File::open(path).ok()?.take(1024)).read_line(&mut line).ok()?;
+    Some(line)
 }

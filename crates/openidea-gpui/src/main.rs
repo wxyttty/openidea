@@ -22,10 +22,20 @@ fn main() {
     ide_workspace::process::mark_start();
     logging();
 
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join(IDENTIFIER);
-    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join(IDENTIFIER);
-    if let Err(err) = std::fs::create_dir_all(&config_dir).and_then(|_| std::fs::create_dir_all(&data_dir)) {
-        eprintln!("cannot create {config_dir:?} / {data_dir:?}: {err}");
+    let (Ok(config_dir), Ok(data_dir), Ok(local_data_dir)) = (
+        ide_host::data_dirs::config_dir(IDENTIFIER),
+        ide_host::data_dirs::data_dir(IDENTIFIER),
+        ide_host::data_dirs::startup_local_data_dir(IDENTIFIER),
+    ) else {
+        eprintln!("cannot resolve the OpenIDEA directories");
+        std::process::exit(1);
+    };
+    if let Err(err) =
+        std::fs::create_dir_all(&config_dir).and_then(|_| std::fs::create_dir_all(&data_dir)).and_then(|_| {
+            std::fs::create_dir_all(&local_data_dir)
+        })
+    {
+        eprintln!("cannot create {config_dir:?} / {data_dir:?} / {local_data_dir:?}: {err}");
         std::process::exit(1);
     }
     // One instance per user: a second launch hands its arguments (a project or
@@ -40,13 +50,13 @@ fn main() {
         Err(single_instance::Claim::Owned(lock)) => lock,
     };
 
-    // Tools, JDKs and language servers keep the layout the Tauri build used.
-    ide_tools::extend_process_path(&data_dir);
-    ide_dap::adapter::set_tools_root(ide_tools::tools_dir(&data_dir));
-    ide_sdk::java::add_jdk_root(&ide_tools::jdk::jdks_dir(&data_dir));
-    let refresh_shell_path = ide_host::shell_env::inherit_login_shell_path(IDENTIFIER);
+    // Tools, JDKs and language servers live in the local (machine) data directory.
+    ide_tools::extend_process_path(&local_data_dir);
+    ide_dap::adapter::set_tools_root(ide_tools::tools_dir(&local_data_dir));
+    ide_sdk::java::add_jdk_root(&ide_tools::jdk::jdks_dir(&local_data_dir));
+    let refresh_shell_path = ide_host::shell_env::inherit_login_shell_path(&IDENTIFIER);
     ide_ssh::git_creds::init(data_dir.join("git-credentials.json"));
-    let removed = ide_workspace::caches::apply_pending(&data_dir);
+    let removed = ide_workspace::caches::apply_pending(&data_dir, &local_data_dir);
     if !removed.is_empty() {
         tracing::info!("invalidated caches: {removed:?}");
     }
@@ -94,6 +104,7 @@ fn main() {
     let host = Arc::new(Host::new(HostConfig {
         config_dir: config_dir.clone(),
         data_dir: data_dir.clone(),
+        local_data_dir: local_data_dir.clone(),
         languages,
         syntax,
         sink_for,

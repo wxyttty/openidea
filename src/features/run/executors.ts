@@ -5,11 +5,13 @@
  */
 import type { RunConfig } from "@/platform/ipc";
 import { notifications, useRunExecutors, type ExecutorLaunch } from "@/workbench/contributions";
+import { containerExecutorBlocked } from "./remote";
 import { prepareLaunch, startRun } from "./store";
 
 export async function runWithExecutor(config: RunConfig, executorId: string): Promise<void> {
   const executor = useRunExecutors.getState().executors.get(executorId);
   if (!executor) return;
+  if (containerExecutorBlocked(config)) return;
   if (!(await prepareLaunch(config))) return;
   let plan: ExecutorLaunch | null;
   try {
@@ -20,13 +22,15 @@ export async function runWithExecutor(config: RunConfig, executorId: string): Pr
       level: "error",
       title: `Cannot run '${config.name}'`,
       body: e instanceof Error ? e.message : String(e),
+      userInitiated: true,
     });
     return;
   }
   if (!plan) return;
-  const { launch, finished } = plan;
+  const { launch, finished, beforeStop } = plan;
   await startRun(config, undefined, undefined, {
     launch,
     onExit: (exitCode, stopped) => finished({ exitCode, stopped }),
+    beforeStop,
   });
 }

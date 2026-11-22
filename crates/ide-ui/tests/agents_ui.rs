@@ -30,6 +30,9 @@ fn a_task_uses_the_isolation_the_panel_selected() {
             config: Vec::new(),
             isolation,
             base: None,
+            mcp_overrides: Default::default(),
+            skill_overrides: Default::default(),
+            idle: false,
         };
         assert_eq!(request.isolation, isolation, "the panel's choice reaches the request");
     }
@@ -45,8 +48,22 @@ fn a_registry_entry_reports_its_install_state() {
 #[test]
 fn a_config_control_cycles_through_its_values() {
     let values = vec![
-        AgentConfigValue { value: "a".into(), name: "A".into(), description: None },
-        AgentConfigValue { value: "b".into(), name: "B".into(), description: None },
+        AgentConfigValue {
+            value: "a".into(),
+            name: "A".into(),
+            description: None,
+            cost_category: None,
+            usage_multiplier: None,
+            pricing: None,
+        },
+        AgentConfigValue {
+            value: "b".into(),
+            name: "B".into(),
+            description: None,
+            cost_category: None,
+            usage_multiplier: None,
+            pricing: None,
+        },
     ];
     assert_eq!(next_config_value(&values, "a").as_deref(), Some("b"));
     assert_eq!(next_config_value(&values, "b").as_deref(), Some("a"), "the last value wraps");

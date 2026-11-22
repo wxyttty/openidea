@@ -2,13 +2,17 @@ import { useEffect, useState, type ComponentType } from "react";
 
 const loaders: Array<() => Promise<unknown>> = [];
 
+export type LazyComponent<P extends object = Record<string, never>> = ComponentType<P> & {
+  preload(): Promise<ComponentType<P>>;
+};
+
 /**
  * A component whose code loads on first render (rendering nothing until then),
  * so contributions keep heavy views out of the start-up bundle. Deliberately
  * not `React.lazy`: a suspended boundary is revealed ~300 ms late (React's
  * fallback throttling), even when the chunk is already there.
  */
-export function lazyComponent<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+export function lazyComponent<P extends object>(load: () => Promise<ComponentType<P>>): LazyComponent<P> {
   let loaded: ComponentType<P> | null = null;
   let pending: Promise<ComponentType<P>> | null = null;
   const get = () =>
@@ -36,7 +40,26 @@ export function lazyComponent<P extends object>(load: () => Promise<ComponentTyp
     }, [Component]);
     return Component ? <Component {...props} /> : null;
   }
+  LazyComponent.preload = get;
   return LazyComponent;
+}
+
+/**
+ * A lazy component first mounted when `useShown()` holds (a dialog opens), so an
+ * always-registered overlay doesn't load its code at start-up. It stays mounted
+ * afterwards: the component still decides what to render when closed.
+ */
+export function lazyWhen<P extends object>(
+  useShown: () => boolean,
+  load: () => Promise<ComponentType<P>>,
+): ComponentType<P> {
+  const Lazy = lazyComponent(load);
+  let shown = false;
+  return function LazyWhen(props: P) {
+    const now = useShown();
+    shown ||= now;
+    return shown ? <Lazy {...props} /> : null;
+  };
 }
 
 /**

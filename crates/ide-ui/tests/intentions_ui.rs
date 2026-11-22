@@ -12,6 +12,8 @@ use gpui_kit::px;
 fn action(title: &str, kind: Option<&str>, preferred: bool) -> CodeAction {
     CodeAction {
         title: title.into(),
+        diagnostics: Vec::new(),
+        original_diagnostics: None,
         kind: kind.map(Into::into),
         is_preferred: preferred,
         disabled_reason: None,

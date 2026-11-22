@@ -10,15 +10,92 @@ use ide_core::{IdeEvent, TaskId};
 use ide_jsonrpc::{Handler, codes};
 use lsp_types as lsp;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 /// Progress token standing for `angular/projectLoadingStart` … `Finish`.
 const ANGULAR_LOADING: &str = "angular/projectLoading";
+
+/// How often a running progress token's silence is checked.
+const PROGRESS_SWEEP: Duration = Duration::from_secs(15);
+/// A token that reports nothing this long is marked stuck: jdtls's `Importing Maven
+/// project(s)` waits minutes on one repository that never answers (`DefaultMetadataResolver`
+/// awaits its whole batch), and a task frozen at one percent is not progress. It stays
+/// visible, but stops holding the server busy while the work behind it keeps running.
+const PROGRESS_STALE: Duration = Duration::from_secs(180);
+
+/// How long a cancelled progress task waits for its server to end it.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// The key of progress token `token` in [`Server::progress`].
+fn progress_key(token: &Value) -> String {
+    match token {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Task message after [`PROGRESS_STALE`] of silence: keep the server's last message and
+/// say how long nothing happened.
+fn stalled_message(message: Option<&str>) -> String {
+    let secs = PROGRESS_STALE.as_secs();
+    match message.filter(|m| !m.is_empty()) {
+        Some(message) => format!("{message} — no progress for {secs} s"),
+        None => format!("No progress for {secs} s"),
+    }
+}
 
 pub struct ClientHandler {
     mgr: Weak<LspManager>,
     server: Arc<Server>,
     generation: u64,
+}
+
+/// The diagnostics in `items` (a JSON array) that deserialize. A server's malformed one is
+/// skipped with a warning, so the rest of the file's problems still show.
+pub(crate) fn lenient_diagnostics(server: &str, items: Value) -> Vec<lsp::Diagnostic> {
+    let Value::Array(items) = items else { return Vec::new() };
+    let mut skipped = 0usize;
+    let parsed: Vec<lsp::Diagnostic> = items
+        .into_iter()
+        .filter_map(|mut item| {
+            crate::virtual_doc::normalize_uris(&mut item);
+            match serde_json::from_value(item) {
+                Ok(diagnostic) => Some(diagnostic),
+                Err(_) => {
+                    skipped += 1;
+                    None
+                }
+            }
+        })
+        .collect();
+    if skipped > 0 {
+        tracing::warn!("{server}: skipped {skipped} malformed diagnostic(s)");
+    }
+    parsed
+}
+
+/// rust-analyzer publishes its own analysis next to `cargo check`'s (flycheck): one type
+/// mismatch then arrives as `rust-analyzer(E0308)` and `rustc(E0308)`. Its own entry is
+/// dropped when the compiler reports the same code and severity over an overlapping range.
+fn drop_compiler_duplicates(diagnostics: &mut Vec<lsp::Diagnostic>) {
+    let overlaps = |a: &lsp::Range, b: &lsp::Range| a.start <= b.end && b.start <= a.end;
+    let compiler: Vec<(lsp::Range, Option<lsp::NumberOrString>, Option<lsp::DiagnosticSeverity>)> = diagnostics
+        .iter()
+        .filter(|d| d.source.as_deref() == Some("rustc") && d.code.is_some())
+        .map(|d| (d.range, d.code.clone(), d.severity))
+        .collect();
+    if compiler.is_empty() {
+        return;
+    }
+    diagnostics.retain(|d| {
+        d.source.as_deref() != Some("rust-analyzer")
+            || d.code.is_none()
+            || !compiler
+                .iter()
+                .any(|(range, code, severity)| code == &d.code && severity == &d.severity && overlaps(range, &d.range))
+    });
 }
 
 impl ClientHandler {
@@ -27,50 +104,108 @@ impl ClientHandler {
     }
 
     fn encoding(&self) -> Encoding {
-        self.server.running_gen(self.generation).map(|r| r.caps.read().encoding).unwrap_or_default()
+        self.server.initialized_gen(self.generation).map(|r| r.caps.read().encoding).unwrap_or_default()
     }
 
     /// Cancelling task `task` asks this server instance to stop the work of progress `token`.
+    /// A server that never ends it (Pyright waiting on a workspace that never loads) would
+    /// leave the task "Cancelling…" for good: after [`CANCEL_GRACE`] the task ends here.
     fn cancel_handle(&self, task: TaskId, token: &Value) -> ide_core::task::CancelHandle {
-        let (server, generation, token) = (self.server.clone(), self.generation, token.clone());
+        let (mgr, server, generation, token) = (self.mgr.clone(), self.server.clone(), self.generation, token.clone());
         ide_core::task::on_cancel(task, move || {
-            if let Some(run) = server.running_gen(generation)
+            if let Some(run) = server.initialized_gen(generation)
                 && let Err(e) = run.peer.notify("window/workDoneProgress/cancel", json!({ "token": token }))
             {
                 tracing::debug!("{}: cannot cancel progress: {e}", server.name);
             }
+            let Some(runtime) = mgr.upgrade().map(|m| m.runtime.clone()) else { return };
+            runtime.spawn(async move {
+                tokio::time::sleep(CANCEL_GRACE).await;
+                let Some(mgr) = mgr.upgrade() else { return };
+                let key = progress_key(&token);
+                let ended = {
+                    let mut progress = server.progress.lock();
+                    if progress.get(&key).is_none_or(|p| p.task != task) {
+                        return; // the server ended it, or the token began new work
+                    }
+                    progress.remove(&key)
+                };
+                if let Some(p) = ended {
+                    tracing::info!("{}: progress '{key}' did not end after cancel; ending its task", server.name);
+                    server.emit(
+                        mgr.sink(),
+                        IdeEvent::Task {
+                            id: p.task,
+                            title: p.title,
+                            message: p.message,
+                            fraction: None,
+                            done: true,
+                            cancellable: false,
+                        },
+                    );
+                    server.refresh_busy_status(mgr.sink());
+                    server.progress_ended();
+                }
+            });
         })
     }
 
     fn progress(&self, mgr: &LspManager, params: Value) {
-        let token = match &params["token"] {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
+        let token = progress_key(&params["token"]);
         let value = &params["value"];
+        let kind = value.get("kind").and_then(Value::as_str);
         let message = value.get("message").and_then(Value::as_str).map(str::to_owned);
         let fraction = value.get("percentage").and_then(Value::as_f64).map(|p| (p / 100.0).clamp(0.0, 1.0) as f32);
         let cancellable = value.get("cancellable").and_then(Value::as_bool);
+        let mut replaced = None;
         let event = {
             let mut progress = self.server.progress.lock();
-            match value.get("kind").and_then(Value::as_str) {
+            match kind {
                 Some("begin") => {
                     let title = value
                         .get("title")
                         .and_then(Value::as_str)
                         .filter(|t| !t.is_empty())
-                        .map(str::to_owned)
+                        .map(ide_core::task::display_title)
                         .unwrap_or_else(|| self.server.name.clone());
                     let task = TaskId::next();
                     let cancel = (cancellable == Some(true)).then(|| self.cancel_handle(task, &params["token"]));
                     let cancellable = cancel.is_some();
-                    progress.insert(token, Progress { task, title: title.clone(), message: message.clone(), cancel });
+                    // A token carries one `begin`, yet servers reuse one for concurrent work
+                    // (PHPantom: begin, begin, end, end). The task it replaces ends now, or no
+                    // `end` would ever reach it.
+                    replaced = progress
+                        .insert(
+                            token.clone(),
+                            Progress {
+                                task,
+                                title: title.clone(),
+                                message: message.clone(),
+                                cancel,
+                                last: tokio::time::Instant::now(),
+                                stalled: false,
+                                fraction,
+                            },
+                        )
+                        .map(|p| IdeEvent::Task {
+                            id: p.task,
+                            title: p.title,
+                            message: p.message,
+                            fraction: None,
+                            done: true,
+                            cancellable: false,
+                        });
                     IdeEvent::Task { id: task, title, message, fraction, done: false, cancellable }
                 }
                 Some("report") => {
                     let Some(p) = progress.get_mut(&token) else { return };
+                    p.last = tokio::time::Instant::now();
+                    p.stalled = false;
                     if message.is_some() {
                         p.message = message;
+                    }
+                    if fraction.is_some() {
+                        p.fraction = fraction;
                     }
                     match cancellable {
                         Some(true) if p.cancel.is_none() => {
@@ -102,23 +237,145 @@ impl ClientHandler {
                 _ => return,
             }
         };
-        let ended = matches!(&event, IdeEvent::Task { done: true, .. });
-        mgr.sink().emit(event);
+        let ended = replaced.is_some() || matches!(&event, IdeEvent::Task { done: true, .. });
+        if let Some(replaced) = replaced {
+            self.server.emit(mgr.sink(), replaced);
+        }
+        self.server.emit(mgr.sink(), event);
         self.server.refresh_busy_status(mgr.sink());
         if ended {
             self.server.progress_ended();
+        } else if kind == Some("begin") {
+            self.watch_progress(mgr, token);
         }
     }
 
+    /// A task that reports nothing for [`PROGRESS_STALE`] is stuck: the work behind it is
+    /// blocked on something that never answers, and a bar frozen at one percent is not
+    /// progress. Keep its task visible but mark it, and stop counting it as busy: a slow
+    /// import can resume and finish in the same task, while the IDE stays usable.
+    fn watch_progress(&self, mgr: &LspManager, token: String) {
+        let (weak, server, generation) = (self.mgr.clone(), self.server.clone(), self.generation);
+        // The notification runs on a reader thread, not inside a runtime.
+        mgr.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(PROGRESS_SWEEP).await;
+                let Some(mgr) = weak.upgrade() else { return };
+                if !server.is_live(generation) || !server.has_progress(&token) {
+                    return; // the instance is gone, or the task ended normally
+                }
+                if server.progress_silent(&token, PROGRESS_STALE) {
+                    let handler = ClientHandler::new(Arc::downgrade(&mgr), server.clone(), generation);
+                    if handler.mark_progress_stalled(&mgr, &token) {
+                        tracing::warn!(
+                            "{}: progress '{token}' reported nothing for {} s; marking it stuck",
+                            server.name,
+                            PROGRESS_STALE.as_secs()
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Marks a silent task as possibly stuck without ending it. Returns whether it was
+    /// newly marked; a later `report` clears the mark and makes the server busy again.
+    fn mark_progress_stalled(&self, mgr: &LspManager, token: &str) -> bool {
+        let event = {
+            let mut progress = self.server.progress.lock();
+            let Some(p) = progress.get_mut(token) else { return false };
+            if p.stalled || !p.silent(PROGRESS_STALE) {
+                return false;
+            }
+            p.stalled = true;
+            IdeEvent::Task {
+                id: p.task,
+                title: p.title.clone(),
+                message: Some(stalled_message(p.message.as_deref())),
+                fraction: p.fraction,
+                done: false,
+                cancellable: p.cancel.is_some(),
+            }
+        };
+        self.server.emit(mgr.sink(), event);
+        self.server.refresh_busy_status(mgr.sink());
+        self.server.progress_ended();
+        true
+    }
+
+    /// Ends every running task of a tsserver that died at its heap limit: the process
+    /// behind them is gone, so no `end` will ever arrive. Without this the tasks sit
+    /// as zombies until [`PROGRESS_STALE`] and the server stays "loading", holding
+    /// empty answers back for [`LOADING_WAIT`] — while vtsls already restarts
+    /// tsserver, which re-reports its own loading.
+    fn tsserver_died(&self, mgr: &LspManager) {
+        let events: Vec<IdeEvent> = {
+            let mut progress = self.server.progress.lock();
+            progress
+                .drain()
+                .map(|(_, p)| IdeEvent::Task {
+                    id: p.task,
+                    title: p.title,
+                    message: p.message,
+                    fraction: Some(1.0),
+                    done: true,
+                    cancellable: false,
+                })
+                .collect()
+        };
+        let ended = !events.is_empty();
+        for event in events {
+            self.server.emit(mgr.sink(), event);
+        }
+        if ended {
+            self.server.refresh_busy_status(mgr.sink());
+            self.server.progress_ended();
+        }
+        self.server.set_loading(mgr.sink(), false);
+    }
+
     fn publish_diagnostics(&self, mgr: &LspManager, params: Value) {
-        let params: lsp::PublishDiagnosticsParams = match serde_json::from_value(params) {
+        // Problems come only from servers used for `diagnostics`.
+        if self.server.initialized_gen(self.generation).is_some_and(|run| !run.caps.read().restriction.diagnostics()) {
+            return;
+        }
+        let mut params = params;
+        crate::virtual_doc::normalize_uris(&mut params);
+        // One malformed diagnostic must not take the others of the file with it.
+        let raw = params.get_mut("diagnostics").map(Value::take);
+        if let Some(fields) = params.as_object_mut() {
+            fields.insert("diagnostics".into(), json!([]));
+        }
+        let mut params: lsp::PublishDiagnosticsParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!("{}: bad publishDiagnostics: {e}", self.server.name);
                 return;
             }
         };
-        let Some(path) = uri_to_path(params.uri.as_str()) else { return };
+        params.diagnostics = lenient_diagnostics(&self.server.name, raw.unwrap_or(Value::Null));
+        drop_compiler_duplicates(&mut params.diagnostics);
+        let Some(path) = uri_to_path(params.uri.as_str())
+            .or_else(|| crate::notebook::is_cell_uri(params.uri.as_str()).then(|| PathBuf::from(params.uri.as_str())))
+        else {
+            return;
+        };
+        if self.server.name == crate::compose::SERVER {
+            // Maven resource-filtering placeholders (`@profileActive@`) parse as invalid
+            // YAML but are replaced before the file is ever read: their parser error is noise.
+            let text = mgr.docs.lock().values().find(|d| d.path == path).map(|d| d.text.as_str().to_owned());
+            if let Some(text) = text {
+                params.diagnostics.retain(|d| !crate::maven_placeholder::false_positive(&text, d));
+            }
+        }
+        if self.server.name == "jdtls"
+            && let Some(failure) = crate::jdtls::build_plan_failure(&path, &self.server.root, &params.diagnostics)
+        {
+            self.build_plan_failure(mgr, failure);
+        }
+        if !mgr.accepts_injected_diagnostics(&path, params.version) {
+            return;
+        }
         // Files opened only for a request (references search) are not the user's problems.
         if (self.server.external_diagnostics.load(std::sync::atomic::Ordering::Acquire)
             && !mgr.docs.lock().values().any(|d| d.path == path))
@@ -126,19 +383,54 @@ impl ClientHandler {
         {
             return;
         }
-        let conv = mgr.conv(self.encoding());
-        let items = params
-            .diagnostics
-            .iter()
-            .cloned()
-            .map(|d| convert::diagnostic(&conv, &path, d, &self.server.name))
-            .collect();
-        self.server.set_diagnostics(path.clone(), params.diagnostics);
-        mgr.sink().emit(IdeEvent::Diagnostics { path: path.into(), source: self.server.name.clone(), items });
+        // A late answer for an older version of the text is shown, but isn't fresh (`check_files`).
+        let obsolete =
+            params.version.is_some_and(|v| mgr.docs.lock().values().any(|d| d.path == path && d.version > v));
+        let shown = if obsolete {
+            self.server.set_obsolete_diagnostics(path.clone(), params.diagnostics)
+        } else {
+            self.server.set_diagnostics(path.clone(), params.diagnostics)
+        };
+        mgr.emit_diagnostics(&self.server, path, shown, self.encoding());
+    }
+
+    fn publish_flutter_outline(&self, mgr: &LspManager, params: Value) {
+        let params: crate::flutter_outline::Params = match serde_json::from_value(params) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("{}: bad publishFlutterOutline: {e}", self.server.name);
+                return;
+            }
+        };
+        let Some(path) = uri_to_path(&params.uri) else { return };
+        if !self.server.is_live(self.generation) {
+            return;
+        }
+        let items = crate::flutter_outline::items(&mgr.conv(self.encoding()), &path, params.outline);
+        if mgr.set_flutter_outline(&path, &self.server, self.generation, items) {
+            mgr.sink().emit(IdeEvent::LspRefresh { server: self.server.id, kind: LspRefreshKind::FlutterOutline });
+        }
+    }
+
+    /// Once per unresolved plugin, whether m2e marked a `pom.xml` or only logged it.
+    fn build_plan_failure(&self, mgr: &LspManager, (plugin, body): (String, String)) {
+        if mgr.first_message(&self.server.name, &format!("build plan: {plugin}")) {
+            mgr.sink().emit(ide_core::IdeEvent::Notify {
+                level: ide_core::event::NotifyLevel::Error,
+                title: "Maven project could not be configured".into(),
+                body: Some(body),
+            });
+        }
     }
 
     fn show_message(&self, mgr: &LspManager, params: &Value) {
         let text = params.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // rust-analyzer built from source reports its own slow main-loop turns as errors, meant for
+        // its developers (`poke_rust_analyzer_developer`); nothing for the user to act on.
+        if text.starts_with("overly long loop turn") {
+            tracing::warn!("[{}] {text}", self.server.name);
+            return;
+        }
         let level = match params.get("type").and_then(Value::as_u64) {
             Some(1) => NotifyLevel::Error,
             Some(2) => NotifyLevel::Warning,
@@ -152,6 +444,63 @@ impl ClientHandler {
             return;
         }
         mgr.sink().emit(IdeEvent::Notify { level, title: self.server.name.clone(), body: Some(text) });
+    }
+
+    /// `window/showMessageRequest` expects `MessageActionItem | null`. Showing
+    /// the question as a plain notification and replying null made Dart cancel
+    /// renames with a warning (`Renamed field will be invisible in …`).
+    fn message_request(&self, mgr: &LspManager, params: &Value) -> Result<Value, (i64, String)> {
+        let message = params.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let actions: Vec<String> = params
+            .get("actions")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(|item| item.get("title").and_then(Value::as_str).map(str::to_owned)).collect()
+            })
+            .unwrap_or_default();
+        let sink = mgr.sink();
+        let Some((id, answer)) = crate::message_requests::begin() else {
+            tracing::warn!("[{}] too many pending message requests; dismissing", self.server.name);
+            sink.emit(IdeEvent::Notify {
+                level: NotifyLevel::Warning,
+                title: self.server.name.clone(),
+                body: Some("Too many open questions; try again".into()),
+            });
+            return Ok(Value::Null);
+        };
+        struct Guard {
+            id: u32,
+            sink: ide_core::SharedSink,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                crate::message_requests::close(self.id);
+                self.sink.emit(IdeEvent::LspMessageRequestDone { id: self.id });
+            }
+        }
+        let _guard = Guard { id, sink: sink.clone() };
+        sink.emit(IdeEvent::LspMessageRequest {
+            id,
+            server: self.server.name.clone(),
+            message: message.clone(),
+            actions: actions.clone(),
+        });
+        // Below the IDE's 30 s timeout for the enclosing request (e.g. rename),
+        // so the dialog cannot outlive the operation it is answering.
+        let received = answer.recv_timeout(Duration::from_secs(20));
+        let timed_out = matches!(received, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        let chosen = received.ok().flatten();
+        if timed_out {
+            sink.emit(IdeEvent::Notify {
+                level: NotifyLevel::Warning,
+                title: self.server.name.clone(),
+                body: Some(format!("No answer in time for: {message}")),
+            });
+        }
+        match chosen.filter(|title| actions.contains(title)) {
+            Some(title) => Ok(json!({ "title": title })),
+            None => Ok(Value::Null),
+        }
     }
 
     fn configuration(&self, params: &Value) -> Value {
@@ -174,6 +523,14 @@ impl ClientHandler {
                         .find_map(|base| section.split('.').try_fold(base, |v, key| v.get(key)))
                         .cloned()
                         .unwrap_or(Value::Null),
+                    None if self.server.name == "eslint" => {
+                        let mut settings = options.clone();
+                        settings["workspaceFolder"] = json!({
+                            "uri": crate::uri::path_to_uri(&self.server.root),
+                            "name": self.server.root.file_name().map_or_else(|| "root".into(), |name| name.to_string_lossy().into_owned()),
+                        });
+                        settings
+                    }
                     None => options.clone(),
                 })
                 .collect(),
@@ -181,17 +538,22 @@ impl ClientHandler {
     }
 
     fn apply_edit(&self, mgr: &LspManager, params: Value) -> Result<Value, (i64, String)> {
-        let edit: lsp::WorkspaceEdit = params
-            .get("edit")
-            .cloned()
-            .ok_or_else(|| (codes::INVALID_PARAMS, "missing edit".to_owned()))
-            .and_then(|e| serde_json::from_value(e).map_err(|e| (codes::INVALID_PARAMS, e.to_string())))?;
+        let edit: lsp::WorkspaceEdit =
+            params.get("edit").cloned().ok_or_else(|| (codes::INVALID_PARAMS, "missing edit".to_owned())).and_then(
+                |mut e| {
+                    crate::virtual_doc::normalize_uris(&mut e);
+                    serde_json::from_value(e).map_err(|e| (codes::INVALID_PARAMS, e.to_string()))
+                },
+            )?;
         // Convert before calling the hook: it re-enters document sync.
         let edit = convert::workspace_edit(&mgr.conv(self.encoding()), edit);
         let applied = match mgr.apply_edit_hook() {
-            Some(hook) => hook(edit),
+            Some(hook) => hook(edit.clone()),
             None => false,
         };
+        if applied {
+            let _ = mgr.applied_edits.send((self.server.id, edit));
+        }
         let mut reply = json!({ "applied": applied });
         if !applied {
             reply["failureReason"] = json!("edit could not be applied");
@@ -199,40 +561,116 @@ impl ClientHandler {
         Ok(reply)
     }
 
-    fn registration(&self, params: &Value, register: bool) {
-        let Some(run) = self.server.running_gen(self.generation) else { return };
+    fn registration(&self, mgr: &LspManager, params: &Value, register: bool) {
+        let Some(run) = self.server.initialized_gen(self.generation) else { return };
         let key = if register { "registrations" } else { "unregisterations" };
         let list = params.get(key).or_else(|| params.get("unregistrations")).and_then(Value::as_array);
         let mut caps = run.caps.write();
+        let mut watchers_changed = false;
         for reg in list.into_iter().flatten() {
             let Some(method) = reg.get("method").and_then(Value::as_str) else { continue };
-            if register {
+            if method == "workspace/didChangeWatchedFiles" {
+                let id = reg.get("id").and_then(Value::as_str).unwrap_or_default();
+                let mut watchers = run.watchers.write();
+                if register {
+                    watchers.register(id, reg.get("registerOptions"));
+                } else {
+                    watchers.unregister(id);
+                }
+                watchers_changed = true;
+            } else if register {
                 caps.register(method, reg.get("registerOptions"));
             } else {
                 caps.unregister(method);
             }
         }
+        drop(caps);
+        if watchers_changed {
+            mgr.file_watch_roots_changed();
+        }
     }
 }
 
+/// Shown once per session when tsserver keeps aborting at its heap limit; the UI adds a
+/// button that opens the language server settings.
+const TSSERVER_OUT_OF_MEMORY: &str = "tsserver stopped because it reached its memory limit and is restarted, so code intelligence may pause or miss results. Raise typescript.tsserver.maxTsServerMemory (in MB) in the server's Workspace Configuration.";
+
+/// Whether a vtsls log line reports tsserver aborting, which is how Node exits at its heap
+/// limit: exit code 134 on Windows, `SIGABRT` elsewhere.
+fn tsserver_ran_out_of_memory(text: &str) -> bool {
+    text.split_once("TSServer exited. ").is_some_and(|(_, rest)| {
+        let rest = rest.trim_end();
+        rest.starts_with("Code: 134.") || rest.ends_with("Signal: SIGABRT")
+    })
+}
+
 impl Handler for ClientHandler {
+    fn normalize_incoming(&self, message: &mut Value) {
+        crate::uri::encode_loose_file_uris(message);
+    }
+
     fn on_notification(&self, method: &str, params: Value) {
         let Some(mgr) = self.mgr.upgrade() else { return };
         match method {
             "$/progress" => self.progress(&mgr, params),
+            "experimental/serverStatus" => {
+                if let Some(quiescent) = params.get("quiescent").and_then(Value::as_bool) {
+                    self.server.set_loading(mgr.sink(), !quiescent);
+                }
+            }
             "textDocument/publishDiagnostics" => self.publish_diagnostics(&mgr, params),
+            "dart/textDocument/publishFlutterOutline" => self.publish_flutter_outline(&mgr, params),
             "window/showMessage" => self.show_message(&mgr, &params),
             "window/logMessage" => {
                 let text = params.get("message").and_then(Value::as_str).unwrap_or_default();
+                if self.server.config.tsserver_project && tsserver_ran_out_of_memory(text) {
+                    tracing::warn!(server = ?self.server.id, generation = self.generation, "[{}] {text}", self.server.name);
+                    // The tasks of the dead tsserver never see their `end`: end them now
+                    // instead of letting them sit as zombies until the stale window, and
+                    // stop holding queries back — the restarted instance re-reports.
+                    self.tsserver_died(&mgr);
+                    if mgr.first_message(&self.server.name, TSSERVER_OUT_OF_MEMORY) {
+                        mgr.sink().emit(IdeEvent::Notify {
+                            level: NotifyLevel::Error,
+                            title: "TypeScript server ran out of memory".into(),
+                            body: Some(TSSERVER_OUT_OF_MEMORY.into()),
+                        });
+                    }
+                }
+                if self.server.name == "jdtls"
+                    && text.contains("Can't use Java ")
+                    && text.contains(" to import Gradle project ")
+                {
+                    self.show_message(&mgr, &json!({ "type": 1, "message": text.lines().next().unwrap_or(text) }));
+                }
+                if self.server.name == "jdtls"
+                    && params.get("type").and_then(Value::as_u64) == Some(1)
+                    && let Some(failure) = crate::jdtls::logged_build_plan_failure(text)
+                {
+                    self.build_plan_failure(&mgr, failure);
+                }
                 match params.get("type").and_then(Value::as_u64) {
-                    Some(1) => tracing::warn!("[{}] {text}", self.server.name),
-                    Some(2 | 3) => tracing::info!("[{}] {text}", self.server.name),
-                    _ => tracing::debug!("[{}] {text}", self.server.name),
+                    Some(1) if self.server.name == "jdtls" && text.contains(crate::jdtls::reserved_names::IMPORT_FAILURE) => {
+                        tracing::warn!(server = ?self.server.id, generation = self.generation, "[{}] {text}", self.server.name);
+                        mgr.report_import_failure(self.server.root.clone(), text.to_owned());
+                    }
+                    Some(1) => tracing::warn!(server = ?self.server.id, generation = self.generation, "[{}] {text}", self.server.name),
+                    Some(2 | 3) => tracing::info!(server = ?self.server.id, generation = self.generation, "[{}] {text}", self.server.name),
+                    _ => tracing::debug!(server = ?self.server.id, generation = self.generation, "[{}] {text}", self.server.name),
                 }
             }
             "tsserver/request" => mgr.forward_tsserver_requests(self.server.clone(), self.generation, params),
+            "intellij/workspaceImportState" if self.server.name == crate::kotlin_lsp::KOTLIN_LSP => {
+                crate::kotlin_lsp::record_import_state(&self.server, self.generation, &params)
+            }
             "language/status" if self.server.name == "jdtls" && params["type"] == "ServiceReady" => {
+                if self.server.initialized_gen(self.generation).is_some() {
+                    self.server.set_java_ready();
+                }
                 mgr.java_import_ready(self.server.clone(), self.generation);
+            }
+            "language/status" if self.server.name == "jdtls" && params["type"] == "ProjectStatus" => {
+                mgr.java_projects_updated(self.server.clone(), self.generation);
             }
             // The Angular server's project loading, shown like `$/progress`; one
             // task while several projects load.
@@ -246,6 +684,7 @@ impl Handler for ClientHandler {
                 self.progress(&mgr, json!({ "token": ANGULAR_LOADING, "value": { "kind": "end" } }))
             }
             "telemetry/event" | "$/logTrace" | "$/cancelRequest" => {}
+            "eslint/status" | "eslint/probeFailed" | "eslint/exitCalled" => {}
             other => tracing::trace!("[{}] unhandled notification {other}", self.server.name),
         }
     }
@@ -256,19 +695,16 @@ impl Handler for ClientHandler {
         };
         match method {
             "window/workDoneProgress/create" => Ok(Value::Null),
-            "window/showMessageRequest" => {
-                self.show_message(&mgr, &params);
-                Ok(Value::Null)
-            }
+            "window/showMessageRequest" => self.message_request(&mgr, &params),
             "window/showDocument" => Ok(json!({ "success": false })),
             "workspace/configuration" => Ok(self.configuration(&params)),
             "workspace/workspaceFolders" => Ok(mgr.workspace_folders(&self.server)),
             "client/registerCapability" => {
-                self.registration(&params, true);
+                self.registration(&mgr, &params, true);
                 Ok(Value::Null)
             }
             "client/unregisterCapability" => {
-                self.registration(&params, false);
+                self.registration(&mgr, &params, false);
                 Ok(Value::Null)
             }
             "workspace/applyEdit" => self.apply_edit(&mgr, params),
@@ -281,8 +717,25 @@ impl Handler for ClientHandler {
                 mgr.sink().emit(IdeEvent::LspRefresh { server: self.server.id, kind });
                 Ok(Value::Null)
             }
-            "workspace/diagnostic/refresh" | "workspace/inlineValue/refresh" => Ok(Value::Null),
+            "workspace/diagnostic/refresh" => {
+                mgr.refresh_pulled_diagnostics(&self.server);
+                Ok(Value::Null)
+            }
+            "workspace/inlineValue/refresh" => Ok(Value::Null),
+            // vscode-eslint asks its client before using the project's eslint (approved: 4) and
+            // reports a missing library or configuration; diagnostics already say what's wrong.
+            "eslint/confirmESLintExecution" => Ok(json!(4)),
+            "eslint/noLibrary" | "eslint/noConfig" | "eslint/openDoc" => Ok(json!({})),
             other => Err((codes::METHOD_NOT_FOUND, format!("unsupported method {other}"))),
+        }
+    }
+
+    fn after_response(&self, method: &str) {
+        if method == "workspace/configuration"
+            && self.server.config.resync_on_configuration
+            && let Some(mgr) = self.mgr.upgrade()
+        {
+            mgr.resync_documents(&self.server, self.generation);
         }
     }
 }
@@ -291,6 +744,21 @@ impl Handler for ClientHandler {
 /// `initializationOptions` with its `settings` merged over them.
 pub(crate) fn all_settings(cfg: &ide_language::LanguageServerConfig) -> Value {
     let mut out = cfg.initialization_options.as_ref().and_then(|v| serde_json::to_value(v).ok()).unwrap_or(Value::Null);
+    if cfg.name == "jdtls" {
+        out = out.get("settings").cloned().unwrap_or_else(|| json!({}));
+        if let Some(settings) = &cfg.settings {
+            // Accept the initialization-options wrapper as well as LSP settings.
+            if let Some(nested) = settings.get("settings") {
+                merge(&mut out, nested.clone());
+            }
+            let mut direct = settings.clone();
+            if let Some(direct) = direct.as_object_mut() {
+                direct.remove("settings");
+            }
+            merge(&mut out, direct);
+        }
+        return out;
+    }
     if let Some(settings) = &cfg.settings {
         merge(&mut out, settings.clone());
     }
@@ -310,5 +778,129 @@ fn merge(base: &mut Value, layer: Value) {
             }
         }
         (base, layer) => *base = layer,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::Progress;
+    use ide_core::event::SharedSink;
+    use ide_core::{LanguageId, TaskId};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rust_analyzer_s_own_entry_yields_to_the_compiler_s_for_the_same_error() {
+        let diagnostic = |source: &str, code: &str, line: u32, severity| lsp::Diagnostic {
+            range: lsp::Range::new(lsp::Position::new(line, 21), lsp::Position::new(line, 27)),
+            severity: Some(severity),
+            code: Some(lsp::NumberOrString::String(code.into())),
+            source: Some(source.into()),
+            message: format!("{source} {code}"),
+            ..Default::default()
+        };
+        let error = lsp::DiagnosticSeverity::ERROR;
+        let mut items = vec![
+            diagnostic("rust-analyzer", "E0308", 1, error),
+            diagnostic("rustc", "E0308", 1, error),
+            diagnostic("rust-analyzer", "E0308", 5, error),
+            diagnostic("rust-analyzer", "unused_variables", 1, lsp::DiagnosticSeverity::WARNING),
+        ];
+        drop_compiler_duplicates(&mut items);
+        let left: Vec<_> = items.iter().map(|d| (d.message.as_str(), d.range.start.line)).collect();
+        assert_eq!(left, [("rustc E0308", 1), ("rust-analyzer E0308", 5), ("rust-analyzer unused_variables", 1)]);
+    }
+
+    #[test]
+    fn tsserver_aborts_are_out_of_memory() {
+        assert!(tsserver_ran_out_of_memory("TSServer exited. Code: 134. Signal: null"));
+        assert!(tsserver_ran_out_of_memory("TSServer exited. Code: null. Signal: SIGABRT"));
+        assert!(!tsserver_ran_out_of_memory("TSServer exited. Code: 0. Signal: null"));
+        assert!(!tsserver_ran_out_of_memory("TSServer exited. Code: null. Signal: SIGTERM"));
+        assert!(!tsserver_ran_out_of_memory("TSServer exited. Code: 1340. Signal: null"));
+        assert!(!tsserver_ran_out_of_memory("Code: 134."));
+        assert!(tsserver_ran_out_of_memory("[error] TSServer exited. Code: 134. Signal: null\n"));
+    }
+
+    /// A vtsls server with two running tasks, one marked stalled, and `loading` set:
+    /// the state a tsserver OOM leaves behind.
+    fn loaded_vtsls(events: Arc<Mutex<Vec<IdeEvent>>>) -> (Arc<LspManager>, Arc<crate::server::Server>) {
+        let sink: SharedSink = {
+            let events = events.clone();
+            Arc::new(move |event: IdeEvent| events.lock().unwrap().push(event))
+        };
+        let languages = Arc::new(ide_language::LanguageRegistry::from_configs(vec![]));
+        let mgr = LspManager::new(PathBuf::from("/p"), languages, sink);
+        let cfg: ide_language::LanguageServerConfig =
+            toml::from_str("name = \"vtsls\"\ncommand = \"vtsls\"\ntsserver-project = true").unwrap();
+        let server = Arc::new(crate::server::Server::new(cfg, PathBuf::from("/p"), LanguageId::new("vue")));
+        server.progress.lock().insert(
+            "loading".into(),
+            Progress {
+                task: TaskId::next(),
+                title: "Initializing 'tsconfig.json'".into(),
+                message: None,
+                cancel: None,
+                last: tokio::time::Instant::now(),
+                fraction: Some(0.1),
+                stalled: false,
+            },
+        );
+        server.progress.lock().insert(
+            "stuck".into(),
+            Progress {
+                task: TaskId::next(),
+                title: "Analyzing 'index.vue' and its dependencies".into(),
+                message: None,
+                cancel: None,
+                last: tokio::time::Instant::now(),
+                fraction: Some(0.2),
+                stalled: true,
+            },
+        );
+        let quiet: SharedSink = Arc::new(|_: IdeEvent| {});
+        server.set_loading(&quiet, true);
+        (mgr, server)
+    }
+
+    #[test]
+    fn tsserver_dying_ends_every_task_and_the_loading_state() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mgr, server) = loaded_vtsls(events.clone());
+        let handler = ClientHandler::new(Arc::downgrade(&mgr), server.clone(), 0);
+
+        handler.tsserver_died(&mgr);
+
+        // Both tasks ended (done: true), including the stalled one; none left running.
+        let tasks: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                IdeEvent::Task { title, done, .. } => Some((title.clone(), *done)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        assert!(tasks.iter().all(|(_, done)| *done), "{tasks:?}");
+        assert!(server.progress.lock().is_empty());
+        assert!(!server.is_loading());
+        assert!(!server.is_busy());
+    }
+
+    #[test]
+    fn tsserver_dying_without_tasks_only_clears_loading() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mgr, server) = loaded_vtsls(events.clone());
+        server.progress.lock().clear();
+        let handler = ClientHandler::new(Arc::downgrade(&mgr), server.clone(), 0);
+
+        handler.tsserver_died(&mgr);
+
+        assert!(events.lock().unwrap().is_empty());
+        assert!(!server.is_loading());
+        // A status event may be published, but no task events.
+        assert!(server.progress.lock().is_empty());
     }
 }

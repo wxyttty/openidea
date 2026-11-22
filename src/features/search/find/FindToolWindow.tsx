@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { menuGroupItems } from "@/workbench/contributions";
+import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
 import { executeAction } from "@/platform/actions";
 import type { FileMatches } from "@/platform/ipc";
-import { shortcutLabel } from "@/platform/keymap";
+import { formatBinding, hostBinding, shortcutLabel } from "@/platform/keymap";
 import {
   Button,
   EmptyState,
@@ -28,12 +29,14 @@ import { countFileMatches } from "./session";
 import { CodePreview, MatchText, type PreviewHighlight } from "./parts";
 import {
   NO_MARKS,
+  confirmAllText,
   confirmText,
   countUsages,
   groupState,
   loadReplacePreview,
   pendingUsages,
   replaceTargets,
+  skipTargets,
   startReplace,
   summaryText,
   toggleExcluded,
@@ -53,7 +56,7 @@ import {
   type FindTab,
 } from "./windowStore";
 import styles from "./FindToolWindow.module.css";
-import { tx } from "@/platform/i18n";
+import { t, tx } from "@/platform/i18n";
 
 type Node =
   | { kind: "dir"; key: string; label: string; count: number; children: Node[] }
@@ -92,7 +95,7 @@ export function buildFindTree(files: readonly FileMatches[], groupByDirectory = 
       const first = m.ranges[0] ?? [0, 0];
       return {
         kind: "match",
-        key: `m:${f.path}:${m.line}`,
+        key: `m:${f.path}:${m.line}:${first[0] + m.textOffset}`,
         path: f.path,
         line: m.line,
         col: first[0] + m.textOffset,
@@ -174,24 +177,30 @@ export function FindTabs() {
         id: String(t.id),
         label: t.title,
         closable: true,
-        icon: t.pinned ? "pin" : undefined,
+        pinned: t.pinned,
       }))}
       activeId={String(tab.id)}
       onSelect={(id) => useFindWindow.setState({ active: Number(id) })}
       onClose={(id) => closeFindTab(Number(id))}
+      onTogglePin={(id) => {
+        const t = tabs.find((x) => x.id === Number(id));
+        if (t) pinFindTab(t.id, !t.pinned);
+      }}
       onContextMenu={(id, e) => {
         const t = tabs.find((x) => x.id === Number(id));
         if (!t) return;
+        // IDEA's content tab menu.
         showContextMenu(e, [
-          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinFindTab(t.id, !t.pinned) },
-          { kind: "separator" },
           { id: "close", label: "Close Tab", run: () => closeFindTab(t.id) },
+          { id: "closeAll", label: "Close All Tabs", run: () => tabs.forEach((o) => closeFindTab(o.id)) },
           {
             id: "closeOthers",
             label: "Close Other Tabs",
             disabled: tabs.length < 2,
             run: () => tabs.forEach((o) => o.id !== t.id && closeFindTab(o.id)),
           },
+          { kind: "separator" },
+          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinFindTab(t.id, !t.pinned) },
         ]);
       }}
     />
@@ -205,20 +214,30 @@ export function FindToolWindow() {
   if (!tab) {
     return (
       <EmptyState title="No search results" icon="search">
-        {tx`Use Find in Files (${shortcutLabel("find.inPath") ?? "⇧⌘F"}) and choose “Open in Find Window”.`}
+        {tx`Use Find in Files (${shortcutLabel("find.inPath") ?? formatBinding(hostBinding("Meta+Shift+F"))}) and choose “Open in Find Window”.`}
       </EmptyState>
     );
   }
-  return (
-    <div className={styles.root}>
-      <FindTabView key={tab.id} tab={tab} />
-    </div>
-  );
+  return <FindTabView key={tab.id} tab={tab} />;
 }
 
 function FindTabView({ tab }: { tab: FindTab }) {
   const groupByDirectory = useFindViewOptions((o) => o.groupByDirectory);
   const showPreview = useFindViewOptions((o) => o.preview);
+  const body = useRef<HTMLDivElement>(null);
+  const [stacked, setStacked] = useState(false);
+  useLayoutEffect(() => {
+    const frame = body.current;
+    if (!showPreview || !frame) return;
+    const measure = () => setStacked(frame.clientWidth < 580);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, [showPreview]);
+  const previewLayout = stacked ? "openidea.find.previewSplit.vertical" : "openidea.find.previewSplit";
+  const minPanelSize = stacked ? "30%" : 160;
   const roots = useMemo(() => buildFindTree(tab.state.files, groupByDirectory), [tab.state.files, groupByDirectory]);
   const tree = useRef<TreeHandle>(null);
   const [leadNode, setLeadNode] = useState<Node | null>(null);
@@ -274,14 +293,15 @@ function FindTabView({ tab }: { tab: FindTab }) {
     }));
   }, [preview?.path, st.files]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const replace = async (usages: Usage[]) => {
+  const replace = async (usages: Usage[], allInScope = false) => {
     if (tab.replacement === null || !usages.length || running) return;
     const run = startReplace(
       {
         query: tab.query,
         replacement: tab.replacement,
         preserveCase: !!tab.preserveCase,
-        targets: replaceTargets(usages),
+        targets: allInScope ? skipTargets(allGroups, marks) : replaceTargets(usages),
+        allInScope,
       },
       setProgress,
     );
@@ -346,13 +366,17 @@ function FindTabView({ tab }: { tab: FindTab }) {
 
   const replaceMode = tab.replacement !== null;
   const allPending = pendingUsages(allGroups, marks);
+  // Past the search's limit, every match in the scope is replaced, listed or not (as in IDEA).
+  const allInScope = !!st.summary?.limitHit;
   const confirmReplaceAll = async () => {
     const ok = await confirm({
       title: "Replace All",
       ok: "Replace",
       message: (
         <>
-          {confirmText(countUsages(allPending), tab.query.pattern, tab.replacement ?? "")}
+          {allInScope
+            ? confirmAllText(tab.query.pattern, tab.replacement ?? "")
+            : confirmText(countUsages(allPending), tab.query.pattern, tab.replacement ?? "")}
           {marks.excluded.size > 0 && (
             <>
               {" "}
@@ -362,29 +386,123 @@ function FindTabView({ tab }: { tab: FindTab }) {
         </>
       ),
     });
-    if (ok) void replace(allPending);
+    if (ok) void replace(allPending, allInScope);
   };
   const selectedPending = pendingUsages(selectedGroups(), marks);
 
   return (
-    <div className={styles.body} onKeyDown={onKeyDown}>
-      <div className={styles.summary}>
-        {(st.status === "searching" || busy) && <Spinner size={12} />}
-        <span className={styles.title}>{tab.title}</span>
-        <span className={styles.count}>
-          {st.status === "invalid" || st.status === "error"
-            ? (st.error ?? tx("Search failed"))
-            : progress
-              ? tx`Replacing… ${progress.done}/${progress.total} files`
-              : tx`${`${st.matchCount}${st.summary?.limitHit ? "+" : ""}`} matches in ${st.files.length} files` +
-                (marks.excluded.size ? ` · ${tx`${marks.excluded.size} excluded`}` : "")}
-        </span>
-        <span className={styles.spacer} />
-        <Button size="small" variant="ghost" disabled={!selection.size} onClick={exclude} title="Exclude / include (⌫)">
-          <T>Exclude</T>
-        </Button>
+    <div className={styles.root} onKeyDown={onKeyDown}>
+      <FindActions tab={tab} roots={roots} canExclude={selection.size > 0} onExclude={exclude} />
+      <div ref={body} className={styles.body}>
+        <div className={styles.summary}>
+          {(st.status === "searching" || busy) && <Spinner size={16} variant="spokes" />}
+          <span className={styles.count}>
+            {st.status === "invalid" || st.status === "error"
+              ? (st.error ?? tx("Search failed"))
+              : progress
+                ? tx`Replacing… ${progress.done}/${progress.total} files`
+                : t(st.summary?.limitHit ? "search.find.matchesIncomplete" : "search.find.matches", {
+                    matches: st.matchCount,
+                    files: st.files.length,
+                  }) + (marks.excluded.size ? ` · ${tx`${marks.excluded.size} excluded`}` : "")}
+          </span>
+        </div>
+        <SplitGroup
+          orientation={showPreview && stacked ? "vertical" : "horizontal"}
+          className={styles.split}
+          id="find-results-split"
+          storageKey={showPreview ? previewLayout : undefined}
+        >
+          <SplitPanel id="results" minSize={showPreview ? minPanelSize : undefined} className={styles.splitPanel}>
+            <Tree<Node>
+              className={styles.tree}
+              aria-label="Find results"
+              handleRef={tree}
+              roots={roots}
+              getKey={(n) => n.key}
+              getLabel={(n) => (n.kind === "dir" ? n.label : n.kind === "file" ? n.name : n.text)}
+              getChildren={(n) => (n.kind === "match" ? undefined : n.children)}
+              isExpandable={(n) => n.kind !== "match"}
+              isOccurrence={(n) => n.kind === "match" && groupState(nodeGroups(n)[0]!, marks) !== "excluded"}
+              expanded={expanded}
+              onExpandedChange={(next) => {
+                const all = allExpandableKeys(roots);
+                setCollapsed(tab.id, new Set([...all].filter((k) => !next.has(k))));
+              }}
+              selected={selection}
+              onSelectionChange={(next, lead) => {
+                setSelection(next);
+                setLeadNode(lead);
+                if (tab.editorResults && lead?.kind === "match")
+                  void openLocation(
+                    lead.path,
+                    { line: lead.line, col: lead.col, endLine: lead.line, endCol: lead.endCol },
+                    { focus: false },
+                  );
+              }}
+              multiSelect
+              onActivate={(n) => {
+                if (n.kind === "match")
+                  void openLocation(
+                    n.path,
+                    { line: n.line, col: n.col, endLine: n.line, endCol: n.endCol },
+                    { focus: true },
+                  );
+                else if (n.kind === "file")
+                  void openLocation(n.path, previewOf(n) ? { line: previewOf(n)!.line } : null);
+              }}
+              onContextMenu={(_n, sel, e) => {
+                const groups = [...sel].flatMap((k) => (byKey.get(k) ? nodeGroups(byKey.get(k)!) : []));
+                const excludedAll = groups.length > 0 && groups.every((g) => groupState(g, marks) === "excluded");
+                showContextMenu(e, [
+                  ...(_n?.kind === "match"
+                    ? menuGroupItems("searchResults", { paths: [_n.path], line: _n.line, column: _n.col })
+                    : []),
+                  {
+                    id: "exclude",
+                    label: excludedAll ? "Include" : "Exclude",
+                    shortcut: "⌫",
+                    disabled: !groups.length,
+                    run: exclude,
+                  },
+                  ...(replaceMode
+                    ? [
+                        {
+                          id: "replace",
+                          label: "Replace Selected",
+                          disabled: busy || !pendingUsages(groups, marks).length,
+                          run: () => void replace(pendingUsages(groups, marks)),
+                        },
+                        {
+                          id: "preview",
+                          label: "Preview Replacement",
+                          disabled: busy || !groups.length,
+                          run: () => void previewReplace(),
+                        },
+                      ]
+                    : []),
+                ]);
+              }}
+              activateExpandable={false}
+              renderNode={(n, s) => <FindNode node={n} state={s} tab={tab} marks={marks} />}
+              empty={
+                <span className={styles.empty}>
+                  {st.status === "searching" || st.status === "validating" ? "Searching…" : "No matches"}
+                </span>
+              }
+            />
+          </SplitPanel>
+          {showPreview && (
+            <>
+              <SplitHandle aria-label={tx("Resize find preview")} />
+              <SplitPanel id="preview" minSize={minPanelSize} defaultSize="45%" className={styles.splitPanel}>
+                <CodePreview path={preview?.path ?? null} line={preview?.line ?? 0} highlights={highlights} />
+              </SplitPanel>
+            </>
+          )}
+        </SplitGroup>
         {replaceMode && (
-          <>
+          <div className={styles.replaceActions}>
             {running && (
               <Button size="small" onClick={() => running.cancel()}>
                 <T>Stop</T>
@@ -412,94 +530,9 @@ function FindTabView({ tab }: { tab: FindTab }) {
             >
               <T>Replace All</T>
             </Button>
-          </>
+          </div>
         )}
       </div>
-      <SplitGroup orientation="horizontal" className={styles.split} id="find-results-split">
-        <SplitPanel id="results" minSize={120} className={styles.splitPanel}>
-          <Tree<Node>
-            className={styles.tree}
-            aria-label="Find results"
-            handleRef={tree}
-            roots={roots}
-            getKey={(n) => n.key}
-            getLabel={(n) => (n.kind === "dir" ? n.label : n.kind === "file" ? n.name : n.text)}
-            getChildren={(n) => (n.kind === "match" ? undefined : n.children)}
-            isExpandable={(n) => n.kind !== "match"}
-            isOccurrence={(n) => n.kind === "match" && groupState(nodeGroups(n)[0]!, marks) !== "excluded"}
-            expanded={expanded}
-            onExpandedChange={(next) => {
-              const all = allExpandableKeys(roots);
-              setCollapsed(tab.id, new Set([...all].filter((k) => !next.has(k))));
-            }}
-            selected={selection}
-            onSelectionChange={(next, lead) => {
-              setSelection(next);
-              setLeadNode(lead);
-              if (tab.editorResults && lead?.kind === "match")
-                void openLocation(
-                  lead.path,
-                  { line: lead.line, col: lead.col, endLine: lead.line, endCol: lead.endCol },
-                  { focus: false },
-                );
-            }}
-            multiSelect
-            onActivate={(n) => {
-              if (n.kind === "match")
-                void openLocation(
-                  n.path,
-                  { line: n.line, col: n.col, endLine: n.line, endCol: n.endCol },
-                  { focus: true },
-                );
-              else if (n.kind === "file") void openLocation(n.path, previewOf(n) ? { line: previewOf(n)!.line } : null);
-            }}
-            onContextMenu={(_n, sel, e) => {
-              const groups = [...sel].flatMap((k) => (byKey.get(k) ? nodeGroups(byKey.get(k)!) : []));
-              const excludedAll = groups.length > 0 && groups.every((g) => groupState(g, marks) === "excluded");
-              showContextMenu(e, [
-                {
-                  id: "exclude",
-                  label: excludedAll ? "Include" : "Exclude",
-                  shortcut: "⌫",
-                  disabled: !groups.length,
-                  run: exclude,
-                },
-                ...(replaceMode
-                  ? [
-                      {
-                        id: "replace",
-                        label: "Replace Selected",
-                        disabled: busy || !pendingUsages(groups, marks).length,
-                        run: () => void replace(pendingUsages(groups, marks)),
-                      },
-                      {
-                        id: "preview",
-                        label: "Preview Replacement",
-                        disabled: busy || !groups.length,
-                        run: () => void previewReplace(),
-                      },
-                    ]
-                  : []),
-              ]);
-            }}
-            activateExpandable={false}
-            renderNode={(n, s) => <FindNode node={n} state={s} tab={tab} marks={marks} />}
-            empty={
-              <span className={styles.empty}>
-                {st.status === "searching" || st.status === "validating" ? "Searching…" : "No matches"}
-              </span>
-            }
-          />
-        </SplitPanel>
-        {showPreview && (
-          <>
-            <SplitHandle />
-            <SplitPanel id="preview" minSize={120} defaultSize="45%" className={styles.splitPanel}>
-              <CodePreview path={preview?.path ?? null} line={preview?.line ?? 0} highlights={highlights} />
-            </SplitPanel>
-          </>
-        )}
-      </SplitGroup>
     </div>
   );
 }
@@ -518,7 +551,7 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
     case "dir":
       return (
         <span className={styles.node}>
-          <Icon name={state.expanded ? "folder-open" : "folder"} size={14} className={styles.icon} />
+          <Icon name={state.expanded ? "folder-open" : "folder"} size={16} className={styles.icon} />
           <span className={styles.label}>{node.label}</span>
           <span className={styles.meta}>
             {node.count} {node.count === 1 ? "match" : "matches"}
@@ -528,10 +561,14 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
     case "file":
       return (
         <span className={styles.node}>
-          <Icon name={fileIconName(node.name)} size={14} className={styles.icon} />
+          <Icon name={fileIconName(node.name)} size={16} className={styles.icon} />
           <span className={styles.label}>{node.name}</span>
           <span className={styles.meta}>{node.count}</span>
-          {!state.depth && node.dir && <span className={styles.meta}>{node.dir}</span>}
+          {!state.depth && node.dir && (
+            <span className={styles.directory} title={node.dir}>
+              {node.dir}
+            </span>
+          )}
         </span>
       );
     case "match":
@@ -543,7 +580,6 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
               text={node.text}
               ranges={node.ranges}
               source={{ path: node.path, line: node.line, col: node.textCol }}
-              active={state.selected}
               replacement={tab.replacement}
               query={tab.query}
               preserveCase={!!tab.preserveCase}
@@ -554,15 +590,20 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
   }
 }
 
-/** Header controls of the Find tool window. */
-export function FindToolWindowActions() {
-  const tabs = useFindWindow((s) => s.tabs);
-  const activeId = useFindWindow((s) => s.active);
-  const tab = tabs.find((t) => t.id === activeId) ?? tabs[tabs.length - 1];
-  if (!tab) return null;
+function FindActions({
+  tab,
+  roots,
+  canExclude,
+  onExclude,
+}: {
+  tab: FindTab;
+  roots: readonly Node[];
+  canExclude: boolean;
+  onExclude: () => void;
+}) {
   const searching = tab.state.status === "searching";
   return (
-    <>
+    <div className={styles.toolbar} role="toolbar" aria-orientation="vertical" aria-label={tx("Find actions")}>
       <IconButton icon="arrow-up" action="navigate.prevOccurrence" size="small" />
       <IconButton icon="arrow-down" action="navigate.nextOccurrence" size="small" />
       {searching ? (
@@ -581,14 +622,10 @@ export function FindToolWindowActions() {
         icon="collapse-all"
         title="Collapse All"
         size="small"
-        onClick={() =>
-          setCollapsed(
-            tab.id,
-            allExpandableKeys(buildFindTree(tab.state.files, useFindViewOptions.getState().groupByDirectory)),
-          )
-        }
+        onClick={() => setCollapsed(tab.id, allExpandableKeys(roots))}
       />
+      <IconButton icon="minus" title="Exclude / include (⌫)" size="small" disabled={!canExclude} onClick={onExclude} />
       <IconButton icon="close" title="Close Tab" size="small" onClick={() => closeFindTab(tab.id)} />
-    </>
+    </div>
   );
 }

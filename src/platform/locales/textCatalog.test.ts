@@ -7,7 +7,7 @@
  *
  * Text counts as translatable when it is a literal (or a branch of `?:` / `??` /
  * `||` around one) that reaches the translation layer directly:
- *   - the first argument of `tx` / `txTemplate`, or of a function bound from
+ *   - the first argument of `tx` / `txPart` / `txTemplate`, or of a function bound from
  *     `useTx()` / `useTxTemplate()` in the same file;
  *   - the plain-text children of `<T>` and the other `TEXT_CHILDREN` primitives;
  *   - a `TEXT_PROPS` attribute of a component (`<Row hint="…">`), and `data-tooltip`;
@@ -25,12 +25,17 @@
  *
  * Not seen: text kept in a variable or built by a helper before it reaches `tx`,
  * and text sent by the backend. Their entries count as used (not stale) as long as
- * the text appears as a literal anywhere in `src/`, the Rust crates or `languages/`.
+ * the text appears as a literal anywhere in `src/`, the Rust crates, `languages/` or `generators/`.
+ *
+ * Message keys are checked too: a literal key given to `t`, or to a function bound
+ * from `useT()` in the same file, must exist in `en.json`; otherwise the UI shows the
+ * raw key. Keys built at runtime or passed through a helper are not seen.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
+import en from "./en.json";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const TEXT_DIR = new URL("./text/", import.meta.url);
@@ -65,6 +70,8 @@ const NOTIFY = new Set(["notify"]);
 
 /** Code templates shown as written, and the in-memory backends of plain-browser development. */
 const UNCHECKED_FILES = new Set([
+  // Pre-module failure UI carries its own English/Chinese text when catalogs cannot load.
+  "public/boot.js",
   "src/editor/core/backend.ts",
   "src/features/plugins/backend.ts",
   "src/features/tools/backend.ts",
@@ -79,6 +86,34 @@ const BUILT_AT_RUNTIME = new Set<string>([]);
 
 /** Text that stays as written in every locale: names, code, formats, shortcuts. */
 const UNTRANSLATED = new Set<string>([
+  "dotnet test",
+  "netcoredbg (.NET)",
+  "php-debug (PHP)",
+  "rdbg (Ruby)",
+  // Product names
+  "Cargo",
+  "CMake",
+  "Flutter",
+  "Prettier",
+  "oxfmt",
+  "Ruff",
+  "IntelliJ IDEA",
+  "GitHub",
+  "PHPStan",
+  "Xdebug",
+  "Zig",
+  // Resource kinds of a browser's network panel
+  "Fetch/XHR",
+  "JS",
+  "CSS",
+  "Chrome",
+  "Edge",
+  "Safari",
+  "Firefox",
+  "JaCoCo",
+  // Docker run target placeholder values
+  "compose.yaml",
+  "python:3.12",
   // Go environment variables and placeholder values
   "CGO",
   "GOPROXY",
@@ -95,6 +130,7 @@ const UNTRANSLATED = new Set<string>([
   "loopvar,rangefunc",
   // SSH and run-target placeholders
   "SSH",
+  "WSL",
   "example.com",
   "java",
   "node",
@@ -105,6 +141,7 @@ const UNTRANSLATED = new Set<string>([
   "basedpyright",
   "Cargo Check",
   "Clippy",
+  "ClickHouse",
   "CockroachDB",
   "CodeLLDB",
   "CodeLLDB (Rust, C, C++)",
@@ -120,15 +157,18 @@ const UNTRANSLATED = new Set<string>([
   "Eclipse (macOS)",
   "Eclipse Temurin",
   "EditorConfig",
+  "Epytext",
+  "Flutter",
   "Git",
   "GitHub",
   "Go",
   "Godot",
+  "Google",
   "Gradle",
+  "GraphQL",
   "Greenplum",
   "Java",
   "java-debug (Java)",
-  "kotlin-debug-adapter (Kotlin)",
   "js-debug (Node.js / TypeScript)",
   "JSON",
   "lldb-dap (C, C++, Swift)",
@@ -138,16 +178,26 @@ const UNTRANSLATED = new Set<string>([
   "MySQL",
   "Neon",
   "Node.js",
+  "NumPy",
+  "PHP",
+  "Python",
   "npm",
+  "npx",
   "OpenIDEA",
+  "Oracle",
+  "Snowflake",
+  "Spring",
   "Spring Boot",
   "PostgreSQL",
+  "Pyrefly",
   "Pyright",
   "pytest",
+  "reStructuredText",
   "Rust",
   "Rustfmt",
   "SingleStore",
   "SQLite",
+  "StarRocks",
   "Supabase",
   "TiDB",
   "TimescaleDB",
@@ -164,20 +214,21 @@ const UNTRANSLATED = new Set<string>([
   "Fixup",
   "Fixup…",
   "IDE",
+  "localhost",
   "mod tests",
   "Windows (\\r\\n)",
-  // Language names, written in their own language
-  "English",
-  "简体中文 (Chinese, Simplified)",
   // Terms, keywords and acronyms kept in English
   "DDL",
   "GOPATH",
   "GOROOT",
   "HEAD",
   "HTTP",
+  "JAR",
   "JDK",
   "JDK 1.4.x",
   "JDK 5 - 8",
+  "JPA",
+  "JRE",
   "LTS",
   "NULL",
   "ORDER BY",
@@ -188,6 +239,8 @@ const UNTRANSLATED = new Set<string>([
   "TODO",
   "URL",
   "VCS",
+  "WAR",
+  "Web",
   "WHERE",
   "WIP",
   // Code, commands and example values
@@ -196,24 +249,43 @@ const UNTRANSLATED = new Set<string>([
   "bastion.example.com",
   "build --info",
   "className()",
+  "claude, codex",
   "clean install -DskipTests",
+  "com.example.* -com.example.generated.*",
+  "com.example.Main",
   "com.example.Service#process, main.run, parse",
   "docker-compose.yml; docker-compose.override.yml",
   "file:src//*&&!file:*test*",
   "git pull --no-rebase --ff",
   "git pull --rebase",
   "go env GOPATH",
+  "java.lang.IllegalStateException, com.example.Outer$Failure",
   "kebab-case",
   "KEY=value; OTHER=value",
+  "main.py",
+  "my-mcp-server",
+  "mysite.settings_test",
   "NAME",
   "NAME=value; OTHER=value",
   "node_modules/typescript",
+  "out",
   "PascalCase",
+  "polls.tests",
+  "CalculatorTest::testAdd",
+  "phpunit.xml",
+  "PHPUnit",
+  "src/main/webapp",
+  "target/classes",
+  "target/test-classes",
+  "tests/Unit",
+  "vendor/bin/phpunit",
+  "pylyzer --server",
   "pyproject.toml, .git",
-  "ruff server",
   "run pytest",
+  "run python",
   "snake_case",
   "tests",
+  "uvicorn",
   '{ "section": { "key": "value" } }',
   // Identifiers that only look like text: icon names, error codes, categories, console output
   "app",
@@ -225,6 +297,9 @@ const UNTRANSLATED = new Set<string>([
   "Running processes requires the desktop app.\n",
   "text",
 ]);
+
+/** Locales that must translate every UI text; the others show English for text they lack. */
+const COMPLETE_LOCALES = new Set(["zh"]);
 
 /**
  * Template literals that reach an exact lookup on purpose: the text around the
@@ -416,14 +491,32 @@ interface Scan {
   untranslatable: Use[];
   /** Translated templates that splice English words into the sentence. */
   spliced: Use[];
+  /** Literal message keys given to `t`. */
+  keys: Use[];
+}
+
+/** Local names of `t` and of the functions bound from `useT()` in a file. */
+function messageFunctions(source: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*"(?:@\/platform|\.)\/i18n"/g))
+    for (const part of m[1]!.split(",")) {
+      const named = /^\s*t(?:\s+as\s+(\w+))?\s*$/.exec(part);
+      if (named) names.add(named[1] ?? "t");
+    }
+  for (const m of source.matchAll(/(?:const|let)\s+(\w+)\s*=\s*useT\(\)/g)) names.add(m[1]!);
+  return names;
 }
 
 function scanTypeScript(): Scan {
   const translated: Use[] = [];
   const untranslatable: Use[] = [];
   const spliced: Use[] = [];
+  const keys: Use[] = [];
   const literals = new Set<string>();
-  const files = walk(`${ROOT}src`, (p) => /\.tsx?$/.test(p) && !isTest(p) && !p.endsWith("/bindings.ts"));
+  const files = [
+    ...walk(`${ROOT}src`, (p) => /\.tsx?$/.test(p) && !isTest(p) && !p.endsWith("/bindings.ts")),
+    `${ROOT}public/boot.js`,
+  ];
   for (const file of files) {
     const path = file.slice(ROOT.length);
     const source = readFileSync(file, "utf8");
@@ -434,13 +527,19 @@ function scanTypeScript(): Scan {
       true,
       file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
     );
-    const exact = new Set(["tx"]);
+    const exact = new Set(["tx", "txPart"]);
     const template = new Set(["txTemplate"]);
     for (const m of source.matchAll(/(?:const|let)\s+(\w+)\s*=\s*useTx(Template)?\(\)/g))
       (m[2] ? template : exact).add(m[1]!);
     const checked = !UNCHECKED_FILES.has(path);
+    const messages = messageFunctions(source);
     const where = (node: ts.Node) => `${path}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
     const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && messages.has(node.expression.text)) {
+        const arg = node.arguments[0] && unwrap(node.arguments[0]);
+        const literal = arg && ts.isStringLiteralLike(arg) ? [arg.text] : arg && stringBranches(arg);
+        for (const text of literal ?? []) keys.push({ text, at: where(node), match: "exact" });
+      }
       if (checked && ts.isTaggedTemplateExpression(node) && ts.isIdentifier(node.tag) && exact.has(node.tag.text)) {
         // Without `${}` the tag looks its text up as written.
         const match = ts.isNoSubstitutionTemplateLiteral(node.template) ? "exact" : "shape";
@@ -461,6 +560,8 @@ function scanTypeScript(): Scan {
         for (const text of texts) {
           literals.add(shape(text));
           literals.add(shape(text.trim()));
+          // Color scheme trees display the individual segments of grouped attribute names.
+          for (const part of text.split(" › ")) literals.add(shape(part));
         }
         const sink = checked ? sinkOf(node, exact, template) : undefined;
         if (sink) {
@@ -478,8 +579,30 @@ function scanTypeScript(): Scan {
     };
     visit(sf);
   }
-  return { translated, literals, untranslatable, spliced };
+  return { translated, literals, untranslatable, spliced, keys };
 }
+
+/** Read strings without letting a Rust character literal open a string match. */
+function backendLiterals(source: string): string[] {
+  const out: string[] = [];
+  for (const m of source.matchAll(/'(?:\\.|[^'\\\r\n])'|"((?:[^"\\]|\\[\s\S])*)"/g)) {
+    if (m[1] !== undefined) out.push(m[1]);
+  }
+  return out;
+}
+
+it("reads backend messages after quote character literals", () => {
+  expect(
+    backendLiterals(`let quote = '"'; let message = "Select a .NET project"; let detail = "Expected 'x'";`),
+  ).toEqual(["Select a .NET project", "Expected 'x'"]);
+});
+
+it("reads backend messages continued over a line", () => {
+  expect(backendLiterals('let m = "can\'t rename; \\\n    half renamed"; let n = "Next";')).toEqual([
+    "can't rename; \\\n    half renamed",
+    "Next",
+  ]);
+});
 
 /** String literals of the Rust crates and language definitions (backend messages). */
 function scanBackend(literals: Set<string>) {
@@ -487,9 +610,10 @@ function scanBackend(literals: Set<string>) {
     ...walk(`${ROOT}crates`, (p) => p.endsWith(".rs")),
     ...walk(`${ROOT}src-tauri/src`, (p) => p.endsWith(".rs")),
     ...walk(`${ROOT}languages`, (p) => p.endsWith(".toml")),
+    ...walk(`${ROOT}generators`, (p) => p.endsWith(".toml")),
   ];
   for (const file of files)
-    for (const m of readFileSync(file, "utf8").matchAll(/"((?:[^"\\]|\\.)*)"/g)) literals.add(shape(m[1]!));
+    for (const literal of backendLiterals(readFileSync(file, "utf8"))) literals.add(shape(literal));
 }
 
 /** Text that needs no translation: no words, a path / glob / option, or listed in `UNTRANSLATED`. */
@@ -508,6 +632,26 @@ const catalogs = Object.fromEntries(
     .filter((f) => f.endsWith(".json"))
     .map((f) => [f.slice(0, -5), JSON.parse(readFileSync(new URL(f, TEXT_DIR), "utf8")) as Record<string, string>]),
 );
+
+/** Keys a JSON file defines more than once (at any depth); `JSON.parse` keeps only the last. */
+function duplicateKeys(url: URL): string[] {
+  const file = ts.parseJsonText(url.pathname, readFileSync(url, "utf8"));
+  const duplicates: string[] = [];
+  const visit = (node: ts.Node, path: string) => {
+    if (ts.isObjectLiteralExpression(node)) {
+      const seen = new Set<string>();
+      for (const property of node.properties) {
+        if (!ts.isPropertyAssignment(property) || !ts.isStringLiteral(property.name)) continue;
+        const key = path + property.name.text;
+        if (seen.has(key)) duplicates.push(key);
+        seen.add(key);
+        visit(property.initializer, `${key}.`);
+      }
+    }
+  };
+  file.statements.forEach((statement) => visit(statement.expression, ""));
+  return duplicates;
+}
 
 /** `{name}` templates of a catalog, as `txTemplate` matches them. */
 function templatePatterns(catalog: Record<string, string>): RegExp[] {
@@ -532,6 +676,36 @@ it("translates built text as whole sentences, one per variant", () => {
   expect(report(scan.spliced)).toEqual([]);
 });
 
+it("reads the imported and bound names of the message function", () => {
+  expect(messageFunctions(`import { t, tx } from "@/platform/i18n";`)).toEqual(new Set(["t"]));
+  expect(messageFunctions(`import { t as translate, useT } from "./i18n"; const tr = useT();`)).toEqual(
+    new Set(["translate", "tr"]),
+  );
+  // `t` bound from `useTx()` takes English text, not a key.
+  expect(messageFunctions(`import { useTx } from "@/platform/i18n"; const t = useTx();`)).toEqual(new Set());
+});
+
+it("uses only message keys of the English catalog", () => {
+  // Ensure the check cannot pass because the scanner stopped finding keys.
+  expect(scan.keys.some((use) => use.text === "app.unsaved.title")).toBe(true);
+  expect(report(scan.keys.filter(({ text }) => !Object.hasOwn(en, text)))).toEqual([]);
+});
+
+const CATALOG_DIRS: [prefix: string, dir: URL][] = [
+  ["", new URL("./", import.meta.url)],
+  ["text/", TEXT_DIR],
+];
+
+it.each(
+  CATALOG_DIRS.flatMap(([prefix, dir]) =>
+    readdirSync(dir)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => ({ name: `${prefix}${f}`, url: new URL(f, dir) })),
+  ),
+)("defines each key once in $name", ({ url }) => {
+  expect(duplicateKeys(url)).toEqual([]);
+});
+
 describe.each(Object.keys(catalogs))("source-text catalog %s", (locale) => {
   const catalog = catalogs[locale]!;
   const patterns = templatePatterns(catalog);
@@ -542,7 +716,7 @@ describe.each(Object.keys(catalogs))("source-text catalog %s", (locale) => {
   const found = ({ text, match }: Use) =>
     has(text) || (match === "pattern" && matchesTemplate(text)) || (match === "shape" && shapes.has(shape(text)));
 
-  it("translates every literal UI text", () => {
+  it.runIf(COMPLETE_LOCALES.has(locale))("translates every literal UI text", () => {
     const missing = new Map<string, string>();
     for (const use of scan.translated)
       if (!found(use) && needsTranslation(use.text) && !missing.has(use.text)) missing.set(use.text, use.at);

@@ -1,6 +1,7 @@
 /** The project open in this window. */
 import { confirmProjectTrust } from "./projectTrust";
 import { create } from "zustand";
+import { setContext } from "./context";
 import { call, commands, type ProjectInfo, type Settings } from "./ipc";
 import { isVirtualUri, virtualContainer, virtualName, virtualParent } from "./virtualDocs";
 
@@ -9,6 +10,7 @@ interface ProjectState {
   /** Effective settings (project-layered when a project is open). */
   settings: Settings | null;
   opening: boolean;
+  openingPath: string | null;
   /** LightEdit: this window edits loose files without a project (`project` stays null). */
   lightEdit: boolean;
 }
@@ -17,23 +19,32 @@ export const useProject = create<ProjectState>(() => ({
   project: null,
   settings: null,
   opening: false,
+  openingPath: null,
   lightEdit: false,
 }));
 
-let leaveGuard: (() => Promise<boolean>) | null = null;
+useProject.subscribe((s) => setContext("projectOpening", s.openingPath !== null));
+
+/** `keepUntitled`: the window opens another project in place and keeps its untitled buffers. */
+type LeaveGuard = (keepUntitled: boolean) => Promise<boolean>;
+let leaveGuard: LeaveGuard | null = null;
 
 /** Installs the check run before this window leaves its project (unsaved changes). */
-export function provideLeaveProjectGuard(guard: () => Promise<boolean>): () => void {
+export function provideLeaveProjectGuard(guard: LeaveGuard): () => void {
   leaveGuard = guard;
   return () => {
     if (leaveGuard === guard) leaveGuard = null;
   };
 }
 
-/** False when the user chose to stay (another project in place, Close Project). */
-export function confirmLeaveProject(): Promise<boolean> {
+/**
+ * False when the user chose to stay (another project in place, Close Project). Untitled buffers
+ * follow the window only into another local project (`keepUntitled`); leaving for Welcome or a
+ * remote host asks about them too.
+ */
+export function confirmLeaveProject(keepUntitled = true): Promise<boolean> {
   const s = useProject.getState();
-  return (s.project || s.lightEdit) && leaveGuard ? leaveGuard() : Promise.resolve(true);
+  return (s.project || s.lightEdit) && leaveGuard ? leaveGuard(keepUntitled) : Promise.resolve(true);
 }
 
 let startupLaunch: Promise<void> | null = null;
@@ -49,20 +60,34 @@ export function startupLaunchHandled(): Promise<void> {
 }
 
 export async function openProject(path: string): Promise<ProjectInfo> {
-  await confirmProjectTrust(path);
-  useProject.setState({ opening: true });
+  await confirmProjectTrust(path, "local");
+  useProject.setState({ opening: true, openingPath: path });
   try {
     const project = await call(commands.openProject(path));
     useProject.setState({ project, settings: project.settings, lightEdit: false });
     return project;
+  } catch (error) {
+    // Opening may fail after the backend has already closed the old project.
+    if (useProject.getState().project) {
+      const project = await commands.projectCurrent().catch(() => null);
+      if (project?.root !== useProject.getState().project?.root)
+        useProject.setState({ project, ...(project ? { settings: project.settings } : {}), lightEdit: false });
+    }
+    throw error;
   } finally {
-    useProject.setState({ opening: false });
+    useProject.setState({ opening: false, openingPath: null });
   }
 }
 
 /** Switches this window to LightEdit for the loose file `path` (kept when already in LightEdit). */
 export async function openLightEdit(path: string): Promise<void> {
   const settings = await call(commands.lightEditOpen(path));
+  useProject.setState({ project: null, settings, lightEdit: true });
+}
+
+/** Switches this window to LightEdit without a file (File › New File from the welcome screen). */
+export async function openLightEditUntitled(): Promise<void> {
+  const settings = await call(commands.lightEditOpenUntitled());
   useProject.setState({ project: null, settings, lightEdit: true });
 }
 

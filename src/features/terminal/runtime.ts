@@ -4,16 +4,36 @@ export {
   applySettingsToAll,
   applyThemeToAll,
   closeAll,
-  closePane,
+  detachTab,
   newTab,
+  newTabRunning,
+  pluginSession,
+  syncTerminalProject,
+  tabTitle,
+  unbindTerminals,
   newTabAt,
-  requestClosePane,
+  requestCloseSession,
   sessionForTerminalId,
   sessionFromElement,
-  splitActive,
+  splitTab,
   startDirectory,
+  unsplit,
   useTerminals,
 } from "./store";
+export {
+  adoptCli,
+  applySettingsToClis,
+  applyThemeToClis,
+  cliBusy,
+  cliSession,
+  cliSessionForTerminalId,
+  cliSessionFromElement,
+  disposeAllClis,
+  disposeCli,
+  isCliSession,
+  startCli,
+} from "./cliSessions";
+export { CliEditor } from "./CliEditor";
 export { TerminalTabs, TerminalView } from "./TerminalView";
 export { applyThemeToEmbedded, createEmbeddedTerminal } from "./embedded";
 export { closeTerminalFind, openTerminalFind, useTerminalFind } from "./FindBar";

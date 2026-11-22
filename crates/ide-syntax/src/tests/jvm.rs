@@ -1,5 +1,5 @@
 use super::*;
-use crate::{JvmPresentation, JvmTypeKind::*};
+use crate::{JvmPresentation, JvmTypeKind::*, jvm_type_header};
 
 fn presentation(language: &str, text: &str) -> JvmPresentation {
     service().jvm_presentation(&Snapshot::text(&lang(language), text), "Foo", &none()).unwrap()
@@ -75,4 +75,57 @@ fn runnable_methods() {
         )
         .runnable
     );
+}
+
+#[test]
+fn a_cut_off_file_is_classified_by_its_type_header() {
+    for (source, header) in [
+        (
+            "package a.record;\n/* class { */\n@Ann({\"}\"}) // interface {\npublic class Foo implements IFoo {\n  void m() {",
+            "package a.record;\n/* class { */\n@Ann({\"}\"}) // interface {\npublic class Foo implements IFoo {",
+        ),
+        ("@interface Foo { String value() default \"{\";", "@interface Foo {"),
+        (
+            "class Foo(val a: Map<String, () -> Unit> = mapOf()) : Base() {\n  fun f() {",
+            "class Foo(val a: Map<String, () -> Unit> = mapOf()) : Base() {",
+        ),
+        (
+            "record Foo(int x) implements Comparable<Foo> {\n  static String S = \"\"\"\n {",
+            "record Foo(int x) implements Comparable<Foo> {",
+        ),
+    ] {
+        assert_eq!(jvm_type_header(source), Some(header), "{source}");
+    }
+    assert_eq!(jvm_type_header("package a;\nimport b.C;\n/* unterminated class {"), None);
+
+    let cut = "@Service\npublic abstract class Foo extends Base {\n  void m() {\n    /*\n     * doc";
+    assert_eq!(presentation("java", cut).kind, None, "the cut-off text itself doesn't parse");
+    let closed = format!("{}}}", jvm_type_header(cut).unwrap());
+    assert_eq!(presentation("java", &closed).kind, Some(AbstractClass));
+}
+
+#[test]
+fn deprecated_primary_types() {
+    for (language, source) in [
+        ("java", "@Deprecated public class Foo {}"),
+        ("java", "@java.lang.Deprecated(since = \"2\") interface Foo {}"),
+        ("java", "/**\n * Old.\n * @deprecated use Bar\n */\npublic class Foo {}"),
+        ("java", "/** @deprecated */ class Foo {}"),
+        ("kotlin", "@Deprecated(\"use Bar\") class Foo"),
+        ("kotlin", "@kotlin.Deprecated(\"x\", level = DeprecationLevel.ERROR) object Foo {}"),
+    ] {
+        assert!(presentation(language, source).deprecated, "{language}: {source}");
+    }
+    for (language, source) in [
+        ("java", "public class Foo {}"),
+        ("java", "/* @deprecated */ class Foo {}"),
+        ("java", "// @Deprecated\nclass Foo {}"),
+        ("java", "/** See {@link Old}; @deprecatedSince is not a tag. */ class Foo {}"),
+        ("java", "class Foo { @Deprecated void old() {} }"),
+        ("java", "@Deprecated class Other {} class Foo {}"),
+        ("kotlin", "class Foo { @Deprecated(\"x\") fun old() {} }"),
+        ("kotlin", "/** @deprecated */ class Foo"),
+    ] {
+        assert!(!presentation(language, source).deprecated, "{language}: {source}");
+    }
 }

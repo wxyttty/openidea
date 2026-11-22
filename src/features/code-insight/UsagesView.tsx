@@ -2,14 +2,17 @@
  * "usages" tool window: Find Usages results grouped by file with line
  * previews, one tab per search (pinnable, as the Find tool window's tabs).
  */
-import { useCallback, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { openCodeLocation } from "@/editor/api";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
-import { tokenSpans, useLineTokens } from "@/editor/lineTokens";
+import { previewColors, tokenSpans, useLineTokens } from "@/editor/lineTokens";
 import { formatMessage, useTx } from "@/platform/i18n";
+import { useEditorPrefs } from "@/platform/editorSettings";
+import { BUNDLED_MONO_FAMILY, monoFontFamily } from "@/platform/fonts";
 import { shortcutLabel } from "@/platform/keymap";
 import { basename, relativeDir, useProject } from "@/platform/project";
-import { maybeEditorService, useOccurrenceNavigator } from "@/workbench/contributions";
+import { useOccurrenceNavigator } from "@/workbench/contributions";
 import {
   EmptyState,
   Icon,
@@ -41,6 +44,8 @@ import {
 } from "./usages";
 import styles from "./UsagesView.module.css";
 
+import { UsageAccessFilter, filterUsageAccess, supportsUsageAccess, useUsageAccessOptions } from "./UsageAccessFilter";
+
 type Node =
   | { kind: "summary"; key: string }
   | { kind: "file"; key: string; group: UsageGroup }
@@ -52,7 +57,7 @@ export function UsagePreview({ usage }: { usage: Usage }) {
   return (
     <span className={styles.preview}>
       {tokenSpans(text, 0, from, tokens, "b:")}
-      <mark className={styles.match}>{tokenSpans(text, from, to, tokens, "m:")}</mark>
+      <mark className={styles.match}>{text.slice(from, to)}</mark>
       {tokenSpans(text, to, text.length, tokens, "a:")}
     </span>
   );
@@ -64,8 +69,16 @@ export function UsagesTabs() {
   const tabs = useUsages((s) => s.tabs);
   const search = useUsages(activeUsageSearch);
   if (!search) return null;
-  const label = (t: (typeof tabs)[number]) =>
-    t.symbol ? formatMessage(tx("Usages of '{symbol}'"), { symbol: t.symbol }) : tx("Usages");
+  const label = (t: (typeof tabs)[number]) => {
+    if (!t.symbol) return tx("Usages");
+    const text =
+      t.scope === "project"
+        ? tx("Usages of '{symbol}' in Project Files")
+        : t.scope === "libraries"
+          ? tx("Usages of '{symbol}' in Project and Libraries")
+          : tx("Usages of '{symbol}'");
+    return formatMessage(text, { symbol: t.symbol });
+  };
   return (
     <Tabs
       variant="compact"
@@ -75,24 +88,30 @@ export function UsagesTabs() {
         id: String(t.id),
         label: label(t),
         closable: true,
-        icon: t.pinned ? "pin" : undefined,
+        pinned: t.pinned,
       }))}
       activeId={String(search.id)}
       onSelect={(id) => useUsages.setState({ active: Number(id) })}
       onClose={(id) => closeUsageTab(Number(id))}
+      onTogglePin={(id) => {
+        const t = tabs.find((x) => x.id === Number(id));
+        if (t) pinUsageTab(t.id, !t.pinned);
+      }}
       onContextMenu={(id, e) => {
         const t = tabs.find((x) => x.id === Number(id));
         if (!t) return;
+        // IDEA's content tab menu.
         showContextMenu(e, [
-          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinUsageTab(t.id, !t.pinned) },
-          { kind: "separator" },
           { id: "close", label: "Close Tab", run: () => closeUsageTab(t.id) },
+          { id: "closeAll", label: "Close All Tabs", run: () => tabs.forEach((o) => closeUsageTab(o.id)) },
           {
             id: "closeOthers",
             label: "Close Other Tabs",
             disabled: tabs.length < 2,
             run: () => tabs.forEach((o) => o.id !== t.id && closeUsageTab(o.id)),
           },
+          { kind: "separator" },
+          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinUsageTab(t.id, !t.pinned) },
         ]);
       }}
     />
@@ -101,7 +120,8 @@ export function UsagesTabs() {
 
 const SUMMARY_KEY = "\u0000summary";
 
-const usageKey = (u: Usage) => `${u.path}:${u.line}:${u.col}`;
+const usageKey = (u: Usage) =>
+  `${u.path}:${u.line}:${u.col}:${u.sourceLocation?.range.end.line ?? u.line}:${u.sourceLocation?.range.end.col ?? u.endCol}`;
 
 /** Excluded (⌫) usages per search. */
 const useExcluded = create<{ byTab: Record<number, ReadonlySet<string>> }>(() => ({ byTab: {} }));
@@ -124,7 +144,7 @@ export function toggleExcludedUsages(excluded: ReadonlySet<string>, usages: read
 }
 
 function openUsage(u: Usage, focus: boolean) {
-  void maybeEditorService()?.openFile(u.path, { selection: { line: u.line, col: u.col }, focus });
+  void openCodeLocation(u.path, { line: u.line, col: u.col }, { focus });
 }
 
 export function UsagesView() {
@@ -135,9 +155,15 @@ export function UsagesView() {
     id: null,
     keys: new Set(),
   });
+  const accessOptions = useUsageAccessOptions();
+  const allUsages = useMemo(() => search?.groups.flatMap((g) => g.usages) ?? [], [search?.groups]);
   const files = useMemo<Node[]>(
-    () => (search?.groups ?? []).map((g) => ({ kind: "file", key: g.path, group: g })),
-    [search?.groups],
+    () =>
+      (search?.groups ?? [])
+        .map((g) => ({ ...g, usages: filterUsageAccess(g.usages, accessOptions) }))
+        .filter((g) => g.usages.length > 0)
+        .map((g) => ({ kind: "file", key: g.path, group: g })),
+    [search?.groups, accessOptions],
   );
   const roots = useMemo<Node[]>(() => (files.length ? [{ kind: "summary", key: SUMMARY_KEY }] : []), [files.length]);
   const searchId = search?.id ?? null;
@@ -173,12 +199,22 @@ export function UsagesView() {
       </EmptyState>
     );
   const total = usageCount(search.groups);
+  const visibleLead =
+    lead?.kind === "usage"
+      ? files.some((f) => f.kind === "file" && f.group.usages.some((u) => usageKey(u) === lead.key))
+        ? lead
+        : null
+      : lead?.kind === "file"
+        ? (files.find((f) => f.key === lead.key) ?? null)
+        : roots.length
+          ? lead
+          : null;
   const setAll = (collapse: boolean) =>
     setCollapsed({ id: search.id, keys: collapse ? new Set(files.map((f) => f.key)) : new Set() });
 
   const exclude = () => {
-    if (!lead) return;
-    const next = toggleExcludedUsages(excluded, nodeUsages(lead, files));
+    if (!visibleLead) return;
+    const next = toggleExcludedUsages(excluded, nodeUsages(visibleLead, files));
     useExcluded.setState((s) => ({ byTab: { ...s.byTab, [search.id]: next } }));
     // Excluding moves on to the next usage, as in IDEA.
     if (next.size > excluded.size) tree.current?.selectOccurrence(1, { skipSubtree: true });
@@ -199,7 +235,10 @@ export function UsagesView() {
             <T>Found usages</T>
           </span>
           <span className={styles.count}>
-            {total} {tx(total === 1 ? "result" : "results")}
+            {!supportsUsageAccess(allUsages) || (accessOptions.read && accessOptions.write)
+              ? total
+              : `${files.reduce((n, f) => n + (f.kind === "file" ? f.group.usages.length : 0), 0)} / ${total}`}{" "}
+            {tx(total === 1 ? "result" : "results")}
           </span>
           {search.note && <span className={styles.note}>{search.note}</span>}
         </span>
@@ -208,9 +247,13 @@ export function UsagesView() {
       const path = n.group.path;
       return (
         <span className={clsx(styles.row, isExcluded(n) && styles.excluded)}>
-          <Icon name={fileIconName(basename(path))} size={16} className={styles.icon} />
-          <span className={styles.file}>{basename(path)}</span>
-          <span className={styles.muted}>{relativeDir(root, path)}</span>
+          <Icon name={fileIconName(basename(path), path)} size={16} className={styles.icon} />
+          <span className={styles.file} title={path}>
+            {basename(path)}
+          </span>
+          <span className={styles.directory} title={path}>
+            {relativeDir(root, path)}
+          </span>
           <span className={styles.count}>
             {n.group.usages.length} {tx(n.group.usages.length === 1 ? "usage" : "usages")}
           </span>
@@ -229,7 +272,7 @@ export function UsagesView() {
     <div className={styles.view}>
       <div className={styles.toolbar} role="toolbar" aria-orientation="vertical" aria-label={tx("Usages actions")}>
         <IconButton
-          icon="rerun"
+          icon="refresh"
           title={tx("Rerun Find Usages")}
           size="small"
           iconSize={16}
@@ -245,11 +288,22 @@ export function UsagesView() {
         <IconButton icon="collapse-all" title="Collapse All" size="small" iconSize={16} onClick={() => setAll(true)} />
       </div>
       <div className={styles.body} onKeyDown={onKeyDown}>
+        <UsageAccessFilter items={allUsages} />
+        {!search.loading && !search.error && search.scope === "project" && (
+          <div className={styles.summary}>
+            <T>Usages in Project Files</T>
+            {search.searchLibraries && (
+              <button type="button" className={styles.link} onClick={() => search.searchLibraries?.()}>
+                {tx("Search in Project and Libraries")}
+              </button>
+            )}
+          </div>
+        )}
         {(search.loading || search.error) && (
           <div className={styles.summary} role="status" aria-live="polite">
             {search.loading ? (
               <>
-                <Spinner size={12} />{" "}
+                <Spinner size={16} variant="spokes" />{" "}
                 {search.symbol
                   ? formatMessage(tx("Searching for usages of '{symbol}'"), { symbol: search.symbol })
                   : tx("Searching for usages")}
@@ -260,9 +314,9 @@ export function UsagesView() {
             )}
           </div>
         )}
-        <UsagesSplit preview={<UsagesPreview node={lead} />}>
+        <UsagesSplit preview={<UsagesPreview node={visibleLead} />}>
           <Tree<Node>
-            key={search.id}
+            key={`${search.id}:${accessOptions.read}:${accessOptions.write}`}
             aria-label="Usages"
             handleRef={tree}
             roots={roots}
@@ -308,9 +362,7 @@ export function UsagesView() {
             }}
             empty={
               !search.loading && !search.error ? (
-                <EmptyState>
-                  <T>No usages found</T>
-                </EmptyState>
+                <EmptyState>{total ? tx("No usages match the access filters") : <T>No usages found</T>}</EmptyState>
               ) : undefined
             }
           />
@@ -356,28 +408,62 @@ export function useUsagesHeaderMenu(): MenuItem[] {
 
 function UsagesSplit({ preview, children }: { preview: ReactNode; children: ReactNode }) {
   const show = useUsagesOptions((s) => s.preview);
+  const frame = useRef<HTMLDivElement>(null);
+  const [stacked, setStacked] = useState(false);
+  useLayoutEffect(() => {
+    const el = frame.current;
+    if (!show || !el) return;
+    const measure = () => setStacked(el.clientWidth < 580);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [show]);
   if (!show) return children;
   return (
-    <SplitGroup orientation="horizontal" id="usages-preview-split">
-      <SplitPanel id="usages" minSize={160} className={styles.panel}>
-        {children}
-      </SplitPanel>
-      <SplitHandle />
-      <SplitPanel id="preview" minSize={160} defaultSize="45%" className={styles.panel}>
-        {preview}
-      </SplitPanel>
-    </SplitGroup>
+    <div ref={frame} className={styles.splitFrame}>
+      <SplitGroup
+        orientation={stacked ? "vertical" : "horizontal"}
+        id="usages-preview-split"
+        storageKey={stacked ? "openidea.usages.previewSplit.vertical" : "openidea.usages.previewSplit"}
+      >
+        <SplitPanel id="usages" minSize={stacked ? "30%" : 160} className={styles.panel}>
+          {children}
+        </SplitPanel>
+        <SplitHandle />
+        <SplitPanel id="preview" minSize={stacked ? "30%" : 160} defaultSize="45%" className={styles.panel}>
+          {preview}
+        </SplitPanel>
+      </SplitGroup>
+    </div>
   );
 }
 
 function UsagesPreview({ node }: { node: Node | null }) {
   const usage = node?.kind === "usage" ? node.usage : node?.kind === "file" ? (node.group.usages[0] ?? null) : null;
   const search = useUsages(activeUsageSearch);
+  const settings = useProject((s) => s.settings?.editor);
+  const { fallbackFont } = useEditorPrefs();
+  const family = settings?.fontFamily;
+  const fontFamily =
+    (family && family !== BUNDLED_MONO_FAMILY) || fallbackFont.trim()
+      ? monoFontFamily(family, fallbackFont, "var(--font-mono)")
+      : undefined;
   const highlights = useMemo(() => {
     const group = usage && search?.groups.find((g) => g.path === usage.path);
     return (group?.usages ?? []).map((u) => ({ line: u.line, ranges: [[u.col, u.endCol] as const] }));
   }, [usage, search?.groups]);
   return (
-    <SourcePreview path={usage?.path ?? null} line={usage?.line ?? 0} highlights={highlights} load={previewText} />
+    <div className={styles.sourcePreview} style={{ fontFamily, fontSize: settings?.fontSize ?? undefined }}>
+      <SourcePreview
+        path={usage?.path ?? null}
+        line={usage?.line ?? 0}
+        highlights={highlights}
+        load={previewText}
+        colorize={previewColors}
+        className={styles.sourceText}
+      />
+    </div>
   );
 }

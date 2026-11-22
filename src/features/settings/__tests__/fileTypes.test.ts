@@ -1,12 +1,18 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { LanguageInfo_Serialize as LanguageInfo, Settings } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
-import { effectivePatterns, removePattern, userFileType, validateFileTypes, wildcardMatch } from "@/platform/fileTypes";
+import {
+  effectivePatterns,
+  overrideKey,
+  removePattern,
+  userFileType,
+  validateFileTypes,
+  wildcardMatch,
+} from "@/platform/fileTypes";
 import { DEFAULT_SETTINGS, validateSettings } from "../model/schema";
 import { openSettings, stage, stagedValue, useSettingsDialog } from "../model/staging";
 import { applyPatternEdit } from "../pages/FileTypes";
 import { CODE_STYLE_KEYS, copyScheme } from "../pages/editor/codeStyleScheme";
-import { overrideKey } from "../fileTypesRuntime";
 
 const lang = (id: string, extensions: string[], filenames: string[] = []): LanguageInfo => ({
   id,
@@ -87,6 +93,9 @@ describe("code style scheme", () => {
   it("copies every Code Style value to the other scheme", () => {
     stage("editor.codeStyle", "global", "editor.codeStyle.hardWrapAt", 100);
     stage("editor.codeStyle", "global", "editor.codeStyle.formatterTagsEnabled", true);
+    stage("editor.codeStyle", "global", "editor.codeStyle.languages", {
+      java: { formatter: "custom", formatterPath: "config/formatter.xml" },
+    });
     copyScheme("editor.codeStyle", "global", "project");
     const s = useSettingsDialog.getState();
     expect(stagedValue(s, "project", "editor.codeStyle.hardWrapAt")).toBe(100);

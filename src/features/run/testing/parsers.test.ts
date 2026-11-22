@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   cargoParser,
   createTestParser,
+  formatDuration,
   frameworkFor,
   goParser,
   jsParser,
   jvmParser,
+  nodeOutput,
   nodeStatus,
   parseAll,
   parseDuration,
@@ -13,6 +15,7 @@ import {
   TestResults,
   type TestOutputParser,
 } from "./index";
+import { moveToReportedClasses } from "./jvm";
 
 function results(parser: TestOutputParser, text: string) {
   const r = new TestResults();
@@ -34,6 +37,22 @@ describe("parseDuration", () => {
     expect(parseDuration("0.05 sec")).toBe(50);
     expect(parseDuration(undefined)).toBeUndefined();
     expect(parseDuration("soon")).toBeUndefined();
+  });
+});
+
+describe("formatDuration", () => {
+  it("shows milliseconds, seconds and minutes", () => {
+    expect(formatDuration(undefined)).toBe("");
+    expect(formatDuration(850)).toBe("850 ms");
+    expect(formatDuration(1250)).toBe("1.25 s");
+    expect(formatDuration(59_400)).toBe("59.4 s");
+    expect(formatDuration(125_000)).toBe("2 m 5 s");
+  });
+
+  it("carries seconds that round up to 60 into the minutes", () => {
+    expect(formatDuration(119_400)).toBe("1 m 59 s");
+    expect(formatDuration(119_600)).toBe("2 m 0 s");
+    expect(formatDuration(3_599_700)).toBe("60 m 0 s");
   });
 });
 
@@ -202,6 +221,8 @@ AssertionError: expected 1 to be 0 // Object.is equality
  ❯ src/b.test.ts:12:17
      10|   it("removes item", () => {
 
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
  Test Files  1 failed | 1 passed (2)
       Tests  1 failed | 3 passed (4)
    Start at  10:00:00
@@ -214,6 +235,12 @@ AssertionError: expected 1 to be 0 // Object.is equality
     expect(leaf(r, "src/b.test.ts", "cart", "adds item")?.own).toBe("passed");
     expect(leaf(r, "src/b.test.ts", "cart", "removes item")).toMatchObject({ own: "failed", durationMs: 4 });
     expect(nodeStatus(r.get("src/b.test.ts")!)).toBe("failed");
+  });
+
+  it("keeps the summary out of a failure's output", () => {
+    const output = leaf(results(jsParser(), fixture), "src/b.test.ts", "cart", "removes item")!.output;
+    expect(output[0]).toBe("AssertionError: expected 1 to be 0 // Object.is equality");
+    expect(output.some((l) => l.includes("Test Files") || l.includes("⎯"))).toBe(false);
   });
 
   it("links the failure location", () => {
@@ -230,6 +257,59 @@ AssertionError: expected 1 to be 0 // Object.is equality
     const r = results(jsParser(), fixture);
     expect(r.summary).toMatchObject({ passed: 3, failed: 1, durationMs: 412 });
     expect(r.counts()).toMatchObject({ passed: 3, failed: 1 });
+  });
+
+  it("gives each test its console output, and a group that of its tests", () => {
+    const r = results(
+      jsParser(),
+      `stdout | src/a.test.ts
+file level log
+
+stdout | src/a.test.ts > cart > adds
+adding item
+
+stderr | src/a.test.ts > cart > adds
+warn: low stock
+
+stdout | src/a.test.ts > top
+top line 1
+top line 2
+
+ ✓ src/a.test.ts > cart > adds 1ms
+ ✓ src/a.test.ts > top 0ms
+`,
+    );
+    const adds = leaf(r, "src/a.test.ts", "cart", "adds")!;
+    expect(adds).toMatchObject({ own: "passed", output: ["adding item", "warn: low stock"] });
+    expect(leaf(r, "src/a.test.ts", "top")?.output).toEqual(["top line 1", "top line 2"]);
+    expect(nodeOutput(r.get("src/a.test.ts")!)).toEqual([
+      "file level log",
+      "adding item",
+      "warn: low stock",
+      "top line 1",
+      "top line 2",
+    ]);
+  });
+
+  it("nests the default reporter's failed tests under their suites", () => {
+    const r = results(
+      jsParser(),
+      ` ❯ tests/cart.test.ts (5 tests | 1 failed) 12ms
+   ❯ Cart (4)
+     × intentionally fails 10ms
+   × top level fails 1ms
+
+ FAIL  tests/cart.test.ts > Cart > intentionally fails
+AssertionError: x
+`,
+    );
+    expect(leaf(r, "tests/cart.test.ts", "Cart", "intentionally fails")).toMatchObject({
+      own: "failed",
+      durationMs: 10,
+    });
+    expect(leaf(r, "tests/cart.test.ts", "intentionally fails")).toBeUndefined();
+    expect(leaf(r, "tests/cart.test.ts", "top level fails")?.own).toBe("failed");
+    expect(r.counts().failed).toBe(2);
   });
 
   it("handles flat verbose lines", () => {
@@ -365,14 +445,101 @@ OrderControllerTest > Paging > firstPage() SKIPPED
 3 tests completed, 1 failed, 1 skipped
 `,
     );
-    expect(leaf(r, "OrderControllerTest", "shouldListOrders()")?.own).toBe("passed");
-    expect(leaf(r, "OrderControllerTest", "shouldCreateOrder()")?.location).toEqual({
+    expect(leaf(r, "OrderControllerTest", "shouldListOrders")?.own).toBe("passed");
+    expect(leaf(r, "OrderControllerTest", "shouldCreateOrder")?.location).toEqual({
       path: "OrderControllerTest.kt",
       line: 22,
       resolve: "name",
     });
-    expect(leaf(r, "OrderControllerTest", "Paging", "firstPage()")?.own).toBe("skipped");
+    expect(leaf(r, "OrderControllerTest", "Paging", "firstPage")?.own).toBe("skipped");
     expect(r.summary).toMatchObject({ passed: 1, failed: 1, skipped: 1 });
+  });
+
+  it("moves gradle's console results to the reported classes", () => {
+    const r = results(
+      jvmParser(),
+      `OrderTest > creates order() FAILED
+    org.opentest4j.AssertionFailedError at OrderTest.kt:22
+`,
+    );
+    r.apply([
+      { type: "result", path: ["com.acme.OrderTest", "lists"], status: "passed" },
+      { type: "result", path: ["com.acme.OrderTest", "creates order"], status: "failed" },
+      { type: "result", path: ["com.acme.UserTest", "loads"], status: "passed" },
+      { type: "result", path: ["com.other.UserTest", "loads"], status: "passed" },
+    ]);
+    moveToReportedClasses(r, ["com.acme.OrderTest", "com.acme.UserTest", "com.other.UserTest"]);
+    expect(r.roots.map((n) => n.name)).toEqual(["com.acme.OrderTest", "com.acme.UserTest", "com.other.UserTest"]);
+    const failed = leaf(r, "com.acme.OrderTest", "creates order")!;
+    expect(failed.own).toBe("failed");
+    expect(failed.location).toMatchObject({ path: "OrderTest.kt", line: 22 });
+    expect(failed.output).not.toEqual([]);
+    expect(r.counts()).toMatchObject({ passed: 3, failed: 1 });
+    expect(r.get("OrderTest")).toBeUndefined();
+  });
+
+  it("reports each test from the gradle init script's service messages", () => {
+    const parser = jvmParser();
+    const r = results(
+      parser,
+      `> Task :test
+##teamcity[testStarted name='addsZero()' className='demo.CalcTest']
+##teamcity[testStdOut name='addsZero()' className='demo.CalcTest' out='adding zero|n']
+##teamcity[testFinished name='addsZero()' className='demo.CalcTest' duration='11']
+##teamcity[testStarted name='fails()' className='demo.CalcTest']
+##teamcity[testFailed name='fails()' className='demo.CalcTest' message='boom' details='org.opentest4j.AssertionFailedError: boom|n\tat app//org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)|n\tat app//demo.CalcTest.fails(CalcTest.java:21)|n']
+##teamcity[testFinished name='fails()' className='demo.CalcTest' duration='4']
+CalcTest > fails() FAILED
+    org.opentest4j.AssertionFailedError at CalcTest.java:21
+##teamcity[testStarted name='add(int)|[1|]' className='demo.ParamTest']
+##teamcity[testFailed name='add(int)|[1|]' className='demo.ParamTest' message='no' details='no']
+##teamcity[testFinished name='add(int)|[1|]' className='demo.ParamTest' duration='1']
+##teamcity[testStarted name='add(int)|[2|]' className='demo.ParamTest']
+##teamcity[testFinished name='add(int)|[2|]' className='demo.ParamTest' duration='1']
+##teamcity[testStarted name='later()' className='demo.ParamTest']
+##teamcity[testIgnored name='later()' className='demo.ParamTest']
+##teamcity[testFinished name='later()' className='demo.ParamTest' duration='0']
+`,
+    );
+    // Named like the XML reports, and not repeated under Gradle's simple class name.
+    expect(r.roots.map((n) => n.name)).toEqual(["demo.CalcTest", "demo.ParamTest"]);
+    expect(leaf(r, "demo.CalcTest", "addsZero")).toMatchObject({
+      own: "passed",
+      durationMs: 11,
+      output: ["adding zero"],
+    });
+    const failed = leaf(r, "demo.CalcTest", "fails")!;
+    expect(failed.own).toBe("failed");
+    expect(failed.output[0]).toBe("org.opentest4j.AssertionFailedError: boom");
+    expect(failed.location).toMatchObject({ path: "demo/CalcTest.java", line: 21, className: "demo.CalcTest" });
+    expect(leaf(r, "demo.ParamTest", "add")?.own).toBe("failed");
+    expect(leaf(r, "demo.ParamTest", "later")?.own).toBe("skipped");
+    expect(r.hasResult(["demo.CalcTest", "fails"])).toBe(true);
+    expect(r.hasResult(["demo.CalcTest", "other"])).toBe(false);
+  });
+
+  it("gives a class's own output from the gradle init script to the class", () => {
+    const r = results(
+      jvmParser(),
+      `##teamcity[testStdOut className='demo.CalcTest' out='class setUp|n']
+##teamcity[testStarted name='adds()' className='demo.CalcTest']
+##teamcity[testStdOut name='adds()' className='demo.CalcTest' out='adding|n']
+##teamcity[testFinished name='adds()' className='demo.CalcTest' duration='1']
+##teamcity[testStdOut className='demo.CalcTest' out='class tearDown|n']
+`,
+    );
+    const cls = r.get("demo.CalcTest")!;
+    expect(cls.children.map((c) => c.name)).toEqual(["adds"]);
+    expect(cls.output).toEqual(["class setUp", "class tearDown"]);
+    expect(nodeOutput(cls)).toEqual(["class setUp", "class tearDown", "adding"]);
+    expect(leaf(r, "demo.CalcTest", "adds")?.output).toEqual(["adding"]);
+  });
+
+  it("shows a test as running from its start", () => {
+    const r = new TestResults();
+    r.apply(jvmParser().feed("##teamcity[testStarted name='slow()' className='demo.SlowTest']"));
+    expect(leaf(r, "demo.SlowTest", "slow")?.own).toBe("running");
+    expect(r.hasResult(["demo.SlowTest", "slow"])).toBe(false);
   });
 
   it("parses surefire reports", () => {
@@ -400,6 +567,24 @@ org.opentest4j.AssertionFailedError: expected: <3> but was: <2>
     expect(r.get("com.acme.UserTest")?.own).toBe("passed");
     expect(r.summary).toMatchObject({ passed: 2, failed: 1 });
   });
+
+  it("locates a TestNG failure in the test, past TestNG's own frames", () => {
+    const r = results(
+      jvmParser(),
+      `[INFO] Running com.acme.PriceTest
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.2 s <<< FAILURE! -- in com.acme.PriceTest
+[ERROR] com.acme.PriceTest.rounds -- Time elapsed: 0.01 s <<< FAILURE!
+java.lang.AssertionError: expected [3] but found [2]
+	at org.testng.Assert.fail(Assert.java:111)
+	at org.testng.Assert.assertEquals(Assert.java:1080)
+	at com.acme.PriceTest.rounds(PriceTest.java:12)
+`,
+    );
+    expect(leaf(r, "com.acme.PriceTest", "rounds")?.location).toMatchObject({
+      path: "com/acme/PriceTest.java",
+      line: 12,
+    });
+  });
 });
 
 describe("parser selection", () => {
@@ -408,6 +593,10 @@ describe("parser selection", () => {
     expect(frameworkFor(cfg("cargo", "cargo", ["test"]))).toBe("cargo");
     expect(frameworkFor(cfg("npm", "pnpm", ["run", "test"]))).toBe("js");
     expect(frameworkFor(cfg("pytest", "uv", ["run", "pytest"]))).toBe("pytest");
+    expect(frameworkFor(cfg("django-test", ".venv/bin/python", ["manage.py", "test"]))).toBe("unittest");
+    expect(frameworkFor(cfg("shell", "python3 manage.py test polls"))).toBe("unittest");
+    expect(frameworkFor(cfg("python", ".venv/bin/python", ["manage.py", "test"]))).toBe("unittest");
+    expect(frameworkFor(cfg("python", ".venv/bin/python", ["-m", "pytest"]))).toBe("pytest");
     expect(frameworkFor(cfg("go", "go", ["test", "./..."]))).toBe("go");
     expect(frameworkFor(cfg("gradle", "./gradlew", ["test"]))).toBe("jvm");
     expect(frameworkFor(cfg("shell", "npx vitest run"))).toBe("js");
@@ -417,9 +606,14 @@ describe("parser selection", () => {
   it("the combined parser understands any supported format", () => {
     const r = results(
       createTestParser(cfg("make", "make", ["test"])),
-      "test a ... ok\n--- PASS: TestB (0.00s)\nok  \tpkg\t0.1s",
+      "test a ... ok\n--- PASS: TestB (0.00s)\nok  \tpkg\t0.1s\ntest_c (app.tests.CTests.test_c) ... ok\n" +
+        "Finished (0.5s)\ncompile (gcc.exe)",
     );
     expect(leaf(r, "a")?.own).toBe("passed");
+    expect(leaf(r, "app.tests", "CTests", "test_c")?.own).toBe("passed");
+    // Lines of other tools that only look like a unittest header make no tests.
+    expect(r.roots.map((n) => n.name)).not.toContain("0");
+    expect(r.roots.map((n) => n.name)).not.toContain("gcc");
     expect(leaf(r, "pkg", "TestB")?.own).toBe("passed");
   });
 });

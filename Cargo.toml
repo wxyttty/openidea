@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "src-tauri"]
+# Plugins and the guest SDK build for wasm32-wasip2 in their own workspaces.
+exclude = ["sdk", "plugins"]
 
 [workspace.package]
-version = "0.1.31"
+version = "0.1.50"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -36,16 +38,27 @@ ide-web = { path = "crates/ide-web" }
 ide-spell = { path = "crates/ide-spell" }
 ide-agent = { path = "crates/ide-agent" }
 ide-clipboard = { path = "crates/ide-clipboard" }
+ide-drag-out = { path = "crates/ide-drag-out" }
 ide-fonts = { path = "crates/ide-fonts" }
 ide-ssh = { path = "crates/ide-ssh" }
 ide-remote = { path = "crates/ide-remote" }
 ide-host = { path = "crates/ide-host" }
+ide-command = { path = "crates/ide-command" }
+ide-mcp = { path = "crates/ide-mcp" }
+ide-scaffold = { path = "crates/ide-scaffold" }
 ide-notebook = { path = "crates/ide-notebook" }
 ide-tools = { path = "crates/ide-tools" }
 ide-plugin = { path = "crates/ide-plugin" }
 ide-docker = { path = "crates/ide-docker" }
 ide-github = { path = "crates/ide-github" }
 ide-ui = { path = "crates/ide-ui" }
+ide-extension = { path = "crates/ide-extension" }
+ide-cli = { path = "crates/ide-cli" }
+ide-jvm-attach = { path = "crates/ide-jvm-attach" }
+ide-jvm-inspect = { path = "crates/ide-jvm-inspect" }
+ide-jdwp = { path = "crates/ide-jdwp" }
+ide-heap = { path = "crates/ide-heap" }
+ide-streams = { path = "crates/ide-streams" }
 
 # serialization & IPC typing
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +75,7 @@ parking_lot = "0.12"
 rayon = "1"
 dashmap = "6"
 futures = "0.3"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "__rustls-tls"] }
 
 # errors & diagnostics
 thiserror = "2"
@@ -78,18 +92,22 @@ ropey = "1.6"
 encoding_rs = "0.8"
 chardetng = "0.1"
 ignore = "0.4"
+base64 = "0.22"
 globset = "0.4"
 notify = "8"
-notify-debouncer-full = "0.6"
 trash = "5"
 blake3 = "1"
 dunce = "1"
 dirs = "6"
-zip = { version = "9", default-features = false, features = ["deflate"] }
+memmap2 = "0.9"
+zip = { version = "9.2.3", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
 
 # search, index, language
 grep-searcher = "0.1"
 grep-regex = "0.1"
+regex-syntax = "0.8"
 grep-matcher = "0.1"
 nucleo-matcher = "0.3"
 redb = "4"
@@ -105,12 +123,24 @@ portable-pty = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset", "socks", "gzip", "deflate", "brotli"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-platform-verifier = "0.7"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "mysql"] }
+# Until SQLx releases its libsqlite3-sys 0.39 update (RUSTSEC-2026-0459).
+sqlx = { version = "0.9", git = "https://github.com/l0ng-ai/sqlx", rev = "9894985a1babc7e6bc0437da4fd43e3143184073", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "mysql"] }
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "sql-browser-tokio"] }
+# Pure-Rust thin Oracle driver; pinned to the beta until it stabilizes.
+oracledb = "=26.0.0-beta.5"
 bb8 = "0.9"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 vt100 = "0.18"
+
+# OS credential stores
+keyring = "4.2"
+keyring-core = "1"
+# proc macros
+heck = "0.5"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
 
 # testing
 insta = { version = "1", features = ["yaml"] }
@@ -120,12 +150,20 @@ tempfile = "3"
 [profile.dev]
 # Keep debug builds snappy while giving dependencies decent speed.
 opt-level = 0
+# Full debug info is most of target/. Line tables keep file:line in our backtraces, but a
+# debugger can't show locals; re-enable with `--config profile.dev.debug=true`.
+debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
+# Dependency frames keep function names only. Re-enable one with
+# `--config 'profile.dev.package.<crate>.debug=true'`.
+debug = false
 
 [profile.release]
 codegen-units = 1
-lto = true
+# Thin LTO: fat LTO's whole-program link outgrew the 16 GB release runners
+# (Linux arm64 was killed mid-link from v0.1.39 on).
+lto = "thin"
 opt-level = 3
 # Unwind, so a panic fails one task or command instead of quitting the IDE.
 panic = "unwind"

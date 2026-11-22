@@ -10,6 +10,7 @@
  * Files (project view): references to the file's top-level symbols from other
  * files, when the language server can answer (`fileUsages`).
  */
+import { Channel } from "@tauri-apps/api/core";
 import type { EditorView } from "@codemirror/view";
 import type { Text } from "@codemirror/state";
 import type { LocalSymbol, Location, OutlineItem, Pos, Range, SyntaxNode } from "@/bindings";
@@ -21,11 +22,12 @@ import { structure } from "@/editor/structure";
 import { docOf, isUnavailable, lspRequest } from "@/editor/lsp/lsp";
 import { comparePos, offsetToPos, rangeContains, rangeToOffsets } from "@/editor/lsp/positions";
 import { showHint } from "@/editor/lsp/hint";
-import { ask, confirmChecked } from "@/workbench/messages";
+import { confirmChecked } from "@/workbench/messages";
 import { openPopup, type PreviewOccurrence } from "@/editor/lsp/popupStore";
 import { cannotPerform } from "./catalog";
 import { cancelled, languageName } from "./query";
-import { tx } from "@/platform/i18n";
+import { tx, txPart } from "@/platform/i18n";
+import { askUsagesDetected } from "./SafeDeleteUsages";
 
 // ---------------------------------------------------------------------------
 // Deletion range (pure)
@@ -254,56 +256,9 @@ async function findUsages(ctx: EditorDocContext, target: SafeDeleteTarget): Prom
   if (target.local)
     return target.local.references.filter((r) => outside(ctx.path, r)).map((range) => ({ path: ctx.path, range }));
   const { locations: refs } = await lspRequest(() =>
-    commands.lspReferences(nextRequestId(), ctx.doc, target.at, false, true),
+    commands.lspReferences(nextRequestId(), ctx.doc, target.at, false, true, false, new Channel()),
   );
   return refs.filter((l) => outside(l.path, l.range));
-}
-
-// ---------------------------------------------------------------------------
-// Usages Detected dialog
-
-export type UsagesAnswer = "view" | "delete" | "cancel";
-
-/** `subject`: "Function 'foo'", "File 'a.ts'", "3 files" (`plural`). */
-export function usagesMessage(
-  subject: string,
-  usages: readonly Location[],
-  plural = false,
-): { message: string; detail: string } {
-  const n = usages.length;
-  const files = new Set(usages.map((u) => u.path)).size;
-  const where = files > 1 ? tx` (in ${files} files)` : "";
-  let detail: string;
-  if (plural)
-    detail =
-      n === 1
-        ? tx`${subject} have ${n} usage that is not safe to delete${where}.`
-        : tx`${subject} have ${n} usages that are not safe to delete${where}.`;
-  else
-    detail =
-      n === 1
-        ? tx`${subject} has ${n} usage that is not safe to delete${where}.`
-        : tx`${subject} has ${n} usages that are not safe to delete${where}.`;
-  return { message: n === 1 ? tx`${n} usage found` : tx`${n} usages found`, detail };
-}
-
-/** IDEA's "Usages Detected" question; resolves "cancel" when dismissed. */
-export async function askUsagesDetected(
-  subject: string,
-  usages: readonly Location[],
-  plural = false,
-): Promise<UsagesAnswer> {
-  const { message, detail } = usagesMessage(subject, usages, plural);
-  const { button } = await ask({
-    title: "Usages Detected",
-    icon: "warning",
-    body: `${message}\n${detail}`,
-    buttons: [
-      { id: "view", label: "View Usages", primary: true },
-      { id: "delete", label: "Delete Anyway" },
-    ],
-  });
-  return button === "view" || button === "delete" ? button : "cancel";
 }
 
 /** Opens the Find Usages tool window with `usages` (code-insight's `find.showUsageResults`). */
@@ -365,7 +320,8 @@ export function textOccurrences(
   const out: { from: number; to: number }[] = [];
   for (let m = re.exec(text); m; m = re.exec(text)) {
     const from = m.index;
-    if (/[\p{L}\p{N}_$]$/u.test(text.slice(Math.max(0, from - 2), from))) continue;
+    // Not `[\p{L}\p{N}_$]$`: V8 (Node 26) misses an astral letter with a lone class before `$`.
+    if (/(?:\p{L}|\p{N}|[_$])$/u.test(text.slice(Math.max(0, from - 2), from))) continue;
     if (ids.has(from) || (from >= exclude.from && from < exclude.to)) continue;
     out.push({ from, to: from + name.length });
   }
@@ -408,7 +364,7 @@ function previewTextOccurrences(
   });
   openPopup({
     kind: "preview",
-    title: tx`Safe Delete ${target.kind} '${target.name}'`,
+    title: tx`Safe Delete ${txPart(target.kind)} '${target.name}'`,
     summary: {
       files: 1,
       occurrences: occurrences.length,
@@ -453,7 +409,8 @@ export async function safeDelete(view: EditorView): Promise<void> {
     // IDEA always confirms first; usages are searched after OK.
     const confirmed = await confirmChecked({
       title: "Safe Delete",
-      message: tx`Delete ${target.kind} '${target.name}'?`,
+      message: tx`Delete ${txPart(target.kind)} '${target.name}'?`,
+      presentation: "form",
       ok: "OK",
       checkbox: "Search in comments and strings",
       checked: searchInComments,
@@ -470,7 +427,7 @@ export async function safeDelete(view: EditorView): Promise<void> {
     ]);
     if (view.state.doc !== docBefore) return;
     if (usages.length) {
-      const answer = await askUsagesDetected(tx`${target.kind} '${target.name}'`, usages);
+      const answer = await askUsagesDetected(tx`${txPart(target.kind)} '${target.name}'`, usages);
       if (answer === "view") viewUsages(target.name, usages);
       else if (answer === "delete") applyDeletion(view, docBefore, target, comments);
       else view.focus();
@@ -506,8 +463,19 @@ export type FileUsages =
   /** The language server can't tell (none running, no document symbols…). */
   | { status: "unsupported"; reason: string };
 
-/** At most this many top-level symbols per file are searched. */
+/** At most this many symbols per file are searched. */
 const MAX_SYMBOLS = 60;
+
+/**
+ * The symbols a file declares at its top level. Packages and namespaces are shared
+ * with other files (IDEA searches a Java file's classes, not its package), so their
+ * members stand in for them.
+ */
+function declaredSymbols(items: readonly OutlineItem[]): OutlineItem[] {
+  return items.flatMap((it) =>
+    it.kind === "package" || it.kind === "namespace" ? declaredSymbols(it.children) : [it],
+  );
+}
 
 async function withDoc<T>(path: string, fn: (doc: number) => Promise<T>): Promise<T> {
   const open = editorsFor(path)[0];
@@ -521,7 +489,7 @@ async function withDoc<T>(path: string, fn: (doc: number) => Promise<T>): Promis
 }
 
 /**
- * References from outside `paths` to the top-level symbols the files declare.
+ * References from outside `paths` to the symbols the files declare ({@link declaredSymbols}).
  * Unsupported when no reference search could run for any of them.
  */
 export async function fileUsages(paths: readonly string[], signal?: AbortSignal): Promise<FileUsages> {
@@ -535,14 +503,22 @@ export async function fileUsages(paths: readonly string[], signal?: AbortSignal)
     try {
       await withDoc(path, async (doc) => {
         const outline = await call(commands.docOutline(doc));
-        for (const item of outline.slice(0, MAX_SYMBOLS)) {
+        for (const item of declaredSymbols(outline).slice(0, MAX_SYMBOLS)) {
           if (signal?.aborted) return;
           let refs: Location[];
           try {
             // Every symbol of every file: the server's own scope (a project search each would be too slow).
             refs = (
               await lspRequest(() =>
-                commands.lspReferences(nextRequestId(), doc, item.selection_range.start, false, false),
+                commands.lspReferences(
+                  nextRequestId(),
+                  doc,
+                  item.selection_range.start,
+                  false,
+                  false,
+                  false,
+                  new Channel(),
+                ),
               )
             ).locations;
           } catch (e) {

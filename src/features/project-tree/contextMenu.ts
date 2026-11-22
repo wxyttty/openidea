@@ -1,12 +1,15 @@
 /** Context menu and "New" popup of the project view. */
 import { executeAction, getAction } from "@/platform/actions";
+import { getContext } from "@/platform/context";
+import { canOpenWithSystemApp, canRevealInFileManager, fileManagerName } from "@/platform/fileManager";
 import { formatBinding, hostBinding, isMacHost, shortcutLabel } from "@/platform/keymap";
-import { relativePath, useProject } from "@/platform/project";
-import { currentDetectedRoots, currentRoots } from "@/platform/projectRoots";
+import { projectFolder, relativePath, useProject } from "@/platform/project";
+import { attachedProjectOf, currentDetectedRoots, currentRoots } from "@/platform/projectRoots";
 import type { MenuItem } from "@/ui";
 import { menuGroupItems, toolWindowService, type MenuGroupContext } from "@/workbench/contributions";
 import type { FolderRole } from "@/platform/languageSettings";
 import { directoryRole, markDirectory } from "./markDirectory";
+import { fileColorMenu } from "./fileColor";
 import type { ProjectNode } from "./model";
 import { packageKindAt } from "./packages";
 import {
@@ -23,13 +26,18 @@ import {
   openFile,
   openMoveDialog,
   openRenameDialog,
+  openSelectionInRightSplit,
   paste,
+  openWithAssociatedApp,
+  reformatNodes,
   reloadFromDisk,
   revealInFinder,
   vcsArg,
 } from "./operations";
+import { canDownload } from "./download";
 import { isSameOrInside } from "./paths";
-import { tx } from "@/platform/i18n";
+import { useProjectTree } from "./store";
+import { tx, txPart } from "@/platform/i18n";
 
 /** Keys handled by the project view itself (the default keymap has no entries for them). */
 export const LOCAL_KEYS: Record<string, string> = {
@@ -46,6 +54,21 @@ export const LOCAL_KEYS: Record<string, string> = {
 
 export const keyLabel = (id: string) =>
   shortcutLabel(id) ?? (LOCAL_KEYS[id] ? formatBinding(hostBinding(LOCAL_KEYS[id])) : undefined);
+
+/**
+ * The comparison for a selection, shared by the context menu and Compare With… (⌘D): two folders,
+ * two files or one node. Mixed file/folder selections cannot apply.
+ */
+export function compareTarget(nodes: ProjectNode[]): { action: string; arg: unknown; label: string } | null {
+  if (nodes.length === 2 && nodes.every((n) => n.dir && !n.placeholder))
+    return { action: "diff.compareDirectories", arg: nodes.map((n) => n.path), label: "Compare Directories" };
+  if (nodes.length === 2 && nodes.every((n) => !n.dir))
+    return { action: "diff.compareFiles", arg: nodes.map((n) => n.path), label: "Compare Files" };
+  const single = nodes.length === 1 ? nodes[0]! : null;
+  if (!single || single.placeholder) return null;
+  const arg = single.dir ? { path: single.path, directory: true } : single.path;
+  return { action: "diff.compareWith", arg, label: "Compare With…" };
+}
 
 /**
  * New › items for `parent`. `outsideTree` (⌘N in the editor): File asks for the
@@ -103,7 +126,12 @@ function showProjectView() {
 
 /** File kinds contributed to the `new` menu group (templates, HTTP Request, Scratch File…). */
 function contributedNewItems(parent: string | null): MenuItem[] {
-  const items = menuGroupItems("new", parent ? { paths: [parent], dirs: [true] } : { paths: [] });
+  const owner = parent ? projectFolder(useProject.getState().project, parent) : null;
+  const projectType =
+    parent && owner && isSameOrInside(parent, owner.root)
+      ? useProjectTree.getState().projectTypes.get(owner.root)
+      : undefined;
+  const items = menuGroupItems("new", parent ? { paths: [parent], dirs: [true], projectType } : { paths: [] });
   return items.length ? [{ kind: "separator" }, ...items] : [];
 }
 
@@ -132,12 +160,7 @@ function submenu(id: string, label: string, entries: Entry[], icon?: string): Me
   return { id, label, icon, submenu: items };
 }
 
-/**
- * IDEA's ProjectViewPopupMenu: New / clipboard / find / Refactor / edit /
- * Run group / Open In / Local History / Git / Compare / Mark Directory as.
- * Items that cannot apply to the selection are hidden (or disabled, like IDEA's
- * clipboard group), so the project root and Scratches get a shorter menu.
- */
+/** Project view actions available for the selected files and directories. */
 export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
   if (nodes.some((n) => n.readOnly)) return libraryMenuItems(nodes.filter((n) => !n.group));
   const lead = nodes[0] ?? null;
@@ -149,16 +172,35 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
   const project = useProject.getState().project;
   // Scratches and other contributed roots live outside the project: no VCS, roots or LSP usages.
   const inProject = !!project && nodes.every((n) => isSameOrInside(n.path, project.root));
+  // Workspace members may live outside the workspace folder; they have VCS and usages too.
+  const memberRoots = project ? [project.root, ...(project.workspace?.projects ?? [])] : [];
+  const inWorkspace = nodes.every((n) => memberRoots.some((root) => isSameOrInside(n.path, root)));
   const items: MenuItem[] = [];
   const push = (...list: Entry[]) => list.forEach((i) => i && items.push(i));
 
-  if (single && project?.workspace && project.workspace.projects.includes(single.path)) {
-    push({ kind: "action", action: "workspace.removeProject", arg: single.path }, { kind: "separator" });
+  if (
+    single &&
+    project?.workspace &&
+    single.path !== project.root &&
+    project.workspace.projects.includes(single.path)
+  ) {
+    push(
+      {
+        kind: "action",
+        action: project.workspace.projects[0] === project.root ? "project.detach" : "workspace.removeProject",
+        arg: single.path,
+      },
+      { kind: "separator" },
+    );
   }
 
-  push({ id: "new", label: "New", submenu: newMenuItems(folder) }, { kind: "separator" });
+  push(
+    { id: "new", label: "New", submenu: newMenuItems(folder) },
+    single?.root && act("maven.importExternal", undefined, "Import Module from Existing Sources"),
+    { kind: "separator" },
+  );
 
-  // Cut / Copy / Copy Path/Reference… / Paste
+  // Clipboard and opening files.
   push(
     {
       id: "cut",
@@ -188,6 +230,8 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         },
         { id: "name", label: "File Name", run: () => void copyPaths("name", nodes) },
         { id: "rel", label: "Path From Content Root", run: () => void copyPaths("relative", nodes) },
+        { kind: "separator" },
+        ...menuGroupItems("copyPath", menuGroupContext(nodes)),
       ],
     },
     {
@@ -198,11 +242,6 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       disabled: !canPaste(),
       run: () => void paste(folder),
     },
-    { kind: "separator" },
-  );
-
-  // Jump to Source / Find Usages / Find in Files… / Replace in Files…
-  push(
     files.length > 0 && {
       id: "jumpToSource",
       label: "Jump to Source",
@@ -210,7 +249,11 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       shortcut: keyLabel("project.open"),
       run: () => files.forEach((f) => void openFile(f.path)),
     },
-    inProject &&
+    { kind: "separator" },
+  );
+
+  push(
+    inWorkspace &&
       singleFile && {
         id: "findUsages",
         label: "Find Usages",
@@ -222,16 +265,17 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
-  // Refactor ›
+  const rename: Entry = single &&
+    !single.root && {
+      id: "rename",
+      label: "Rename…",
+      shortcut: keyLabel("project.rename"),
+      run: () => void openRenameDialog(single),
+    };
   push(
+    rename,
     submenu("refactor", "Refactor", [
-      single &&
-        !single.root && {
-          id: "rename",
-          label: "Rename…",
-          shortcut: keyLabel("project.rename"),
-          run: () => void openRenameDialog(single),
-        },
+      rename,
       nonRoot.length > 0 && {
         id: "move",
         label: nonRoot.length === 1 ? (nonRoot[0]!.dir ? "Move Directory…" : "Move File…") : "Move…",
@@ -252,25 +296,6 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         run: () => void deleteSelection(nodes),
       },
     ]),
-    { kind: "separator" },
-  );
-
-  // Reformat Code / Optimize Imports / Delete…
-  push(
-    singleFile &&
-      getAction("code.reformatFile") && {
-        id: "reformat",
-        label: "Reformat Code",
-        shortcut: keyLabel("project.reformatCode"),
-        run: () => void delegate("code.reformatFile", { path: singleFile.path }),
-      },
-    singleFile &&
-      getAction("code.optimizeImportsFile") && {
-        id: "optimizeImports",
-        label: "Optimize Imports",
-        shortcut: keyLabel("project.optimizeImports"),
-        run: () => void delegate("code.optimizeImportsFile", { path: singleFile.path }),
-      },
     {
       id: "delete",
       label: "Delete…",
@@ -281,41 +306,71 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
+  push(
+    nodes.some((n) => !n.group) &&
+      getAction(singleFile ? "code.reformatFile" : "code.reformatFiles") && {
+        id: "reformat",
+        label: "Reformat Code",
+        shortcut: keyLabel("project.reformatCode"),
+        run: () => void reformatNodes(nodes),
+      },
+    singleFile &&
+      getAction("code.optimizeImportsFile") && {
+        id: "optimizeImports",
+        label: "Optimize Imports",
+        shortcut: keyLabel("project.optimizeImports"),
+        run: () => void delegate("code.optimizeImportsFile", { path: singleFile.path }),
+      },
+    { kind: "separator" },
+  );
+
   // Contributed groups (Run / Debug '…', More Run/Debug ›), each followed by a separator.
   push(...menuGroupItems("projectView", menuGroupContext(nodes)));
 
-  // Open In ›
+  // Open in Right Split / Open In ›
   push(
+    files.length > 0 && openInRightSplitItem(files),
     submenu("openIn", "Open In", [
-      { id: "finder", label: revealLabel(), icon: "external-link", run: () => void revealInFinder(nodes) },
+      canRevealInFileManager() && {
+        id: "finder",
+        label: revealLabel(),
+        icon: "external-link",
+        run: () => void revealInFinder(nodes),
+      },
+      files.length > 0 &&
+        canOpenWithSystemApp() && {
+          id: "associatedApp",
+          label: "Associated Application",
+          icon: "external-link",
+          run: () => void openWithAssociatedApp(files),
+        },
       folder && getAction("terminal.openAt")
         ? { id: "terminal", label: "Terminal", icon: "terminal", run: () => void delegate("terminal.openAt", folder) }
         : null,
       { kind: "separator" },
       ...menuGroupItems("openIn", menuGroupContext(nodes)),
     ]),
+    inWorkspace &&
+      canDownload() &&
+      delegated(
+        "project.downloadTo",
+        nodes.map((n) => n.path),
+        "Download to…",
+        { icon: "download" },
+      ),
     { kind: "separator" },
   );
 
-  // Local History › / Reload from Disk
   push(
     single &&
       submenu("history", "Local History", [
         delegated("vcs.localHistory", single.path, "Show History"),
         delegated("localHistory.putLabel", undefined, "Put Label…"),
       ]),
-    {
-      id: "reload",
-      label: "Reload from Disk",
-      icon: "refresh",
-      shortcut: keyLabel("project.reloadFromDisk"),
-      run: () => void reloadFromDisk(nodes),
-    },
-    { kind: "separator" },
   );
 
-  // Git ›
-  if (inProject && project?.isGit) {
+  // Git › (`vcsAvailable` also covers repositories nested below a non-Git project root)
+  if (inWorkspace && (project?.isGit || getContext().vcsAvailable === true)) {
     const arg = vcsArg(nodes);
     const dirs = nodes.some((n) => n.dir);
     push(
@@ -335,15 +390,19 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
           { kind: "separator" },
           singleFile && act("vcs.annotate", singleFile.path, "Annotate with Git Blame"),
           act("vcs.showDiff", arg, "Show Diff"),
-          singleFile && act("vcs.compareWithBranch", { path: singleFile.path }, "Compare with Branch…"),
+          nodes.length > 0 &&
+            nodes.every((n) => !n.placeholder) &&
+            act("vcs.compareWithBranch", arg, "Compare with Branch…"),
+          singleFile && act("vcs.compareWithRevision", singleFile.path, "Compare with Revision…"),
           nodes.length > 0 && nodes.every((n) => !n.placeholder) && act("vcs.showHistory", arg, "Show History"),
+          singleFile && act("vcs.showCurrentRevision", singleFile.path, "Show Current Revision"),
           act("vcs.rollback", arg, "Rollback…"),
           { kind: "separator" },
           act("vcs.push", undefined, "Push…"),
-          act("vcs.update", undefined, "Pull…"),
+          act("vcs.pull", arg, "Pull…"),
           act("vcs.fetch", undefined, "Fetch"),
-          act("vcs.merge", undefined, "Merge…"),
-          act("vcs.rebase", undefined, "Rebase…"),
+          act("vcs.merge", arg, "Merge…"),
+          act("vcs.rebase", arg, "Rebase…"),
           { kind: "separator" },
           act("vcs.branches", undefined, "Branches…"),
           act("vcs.newBranch", undefined, "New Branch…"),
@@ -352,40 +411,50 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
           { kind: "separator" },
           act("vcs.stash", undefined, "Stash Changes…"),
           act("vcs.unstash", undefined, "Unstash Changes…"),
+          { kind: "separator" },
+          act("vcs.manageRemotes", undefined, "Manage Remotes…"),
+          act("vcs.clone", undefined, "Clone…"),
         ],
         "branch",
       ),
-      { kind: "separator" },
     );
   }
 
-  // IDEA: Compare With… (one file) / Compare Files (two files).
-  if (files.length === 2 && nodes.length === 2)
+  push(
+    {
+      id: "reload",
+      label: "Reload from Disk",
+      icon: "refresh",
+      shortcut: keyLabel("project.reloadFromDisk"),
+      run: () => void reloadFromDisk(nodes),
+    },
+    { kind: "separator" },
+  );
+
+  const compare = compareTarget(nodes);
+  if (compare)
     push(
-      delegated(
-        "diff.compareFiles",
-        files.map((f) => f.path),
-        "Compare Files",
-        { icon: "diff" },
-      ),
-    );
-  else if (singleFile)
-    push(
-      delegated("diff.compareWith", singleFile.path, "Compare With…", {
+      delegated(compare.action, compare.arg, compare.label, {
         icon: "diff",
         shortcut: keyLabel("project.compareWith"),
       }),
     );
 
-  if (inProject && single?.dir && !single.root && !single.placeholder) {
+  push({ kind: "separator" });
+
+  // An attached project keeps its own excluded folders; its other roles aren't applied yet.
+  const attached = !inProject && single?.dir ? attachedProjectOf(single.path) : null;
+  if ((inProject || attached) && single?.dir && !single.root && !single.placeholder) {
     const current = directoryRole(single.path);
-    const roles: Array<[FolderRole, string, string]> = [
-      ["source", "Sources Root", "folder-source"],
-      ["test", "Test Sources Root", "folder-test"],
-      ["resources", "Resources Root", "folder-resources"],
-      ["testResources", "Test Resources Root", "folder-test-resources"],
-      ["excluded", "Excluded", "folder-excluded"],
-    ];
+    const roles: Array<[FolderRole, string, string]> = (
+      [
+        ["source", "Sources Root", "folder-source"],
+        ["test", "Test Sources Root", "folder-test"],
+        ["resources", "Resources Root", "folder-resources"],
+        ["testResources", "Test Resources Root", "folder-test-resources"],
+        ["excluded", "Excluded", "folder-excluded"],
+      ] as Array<[FolderRole, string, string]>
+    ).filter(([role]) => !attached || role === "excluded");
     push({
       id: "markAs",
       label: "Mark Directory as",
@@ -393,12 +462,14 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         ...roles
           .filter(([role]) => role !== current)
           .map(([role, label, icon]) => ({ id: role, label, icon, run: () => void markDirectory(single.path, role) })),
-        ...(current
+        ...(current && (!attached || current === "excluded")
           ? [
               {
                 id: "unmark",
                 label:
-                  current === "excluded" ? "Cancel Exclusion" : tx`Unmark as ${roles.find(([r]) => r === current)![1]}`,
+                  current === "excluded"
+                    ? "Cancel Exclusion"
+                    : tx`Unmark as ${txPart(roles.find(([r]) => r === current)![1])}`,
                 run: () => void markDirectory(single.path, null),
               },
             ]
@@ -406,7 +477,21 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       ],
     });
   }
+  if (inProject && single && !single.root && !single.placeholder && !single.group) {
+    const color = fileColorMenu(single.path, single.dir);
+    if (color) push(color);
+  }
   return items;
+}
+
+function openInRightSplitItem(files: ProjectNode[]): MenuItem {
+  return {
+    id: "openInRightSplit",
+    label: "Open in Right Split",
+    icon: "split",
+    shortcut: keyLabel("project.openInRightSplit"),
+    run: () => void openSelectionInRightSplit(files),
+  };
 }
 
 /** Library sources (External Libraries) are read-only: copy, find and reveal only. */
@@ -432,8 +517,21 @@ function libraryMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
     !!folder && delegated("find.inPath", { directory: folder }, "Find in Files…", { icon: "search" }),
     !!folder && { kind: "separator" },
+    nodes.every((n) => !n.dir) && openInRightSplitItem(nodes),
     submenu("openIn", "Open In", [
-      { id: "finder", label: revealLabel(), icon: "external-link", run: () => void revealInFinder(nodes) },
+      canRevealInFileManager() && {
+        id: "finder",
+        label: revealLabel(),
+        icon: "external-link",
+        run: () => void revealInFinder(nodes),
+      },
+      nodes.every((n) => !n.dir) &&
+        canOpenWithSystemApp() && {
+          id: "associatedApp",
+          label: "Associated Application",
+          icon: "external-link",
+          run: () => void openWithAssociatedApp(nodes),
+        },
     ]),
     single &&
       !single.dir &&
@@ -446,10 +544,7 @@ function libraryMenuItems(nodes: ProjectNode[]): MenuItem[] {
 }
 
 export function revealLabel() {
-  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-  if (/Win/i.test(ua)) return "Explorer";
-  if (/Linux/i.test(ua)) return "Files";
-  return "Finder";
+  return fileManagerName();
 }
 
 /** What contributed menu groups see: the selected (non-placeholder) paths. */

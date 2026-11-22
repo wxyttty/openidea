@@ -5,8 +5,8 @@
  * files change, then the move itself — one step that Undo reverts.
  */
 import type { FileMove, UndoOutcome, WorkspaceEdit } from "@/bindings";
-import { openEditorPaths } from "@/editor/api";
-import { call, commands, emitLocalIdeEvent, isCancelled, isTauri, nextRequestId } from "@/platform/ipc";
+import { saveAllQuietly, withEditorsFollowing } from "@/editor/fileMoves";
+import { call, commands, isCancelled, isTauri, nextRequestId } from "@/platform/ipc";
 import { maybeEditorService, notifications } from "@/workbench/contributions";
 import { projectFs } from "./fs";
 import { isSameOrInside, nameOf, parentOf } from "./paths";
@@ -129,9 +129,15 @@ function overlaps(a: { start: { line: number; col: number }; end: { line: number
  * Only text edits are kept: the move itself is the refactoring's file operation.
  */
 export function mergeEdits(lsp: WorkspaceEdit, text: WorkspaceEdit): WorkspaceEdit {
+  const versions = new Map<string, number | null | undefined>();
+  const guards: WorkspaceEdit["files"] = [];
   const byPath = new Map<string, Extract<WorkspaceEdit["files"][number], { kind: "edit" }>["edits"]>();
   for (const f of lsp.files) {
     if (f.kind !== "edit") continue;
+    const previous = versions.get(f.path);
+    if (previous != null && f.version != null && previous !== f.version)
+      guards.push({ ...f, edits: [], version: previous });
+    versions.set(f.path, f.version ?? previous);
     byPath.set(f.path, [...(byPath.get(f.path) ?? []), ...f.edits]);
   }
   for (const f of text.files) {
@@ -140,7 +146,15 @@ export function mergeEdits(lsp: WorkspaceEdit, text: WorkspaceEdit): WorkspaceEd
     const extra = f.edits.filter((t) => !existing.some((e) => overlaps(e.range, t.range)));
     if (extra.length) byPath.set(f.path, [...existing, ...extra]);
   }
-  return { files: [...byPath].filter(([, e]) => e.length).map(([path, edits]) => ({ kind: "edit", path, edits })) };
+  return {
+    files: [
+      ...guards,
+      ...[...byPath]
+        .filter(([, e]) => e.length)
+        .map(([path, edits]) => ({ kind: "edit" as const, path, edits, version: versions.get(path) })),
+    ],
+    preconditions: [...(lsp.preconditions ?? []), ...(text.preconditions ?? [])],
+  };
 }
 
 /** Whether `edit` changes files other than the moved ones (IDEA previews those refactorings). */
@@ -151,50 +165,13 @@ export function touchesOtherFiles(edit: WorkspaceEdit, moves: readonly FileMove[
 }
 
 // ---------------------------------------------------------------------------
-// Editors follow the move
-
-async function saveAllQuietly(editor: { saveAll(): Promise<void> }) {
-  try {
-    await editor.saveAll();
-  } catch {
-    /* unsaved files are reported by the editor */
-  }
-}
-
-/** `path` after `moves`. */
-export function movedPath(path: string, moves: readonly FileMove[]): string {
-  let p = path;
-  for (const m of moves) if (isSameOrInside(p, m.from)) p = m.to + p.slice(m.from.length);
-  return p;
-}
-
-/** IDEA retargets editors of moved files: unsaved changes are saved first, tabs reopen at the new paths. */
-async function withEditorsFollowing<T>(run: () => Promise<T>, done: (r: T) => FileMove[]): Promise<T> {
-  const editor = maybeEditorService();
-  const openBefore = editor ? openEditorPaths() : [];
-  if (editor) await saveAllQuietly(editor);
-  const active = editor?.activePath() ?? null;
-  const result = await run();
-  const applied = done(result);
-  const open = openBefore.filter((p) => applied.some((m) => isSameOrInside(p, m.from)));
-  if (applied.length)
-    emitLocalIdeEvent({
-      type: "fsChanged",
-      created: applied.map((m) => m.to),
-      modified: [],
-      removed: applied.map((m) => m.from),
-    });
-  if (!editor || !open.length) return result;
-  const ordered = active && open.includes(active) ? [...open.filter((p) => p !== active), active] : open;
-  for (const p of ordered) await editor.openFile(movedPath(p, applied), { focus: false }).catch(() => {});
-  if (active && !open.includes(active)) await editor.openFile(active, { focus: false }).catch(() => {});
-  return result;
-}
-
-// ---------------------------------------------------------------------------
 // Run / undo
 
-let lastMove: { id: number; title: string } | null = null;
+let lastMove: { id: number; title: string; seq: number } | null = null;
+let fileOperations = 0;
+
+/** Orders file operations (move / rename, delete) for Undo, which reverts the latest. */
+export const nextFileOperation = () => ++fileOperations;
 
 /** The latest file refactoring that Undo reverts. */
 export function lastFileRefactoring() {
@@ -256,7 +233,7 @@ export async function runFileRefactoring(
     });
     return "failed";
   }
-  lastMove = { id, title };
+  lastMove = { id, title, seq: nextFileOperation() };
   if (collected.errors.length)
     notifications().notify({
       level: "warning",

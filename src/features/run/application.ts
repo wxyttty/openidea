@@ -5,14 +5,22 @@
  */
 import type { RunConfig } from "@/platform/ipc";
 import { CLASSPATH, TEST_CLASSPATH, jvmModuleDir } from "@/platform/javaLaunch";
-import { isTestPath } from "@/platform/languageSettings";
+import { isTestPath, rootFor } from "@/platform/languageSettings";
 import { currentRoots } from "@/platform/projectRoots";
 import { simpleClassName } from "./jvmTargets";
+import { withMavenTests } from "./mavenTests";
 
 export { jvmModuleDir } from "@/platform/javaLaunch";
 
-/** In a test source root (detected or marked in Project Structure), or Maven's `src/test`. */
-const isTestSource = (relPath: string) => /(^|\/)src\/test\//.test(relPath) || isTestPath(currentRoots(), relPath);
+/**
+ * In a test source root, as IDEA's `getClasspathType` decides: the root holding the file
+ * (synced from Gradle, detected or marked in Project Structure) wins; `src/test` only
+ * while no root is known for the file.
+ */
+const isTestSource = (relPath: string) => {
+  const roots = currentRoots();
+  return rootFor(roots, relPath) ? isTestPath(roots, relPath) : /(^|\/)src\/test\//.test(relPath);
+};
 
 /** Temporary "Application" configuration that runs `className` (a binary name). */
 export function applicationConfig(
@@ -21,13 +29,16 @@ export function applicationConfig(
   configs: readonly RunConfig[] = [],
 ): RunConfig {
   const module = jvmModuleDir(relPath, configs);
+  const id = `application:${module ? `${module}:` : ""}${target.className}`;
+  // Project detection also recognises annotations carrying @SpringBootApplication.
+  const spring = target.spring || configs.some((c) => c.id === id && c.kind === "spring-boot");
   return {
-    id: `application:${module ? `${module}:` : ""}${target.className}`,
+    id,
     name: simpleClassName(target.className),
-    kind: target.spring ? "spring-boot" : "application",
+    kind: spring ? "spring-boot" : "application",
     command: "java",
     args: ["-cp", isTestSource(relPath) ? TEST_CLASSPATH : CLASSPATH, target.className],
-    cwd: module || null,
+    cwd: null,
     module,
     env: {},
     detected: true,
@@ -39,7 +50,7 @@ export function applicationConfig(
 /**
  * Narrows a Maven / Gradle test configuration to a class (`method` unset) or
  * one method: Surefire `-Dtest=Class#method`, Gradle `--tests Class.method`.
- * `fileConfig` is the file-level configuration whose last argument is the file filter.
+ * `fileConfig` is the file-level configuration; for Gradle its last argument is the file filter.
  */
 export function jvmTestConfig(fileConfig: RunConfig, className: string, method: string | undefined): RunConfig | null {
   const args = fileConfig.args.slice(0, -1);
@@ -53,7 +64,7 @@ export function jvmTestConfig(fileConfig: RunConfig, className: string, method: 
         id,
         name,
         env: { ...fileConfig.env },
-        args: [...args, `-Dtest=${className}${method ? `#${method}` : ""}`, "-Dsurefire.failIfNoSpecifiedTests=false"],
+        args: withMavenTests(fileConfig.args, `${className}${method ? `#${method}` : ""}`),
       };
     case "gradle":
       return {

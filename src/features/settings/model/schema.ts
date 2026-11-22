@@ -4,9 +4,13 @@
  * so `validateSettings` never throws — anything unknown or malformed falls
  * back to the default (mirrors `ide-core::settings` defaults).
  */
+import { DEFAULT_FILE_COLORS, validateFileColors, type FileColorSettings } from "@/platform/fileColors";
+import { validateScopes, type NamedScope } from "@/platform/scopes";
+import { validateCMake } from "@/platform/cmakeSettings";
+import { SUPPORTED_LOCALES, type Locale } from "@/platform/i18n";
 import { DEFAULT_IGNORED_NAMES } from "@/platform/ignoredNames";
 import { validateFileTypeOverrides, validateFileTypes, type FileTypeAssociations } from "@/platform/fileTypes";
-import type { LanguageServerSettings, Settings } from "@/platform/ipc";
+import type { AgentSettings, LanguageServerSettings, Settings } from "@/platform/ipc";
 import {
   DEFAULT_LANGUAGES,
   DEFAULT_PROJECT_STRUCTURE,
@@ -16,7 +20,13 @@ import {
   type ProjectStructureValid,
 } from "@/platform/languageSettings";
 import { EDITOR_EXTRA_DEFAULTS, validateEditorExtras, type EditorExtras } from "@/platform/editorSettings";
-import { DEFAULT_WORKFLOW, validateWorkflow, type WorkflowSettings } from "@/platform/workflowSettings";
+import {
+  DEFAULT_AGENT_RUNS,
+  DEFAULT_WORKFLOW,
+  validateAgentRuns,
+  validateWorkflow,
+  type WorkflowSettings,
+} from "@/platform/workflowSettings";
 import { DEFAULT_INSPECTIONS, validateInspections, type InspectionSettingsValid } from "@/platform/inspections";
 import { DEFAULT_PROXY, validateProxy, type ProxySettingsValid } from "@/platform/proxySettings";
 import {
@@ -30,10 +40,20 @@ import {
   type GeneralExtras,
   type NotificationsValid,
 } from "./behaviorSchema";
-import { BUILTIN_THEME_IDS, type BuiltinThemeId } from "@/platform/themes";
+import { isThemeChoiceId, type ThemeChoiceId } from "@/platform/themes";
 
-export type ThemeId = BuiltinThemeId | "system";
-export type LocaleId = "en" | "zh";
+/** Agents › IDE MCP Server › Port: its default (`ide-core::settings::DEFAULT_MCP_PORT`) and range. */
+export const DEFAULT_MCP_PORT = 26371;
+export const MCP_PORT_LIMITS = { min: 1, max: 65535 };
+/** Agents › IDE MCP Server › Background projects: the idle minutes (0 = never unload) and the project limit. */
+export const MCP_BACKGROUND_IDLE_LIMITS = { min: 0, max: 1440 };
+export const MCP_BACKGROUND_PROJECT_LIMITS = { min: 1, max: 32 };
+export const MCP_BACKGROUND_MODES = ["off", "trusted", "listed"] as const;
+/** Agents › IDE MCP Server › Listen address: its default (`ide-core::settings::DEFAULT_MCP_ADDRESS`). */
+export const DEFAULT_MCP_ADDRESS = "127.0.0.1";
+
+/** A built-in theme, a plugin's (`plugin:<id>/<theme>`) or the legacy `"system"`. */
+export type ThemeId = ThemeChoiceId | "system";
 
 /** A user keymap (Keymap › Duplicate…): its own overrides on top of a bundled preset. */
 export interface CustomKeymapSettings {
@@ -43,8 +63,20 @@ export interface CustomKeymapSettings {
 }
 
 export interface ValidSettings extends WorkflowSettings {
-  general: { reopenLastProject: boolean; confirmExit: boolean } & GeneralExtras;
-  appearance: { theme: ThemeId; accent: string; uiFontSize: number; locale: LocaleId } & AppearanceExtras;
+  plugins: Record<string, Record<string, unknown>>;
+  scopes: NamedScope[];
+  fileColors: FileColorSettings;
+  /** Database › Query Execution. */
+  database: { inEditorResults: boolean; resolutionScopes: Array<{ path: string; dataSource: string; schema: string }> };
+  general: {
+    reopenLastProject: boolean;
+    confirmExit: boolean;
+    /** Last window closes instead of showing the Welcome screen. */
+    closeWithoutWelcome: boolean;
+    /** Closing a window drops its saved editor tabs. */
+    closeTabsWithWindow: boolean;
+  } & GeneralExtras;
+  appearance: { theme: ThemeId; accent: string; uiFontSize: number; locale: Locale } & AppearanceExtras;
   editor: {
     fontFamily: string;
     fontSize: number;
@@ -75,13 +107,18 @@ export interface ValidSettings extends WorkflowSettings {
     fileTypes: FileTypeAssociations;
     /** Override File Type: file → language id (project scope). */
     fileTypeOverrides: Record<string, string>;
+    /** Files opened in associated applications: file-name patterns. */
+    associatedApplications: string[];
   };
   keymapOverrides: Record<string, string[]>;
   customKeymaps: Record<string, CustomKeymapSettings>;
   notifications: NotificationsValid;
   /** System Settings › HTTP Proxy (global). */
   proxy: ProxySettingsValid;
+  /** Tools › Download sources: a mirror prefix for the installer's release downloads. */
+  toolDownloads: { githubMirror: string };
   languages: LanguagesValid;
+  cmake: ReturnType<typeof validateCMake>;
   projectStructure: ProjectStructureValid;
   inspections: InspectionSettingsValid;
   /** Editor › Natural Languages › Spelling. */
@@ -90,6 +127,30 @@ export interface ValidSettings extends WorkflowSettings {
   tools: Record<string, { path: string }>;
   /** Settings › Language Servers, by server name (as the backend sends them). */
   languageServers: Record<string, LanguageServerEntry>;
+  /** Tools › Agents › Chat: the meters in an agent task's header. */
+  agents: Required<AgentSettings>;
+  /** Agents › IDE MCP Server (global). */
+  mcpServer: {
+    enabled: boolean;
+    runWithoutConfirmation: boolean;
+    agentTabLimit: number;
+    agentArchiveLimit: number;
+    /** The IP address to listen on (`127.0.0.1`: this computer only); the backend checks it. */
+    address: string;
+    /** Listen on `port` in every run rather than a free port each time. */
+    fixedPort: boolean;
+    port: number;
+    /** Keep the bearer token across runs rather than make a new one each run. */
+    fixedToken: boolean;
+    /** Which folders without an open window the server still serves. */
+    backgroundProjects: (typeof MCP_BACKGROUND_MODES)[number];
+    /** The folders `listed` serves (and `trusted` serves even when untrusted). */
+    backgroundProjectPaths: string[];
+    /** Minutes a background project may sit idle before it unloads; 0 keeps it until the IDE quits. */
+    backgroundIdleMinutes: number;
+    /** Background projects loaded at once. */
+    backgroundProjectLimit: number;
+  };
 }
 
 /** One `languageServers.<name>` entry; every field optional, like in settings.toml. */
@@ -116,7 +177,17 @@ function validateSpelling(raw: unknown): SpellingValid {
 export { ACCENT_PRESETS } from "@/workbench/theme";
 
 export const DEFAULT_SETTINGS: ValidSettings = {
-  general: { reopenLastProject: true, confirmExit: false, ...DEFAULT_GENERAL_EXTRAS },
+  plugins: {},
+  scopes: [],
+  fileColors: DEFAULT_FILE_COLORS,
+  database: { inEditorResults: false, resolutionScopes: [] },
+  general: {
+    reopenLastProject: true,
+    confirmExit: true,
+    closeWithoutWelcome: false,
+    closeTabsWithWindow: false,
+    ...DEFAULT_GENERAL_EXTRAS,
+  },
   appearance: { theme: "light", accent: "#3871e1", uiFontSize: 13, locale: "en", ...DEFAULT_APPEARANCE_EXTRAS },
   editor: {
     fontFamily: "JetBrains Mono",
@@ -144,17 +215,52 @@ export const DEFAULT_SETTINGS: ValidSettings = {
     localHistoryMaxMb: 512,
     fileTypes: {},
     fileTypeOverrides: {},
+    associatedApplications: ["*.xlsx", "*.xls", "*.docx", "*.doc", "*.pptx", "*.ppt", "*.pdf"],
   },
   keymapOverrides: {},
   customKeymaps: {},
   notifications: DEFAULT_NOTIFICATIONS,
   proxy: DEFAULT_PROXY,
+  toolDownloads: { githubMirror: "" },
   languages: DEFAULT_LANGUAGES,
+  cmake: {},
   projectStructure: DEFAULT_PROJECT_STRUCTURE,
   inspections: DEFAULT_INSPECTIONS,
   spelling: { ideWords: [], projectWords: [], customDictionaries: [] },
   tools: {},
   languageServers: {},
+  agents: {
+    showContextUsage: true,
+    showWorkTime: true,
+    showUsageLimits: true,
+    showCost: false,
+    foldTurns: true,
+    smoothText: true,
+    fitWindowWidth: false,
+    thinking: "auto",
+    toolCalls: "grouped",
+    expandToolOutput: false,
+    sendWith: "enter",
+    whileRunning: "queue",
+    newTaskApprovals: "bypass",
+    defaults: {},
+    mcpServers: {},
+    skills: {},
+  },
+  mcpServer: {
+    enabled: false,
+    runWithoutConfirmation: false,
+    agentTabLimit: DEFAULT_AGENT_RUNS.tabLimit,
+    agentArchiveLimit: DEFAULT_AGENT_RUNS.archiveLimit,
+    address: DEFAULT_MCP_ADDRESS,
+    fixedPort: true,
+    port: DEFAULT_MCP_PORT,
+    fixedToken: false,
+    backgroundProjects: "off",
+    backgroundProjectPaths: [],
+    backgroundIdleMinutes: 30,
+    backgroundProjectLimit: 8,
+  },
   ...DEFAULT_WORKFLOW,
 };
 
@@ -167,14 +273,57 @@ export const LIMITS = {
   localHistoryMaxMb: { min: 16, max: 16384 },
 } as const;
 
-const THEMES: readonly ThemeId[] = [...BUILTIN_THEME_IDS, "system"];
-const LOCALES: readonly LocaleId[] = ["en", "zh"];
+const theme = (v: unknown, d: ThemeId): ThemeId => (v === "system" || isThemeChoiceId(v) ? v : d);
 export const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
 type Obj = Record<string, unknown>;
 const obj = (v: unknown): Obj => (v && typeof v === "object" && !Array.isArray(v) ? (v as Obj) : {});
 const bool = (v: unknown, d: boolean) => (typeof v === "boolean" ? v : d);
 const str = (v: unknown, d: string) => (typeof v === "string" && v.trim() ? v : d);
+const stringMap = (v: unknown): Record<string, string> =>
+  Object.fromEntries(Object.entries(obj(v)).filter((e): e is [string, string] => typeof e[1] === "string"));
+
+/** Agent id → option id → value, keeping only string values. */
+function agentDefaults(v: unknown): Record<string, Record<string, string>> {
+  return Object.fromEntries(Object.entries(obj(v)).map(([agent, options]) => [agent, stringMap(options)]));
+}
+
+function agentMcpServers(v: unknown): Required<AgentSettings>["mcpServers"] {
+  const out: Required<AgentSettings>["mcpServers"] = {};
+  for (const [name, raw] of Object.entries(obj(v))) {
+    if (!name.trim()) continue;
+    const s = obj(raw);
+    const transport = oneOf(s.transport, ["stdio", "http", "sse"] as const, "stdio");
+    const enabled = bool(s.enabled, true);
+    const command = typeof s.command === "string" && s.command.trim() ? s.command.trim() : null;
+    const args = stringList(s.args);
+    const env = stringMap(s.env);
+    const url = typeof s.url === "string" && s.url.trim() ? s.url.trim() : null;
+    const headers = stringMap(s.headers);
+    const agents = stringList(s.agents);
+    out[name] = {
+      transport,
+      enabled,
+      ...(command ? { command } : {}),
+      ...(args.length ? { args } : {}),
+      ...(Object.keys(env).length ? { env } : {}),
+      ...(url ? { url } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
+      ...(agents.length ? { agents } : {}),
+    };
+  }
+  return out;
+}
+
+function agentSkillPolicies(v: unknown): Required<AgentSettings>["skills"] {
+  const out: Required<AgentSettings>["skills"] = {};
+  for (const [name, raw] of Object.entries(obj(v))) {
+    if (!name.trim()) continue;
+    out[name] = { mode: oneOf(obj(raw).mode, ["auto", "slashOnly", "off"] as const, "auto") };
+  }
+  return out;
+}
+
 const oneOf = <T extends string>(v: unknown, allowed: readonly T[], d: T): T =>
   typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : d;
 const num = (v: unknown, d: number, { min, max }: { min: number; max: number }, int = false) => {
@@ -198,6 +347,7 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
   const a = obj(root.appearance);
   const e = obj(root.editor);
   const f = obj(root.files);
+  const agents = obj(root.agents);
   const overrides = bindingMap(root.keymapOverrides);
   const customKeymaps: Record<string, CustomKeymapSettings> = {};
   for (const [id, raw] of Object.entries(obj(root.customKeymaps))) {
@@ -206,17 +356,33 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
     customKeymaps[id] = { name: str(k.name, id), parent: str(k.parent, d.keymap), overrides: bindingMap(k.overrides) };
   }
   return {
+    plugins: Object.fromEntries(Object.entries(obj(root.plugins)).map(([id, values]) => [id, obj(values)])),
+    scopes: validateScopes(root.scopes),
+    fileColors: validateFileColors(root.fileColors),
+    database: {
+      inEditorResults: bool(obj(root.database).inEditorResults, d.database.inEditorResults),
+      resolutionScopes: (Array.isArray(obj(root.database).resolutionScopes)
+        ? (obj(root.database).resolutionScopes as unknown[])
+        : []
+      ).map((r) => ({
+        path: str(obj(r).path, ""),
+        dataSource: str(obj(r).dataSource, ""),
+        schema: str(obj(r).schema, ""),
+      })),
+    },
     general: {
       ...validateGeneralExtras(g),
       reopenLastProject: bool(g.reopenLastProject, d.general.reopenLastProject),
       confirmExit: bool(g.confirmExit, d.general.confirmExit),
+      closeWithoutWelcome: bool(g.closeWithoutWelcome, d.general.closeWithoutWelcome),
+      closeTabsWithWindow: bool(g.closeTabsWithWindow, d.general.closeTabsWithWindow),
     },
     appearance: {
       ...validateAppearanceExtras(a),
-      theme: oneOf(a.theme, THEMES, d.appearance.theme),
+      theme: theme(a.theme, d.appearance.theme),
       accent: typeof a.accent === "string" && HEX_COLOR.test(a.accent) ? a.accent.toLowerCase() : d.appearance.accent,
       uiFontSize: num(a.uiFontSize, d.appearance.uiFontSize, LIMITS.uiFontSize, true),
-      locale: oneOf(a.locale, LOCALES, d.appearance.locale),
+      locale: oneOf(a.locale, SUPPORTED_LOCALES, d.appearance.locale),
     },
     editor: {
       fontFamily: str(e.fontFamily, d.editor.fontFamily),
@@ -248,12 +414,22 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
       localHistoryMaxMb: num(f.localHistoryMaxMb, d.files.localHistoryMaxMb, LIMITS.localHistoryMaxMb, true),
       fileTypes: validateFileTypes(f.fileTypes),
       fileTypeOverrides: validateFileTypeOverrides(f.fileTypeOverrides),
+      associatedApplications: Array.isArray(f.associatedApplications)
+        ? stringList(f.associatedApplications)
+        : [...d.files.associatedApplications],
     },
     keymapOverrides: overrides,
     customKeymaps,
     notifications: validateNotifications(root.notifications),
     proxy: validateProxy(root.proxy),
+    toolDownloads: {
+      githubMirror:
+        typeof obj(root.toolDownloads).githubMirror === "string"
+          ? String(obj(root.toolDownloads).githubMirror).trim()
+          : "",
+    },
     languages: validateLanguages(root.languages),
+    cmake: validateCMake(root.cmake),
     projectStructure: validateProjectStructure(root.projectStructure),
     inspections: validateInspections(root.inspections),
     spelling: validateSpelling(root.spelling),
@@ -266,6 +442,52 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
     languageServers: Object.fromEntries(
       Object.entries(obj(root.languageServers)).map(([name, ls]) => [name, obj(ls) as LanguageServerEntry]),
     ),
+    agents: {
+      showContextUsage: bool(agents.showContextUsage, d.agents.showContextUsage),
+      showWorkTime: bool(agents.showWorkTime, d.agents.showWorkTime),
+      showUsageLimits: bool(agents.showUsageLimits, d.agents.showUsageLimits),
+      showCost: bool(agents.showCost, d.agents.showCost),
+      foldTurns: bool(agents.foldTurns, d.agents.foldTurns),
+      smoothText: bool(agents.smoothText, d.agents.smoothText),
+      fitWindowWidth: bool(agents.fitWindowWidth, d.agents.fitWindowWidth),
+      thinking: oneOf(agents.thinking, ["auto", "expanded", "collapsed"] as const, d.agents.thinking),
+      toolCalls: oneOf(agents.toolCalls, ["grouped", "each"] as const, d.agents.toolCalls),
+      expandToolOutput: bool(agents.expandToolOutput, d.agents.expandToolOutput),
+      sendWith: oneOf(agents.sendWith, ["enter", "modEnter"] as const, d.agents.sendWith),
+      whileRunning: oneOf(agents.whileRunning, ["queue", "steer"] as const, d.agents.whileRunning),
+      newTaskApprovals: oneOf(agents.newTaskApprovals, ["bypass", "ask"] as const, d.agents.newTaskApprovals),
+      defaults: agentDefaults(agents.defaults),
+      mcpServers: agentMcpServers(agents.mcpServers),
+      skills: agentSkillPolicies(agents.skills),
+    },
+    mcpServer: {
+      enabled: bool(obj(root.mcpServer).enabled, d.mcpServer.enabled),
+      runWithoutConfirmation: bool(obj(root.mcpServer).runWithoutConfirmation, d.mcpServer.runWithoutConfirmation),
+      agentTabLimit: validateAgentRuns(root.mcpServer).tabLimit,
+      agentArchiveLimit: validateAgentRuns(root.mcpServer).archiveLimit,
+      address: str(obj(root.mcpServer).address, d.mcpServer.address).trim(),
+      fixedPort: bool(obj(root.mcpServer).fixedPort, d.mcpServer.fixedPort),
+      port: num(obj(root.mcpServer).port, d.mcpServer.port, MCP_PORT_LIMITS, true),
+      fixedToken: bool(obj(root.mcpServer).fixedToken, d.mcpServer.fixedToken),
+      backgroundProjects: oneOf(
+        obj(root.mcpServer).backgroundProjects,
+        MCP_BACKGROUND_MODES,
+        d.mcpServer.backgroundProjects,
+      ),
+      backgroundProjectPaths: [...new Set(stringList(obj(root.mcpServer).backgroundProjectPaths))],
+      backgroundIdleMinutes: num(
+        obj(root.mcpServer).backgroundIdleMinutes,
+        d.mcpServer.backgroundIdleMinutes,
+        MCP_BACKGROUND_IDLE_LIMITS,
+        true,
+      ),
+      backgroundProjectLimit: num(
+        obj(root.mcpServer).backgroundProjectLimit,
+        d.mcpServer.backgroundProjectLimit,
+        MCP_BACKGROUND_PROJECT_LIMITS,
+        true,
+      ),
+    },
     ...validateWorkflow(root),
   };
 }

@@ -12,6 +12,8 @@ import {
   resolveServer,
   sshRemedy,
   summarizeReport,
+  transferMenuEntries,
+  defaultGroup,
   syncChoices,
   syncSteps,
   targetPaths,
@@ -41,6 +43,32 @@ describe("targetPaths", () => {
     expect(targetPaths(undefined, { ...both, part: "project" })).toEqual([`${ROOT}/src`]);
     expect(targetPaths(undefined, { ...both, part: "editor" })).toEqual([`${ROOT}/index.php`]);
     expect(targetPaths(undefined, { ...ctx, part: "editor", selection: [`${ROOT}/src`] })).toEqual([]);
+  });
+
+  it("prefers the Commit / Local Changes selection over Project view and the editor", () => {
+    const changes = [`${ROOT}/a.php`, `${ROOT}/b.php`];
+    expect(
+      targetPaths(undefined, {
+        ...ctx,
+        part: "project",
+        selection: [`${ROOT}/only-project`],
+        editorPath: `${ROOT}/editor.php`,
+        changesSelection: changes,
+      }),
+    ).toEqual(changes);
+    // Menu arg still wins.
+    expect(
+      targetPaths({ paths: [`${ROOT}/menu.php`] }, { ...ctx, changesSelection: changes, part: "project" }),
+    ).toEqual([`${ROOT}/menu.php`]);
+    // Empty changes selection falls through to Project / editor.
+    expect(
+      targetPaths(undefined, {
+        ...ctx,
+        part: "project",
+        selection: [`${ROOT}/proj`],
+        changesSelection: [],
+      }),
+    ).toEqual([`${ROOT}/proj`]);
   });
 
   it("drops paths outside the project and paths inside selected folders", () => {
@@ -102,6 +130,28 @@ describe("servers and reports", () => {
     expect(resolveServer({ ...DEFAULT_DEPLOYMENT, servers: [a, b], defaultServer: "b" }, "a")?.id).toBe("a");
   });
 
+  it("names the menu's transfers after the default server", () => {
+    const actions = (servers: (typeof a)[], defaultServer: string) =>
+      transferMenuEntries({ ...DEFAULT_DEPLOYMENT, servers, defaultServer }).map((e) => e.label ?? e.action);
+    const named = ["Upload to Staging", "Download from Staging", "Sync with Deployed to Staging…"];
+    const choosers = ["deployment.uploadTo", "deployment.downloadFrom", "deployment.syncWith"];
+    expect(actions([a], "")).toEqual(named);
+    expect(actions([a, b], "a")).toEqual([...named, ...choosers]);
+    expect(actions([a, b], "")).toEqual(choosers);
+    // A default server group uploads to its servers; the rest choose one server.
+    const groups = [{ id: "g", name: "All stages", servers: [b.id, a.id] }];
+    expect(
+      transferMenuEntries({ ...DEFAULT_DEPLOYMENT, servers: [a, b], groups, defaultServer: "g" }).map(
+        (e) => e.label ?? e.action,
+      ),
+    ).toEqual(["Upload to All stages", ...choosers]);
+    expect(defaultGroup({ ...DEFAULT_DEPLOYMENT, servers: [a, b], groups, defaultServer: "g" })?.servers).toEqual([
+      b,
+      a,
+    ]);
+    expect(defaultGroup({ ...DEFAULT_DEPLOYMENT, servers: [a, b], groups, defaultServer: "a" })).toBeNull();
+  });
+
   it("summarizes transfer reports", () => {
     expect(summarizeReport({ files: 3, skipped: 1, errors: [] }, "upload", "Staging")).toEqual({
       level: "info",
@@ -121,6 +171,14 @@ describe("servers and reports", () => {
     expect(sshRemedy("permissionDenied", "SSH password required for deploy@example.com", "password")).toBe("secret");
     expect(sshRemedy("permissionDenied", "SSH key passphrase required for ~/.ssh/id", "keyPair")).toBe("secret");
     expect(sshRemedy("permissionDenied", "SSH host key of box:22 has changed", "password")).toBeNull();
+    expect(sshRemedy("permissionDenied", "FTP password required for web@ftp.example.com:21", "openSsh")).toBe("secret");
+    expect(
+      sshRemedy(
+        "permissionDenied",
+        "FTP authentication failed for web@ftp.example.com:21: [530] Login incorrect.",
+        "openSsh",
+      ),
+    ).toBe("secret");
     expect(sshRemedy("permissionDenied", "SSH authentication failed", "openSsh")).toBeNull();
     expect(sshRemedy("permissionDenied", "SSH authentication failed", "password")).toBe("secret");
     expect(sshRemedy("io", "Connection refused", "password")).toBeNull();
@@ -140,16 +198,25 @@ describe("remote paths", () => {
 
   it("maps remote paths back to project paths through the most specific mapping", () => {
     const mappings = [
-      { local: "", deployment: "", web: "" },
-      { local: "public", deployment: "htdocs", web: "" },
-      { local: "shared", deployment: "/opt/shared", web: "" },
+      { local: ROOT, deployment: "/var/www" },
+      { local: `${ROOT}/public`, deployment: "/var/www/htdocs" },
+      { local: `${ROOT}/shared`, deployment: "/var/www/opt/shared" },
     ];
-    const map = (p: string) => localPathForRemote(p, "/var/www", mappings, ROOT);
+    const map = (p: string) => localPathForRemote(p, mappings);
     expect(map("/var/www/index.php")).toBe(`${ROOT}/index.php`);
     expect(map("/var/www/htdocs/css/a.css")).toBe(`${ROOT}/public/css/a.css`);
     expect(map("/var/www/htdocs")).toBe(`${ROOT}/public`);
-    expect(map("/opt/shared/lib")).toBe(`${ROOT}/shared/lib`);
+    expect(map("/var/www/opt/shared/lib")).toBe(`${ROOT}/shared/lib`);
+    expect(map("/opt/shared/lib")).toBeNull();
     expect(map("/var/wwwx/a")).toBeNull();
     expect(map("/etc/passwd")).toBeNull();
+  });
+
+  it("uses the backend folder for aliases and does not invent mappings", () => {
+    const mappings = [{ local: `${ROOT}/src`, deployment: "/mnt/deploy" }];
+    expect(localPathForRemote("/mnt/deploy/a.txt", mappings)).toBe(`${ROOT}/src/a.txt`);
+    expect(localPathForRemote("/mnt/deploy/a.txt", [])).toBeNull();
+    expect(localPathForRemote("/mnt/deploy/../a.txt", mappings)).toBeNull();
+    expect(localPathForRemote("/a.txt", [{ local: ROOT, deployment: "/" }])).toBe(`${ROOT}/a.txt`);
   });
 });

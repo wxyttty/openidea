@@ -1,6 +1,6 @@
 //! Lombok for jdtls: ECJ only generates Lombok members when the language
 //! server's JVM runs `-javaagent:lombok.jar`, so a project using Lombok gets the
-//! newest jar available, managed (installed by the IDE) or in the Maven / Gradle caches.
+//! app-provided jar, or falls back to the newest release in the Maven / Gradle caches.
 
 use crate::home_dir;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ pub enum LombokAgent {
     Missing,
     Found {
         jar: PathBuf,
-        /// `None` for the managed jar (the latest release when installed).
+        /// `None` for the app-provided jar (its version is shown by the tool registry).
         version: Option<String>,
     },
 }
@@ -64,7 +64,7 @@ pub fn agent_in_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<Path
 }
 
 /// The Lombok agent for the project at `root`: the user's own (`own`, from the JVM
-/// options) wins, then `managed` (the IDE-installed jar, always attached: it is inert
+/// options) wins, then `managed` (the app-provided jar, always attached: it is inert
 /// without Lombok on the classpath), then, for a project using Lombok, the build caches
 /// (`maven_repo`, the configured Maven local repository, else the default one).
 pub fn lombok_agent(
@@ -85,7 +85,7 @@ pub fn lombok_agent(
         return LombokAgent::Found { jar, version: None };
     }
     let home = home_dir();
-    let maven_repo = maven_repo.or_else(|| maven_repository(home.as_deref()));
+    let maven_repo = maven_repo.or_else(|| home.as_deref().and_then(crate::apply::default_maven_repository_in));
     if !uses_lombok(root, maven_repo.as_deref()) {
         return LombokAgent::Unused;
     }
@@ -246,7 +246,7 @@ fn sources_import_lombok(root: &Path) -> bool {
     // Imports precede the first type, after at most a license header.
     const HEAD: u64 = 8 * 1024;
     let mut walker = ignore::WalkBuilder::new(root);
-    walker.require_git(false).follow_links(false).filter_entry(|e| {
+    walker.require_git(ide_core::ignored::inside_git_repo(root)).follow_links(false).filter_entry(|e| {
         e.depth() == 0
             || !e.file_type().is_some_and(|t| t.is_dir())
             || !OUTPUT_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
@@ -266,17 +266,6 @@ fn sources_import_lombok(root: &Path) -> bool {
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()) && e.path().extension().is_some_and(|x| x == "java"))
         .take(MAX_FILES)
         .any(|e| imports_lombok(e.path()))
-}
-
-/// `<localRepository>` of `~/.m2/settings.xml`, else `~/.m2/repository`.
-fn maven_repository(home: Option<&Path>) -> Option<PathBuf> {
-    let m2 = home?.join(".m2");
-    let custom = std::fs::read_to_string(m2.join("settings.xml"))
-        .ok()
-        .and_then(|s| crate::java::xml_value(&strip_xml_comments(&s), "localRepository"))
-        .filter(|v| !v.is_empty() && !v.contains("${"))
-        .map(PathBuf::from);
-    Some(custom.unwrap_or_else(|| m2.join("repository")))
 }
 
 pub(crate) fn strip_xml_comments(text: &str) -> String {
@@ -500,6 +489,23 @@ mod tests {
     }
 
     #[test]
+    fn the_patched_agent_wins_over_project_caches_but_respects_explicit_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("pom.xml"), LOMBOK_DEP).unwrap();
+        let repo = tmp.path().join("m2");
+        let cache = repo.join("org/projectlombok/lombok/1.18.48");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("lombok-1.18.48.jar"), b"official agent").unwrap();
+        let patched = PathBuf::from("/managed/lombok-1.18.48-openidea.3.jar");
+        let selected = lombok_agent(tmp.path(), None, Some(patched.clone()), Some(repo.clone()));
+        assert_eq!(selected.jar(), Some(patched.as_path()));
+        assert_eq!(selected.problem(), None);
+        let own = PathBuf::from("/custom/lombok.jar");
+        let selected = lombok_agent(tmp.path(), Some(own.clone()), Some(patched), Some(repo));
+        assert_eq!(selected.jar(), Some(own.as_path()));
+    }
+
+    #[test]
     fn picks_the_newest_cached_release() {
         let tmp = tempfile::tempdir().unwrap();
         let m2 = tmp.path().join("m2");
@@ -542,19 +548,5 @@ mod tests {
         assert!(agent.outdated(), "its version is read from the file name");
         let plain = lombok_agent(tmp.path(), agent_in_args(["-javaagent:/opt/lombok.jar"]), None, None);
         assert_eq!(plain.problem(), None, "a user agent is never reported missing");
-    }
-
-    #[test]
-    fn maven_settings_local_repository() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        assert_eq!(maven_repository(Some(home)), Some(home.join(".m2/repository")));
-        fs::create_dir_all(home.join(".m2")).unwrap();
-        fs::write(
-            home.join(".m2/settings.xml"),
-            "<settings><!-- <localRepository>/old</localRepository> --><localRepository>/repo</localRepository></settings>",
-        )
-        .unwrap();
-        assert_eq!(maven_repository(Some(home)), Some(PathBuf::from("/repo")));
     }
 }

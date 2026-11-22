@@ -257,7 +257,17 @@ impl DebugPanel {
             DebugEvent::HotCodeReplace { change_type, message } => {
                 self.push_line("console", &format!("Hot code replace {change_type}: {message}"));
             }
-            DebugEvent::BreakpointsChanged { .. } | DebugEvent::Thread { .. } => {}
+            DebugEvent::BreakpointsChanged { .. }
+            | DebugEvent::Thread { .. }
+            | DebugEvent::ProgramInput
+            | DebugEvent::FlutterAppStarted
+            | DebugEvent::FlutterVmService { .. }
+            | DebugEvent::FlutterNavigate { .. }
+            | DebugEvent::Capabilities
+            | DebugEvent::Invalidated { .. }
+            | DebugEvent::JvmBackend { .. }
+            | DebugEvent::JsNetwork { .. }
+            | DebugEvent::JsNetworkUnavailable => {}
         }
         cx.notify();
     }

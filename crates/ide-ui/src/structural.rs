@@ -252,7 +252,7 @@ impl StructuralPanel {
                     for (path, range, replacement) in edits {
                         by_file.entry(path.0.clone()).or_default().push((range, replacement));
                     }
-                    let mut workspace = ide_core::WorkspaceEdit { files: Vec::new() };
+                    let mut workspace = ide_core::WorkspaceEdit { files: Vec::new(), preconditions: Vec::new() };
                     for (path, edits) in by_file {
                         workspace.files.push(ide_core::FileEdit::Edit {
                             path: ide_core::IpcPath(path),
@@ -260,6 +260,7 @@ impl StructuralPanel {
                                 .into_iter()
                                 .map(|(range, new_text)| ide_core::TextEdit { range, new_text })
                                 .collect(),
+                            version: None,
                         });
                     }
                     let count = workspace.files.iter().map(|f| match f {
@@ -267,10 +268,7 @@ impl StructuralPanel {
                         _ => 0,
                     }).sum::<usize>();
                     let file_count = workspace.files.len();
-                    let applied = match apply_host.project("main") {
-                        Ok(project) => ide_host::apply_workspace_edit(&project.documents, &workspace),
-                        Err(err) => Err(err),
-                    };
+                    let applied = ide_host::ops::lsp::apply_workspace_edit(&apply_host, "main", workspace).await;
                     match applied {
                         Ok(()) => {
                             let _ = &editor;

@@ -1,15 +1,27 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EditorController, openFilePaths, useEditorStatus, useTabs } from "./controller";
+import { EditorController, openFilePaths, useEditorStatus, useTabErrors, useTabs } from "./controller";
 import { createMemoryBackend } from "./backend";
 import { initialTabsState } from "./model/tabs";
 import { useDocMeta } from "./model/document";
+import { storeSession } from "./model/session";
 import { resetDistractionFree, setDistractionFree } from "@/workbench/distractionFree";
+import * as contributions from "@/workbench/contributions";
+import {
+  registerEditorKind,
+  registerTextEditorWrapper,
+  setProjectViewLead,
+  useProjectViewLead,
+} from "@/workbench/contributions";
 import { registerActions } from "@/platform/actions";
+import { IpcError, type ErrorKind } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
-import { resolveMenuItems } from "@/ui";
-import { getContext } from "@/platform/context";
+import { useRemote } from "@/platform/remote";
+import { hideContextMenu, resolveMenuItems, useContextMenuStore } from "@/ui";
+import { evaluateWhen, getContext, setContext } from "@/platform/context";
 import { installKeyboardDispatcher } from "@/platform/keymap";
 import { TEXT_WHEN } from "./actions";
+import { EDITOR_WHEN } from "@/editor/lsp/actions";
+import { setShownLine } from "@/editor/api";
 
 let ctrl: EditorController | null = null;
 
@@ -20,7 +32,245 @@ afterEach(() => {
   useEditorStatus.setState({ status: null });
 });
 
+describe("restoring an editor session", () => {
+  const root = "/session-restore";
+  const existing = `${root}/existing.txt`;
+  const unavailable = `${root}/unavailable.txt`;
+  const text = "first\nsecond";
+  let controller: EditorController | undefined;
+
+  afterEach(() => {
+    controller?.stop();
+    controller = undefined;
+    storeSession(root, null);
+    useTabErrors.setState({}, true);
+    vi.restoreAllMocks();
+  });
+
+  async function restoreWithOpenError(kind: ErrorKind, message: string) {
+    storeSession(root, {
+      version: 1,
+      layout: { kind: "pane", tabs: [{ path: existing }, { path: unavailable }], active: 1 },
+      activePane: 0,
+      files: { [existing]: { anchor: 6, head: 6 } },
+    });
+    const backend = createMemoryBackend({ [existing]: text });
+    // For an absent path the memory backend serves sample text, not a disk error.
+    const open = backend.open.bind(backend);
+    vi.spyOn(backend, "open").mockImplementation(async (path) => {
+      if (path === unavailable) throw new IpcError({ kind, message });
+      return open(path);
+    });
+    const editor = (controller = new EditorController(backend));
+    editor.start();
+
+    const restoring = editor.restoreSession(root);
+    const state = useTabs.getState();
+    const selected = state.panes[state.activePane]!.active!;
+    // Restore opens the selected tab in the background. Join the same slot request.
+    await Promise.all([restoring, editor.ensureSlot(selected)]);
+    return { editor, selected };
+  }
+
+  it("silently drops a deleted selected file and restores the remaining tab", async () => {
+    const notify = vi.fn();
+    vi.spyOn(contributions, "notifications").mockReturnValue({ notify });
+    const { editor, selected } = await restoreWithOpenError("notFound", `No such file: ${unavailable}`);
+
+    expect(notify).not.toHaveBeenCalled();
+    expect(useTabErrors.getState()).toEqual({});
+    expect(openFilePaths(useTabs.getState())).toEqual([existing]);
+    expect(editor.slotFor(selected)).toBeNull();
+    expect(editor.activeInput()?.path).toBe(existing);
+
+    // In the app the visible tab's editor host requests this slot after selection changes.
+    const state = useTabs.getState();
+    const slot = await editor.ensureSlot(state.panes[state.activePane]!.active!);
+    expect(slot?.model.path).toBe(existing);
+    expect(slot?.state.doc.toString()).toBe(text);
+    expect(slot?.caret()).toMatchObject({ line: 1, col: 0 });
+  });
+
+  it("keeps a tab and reports its open error when access is denied", async () => {
+    const message = `Permission denied: ${unavailable}`;
+    const { editor, selected } = await restoreWithOpenError("permissionDenied", message);
+
+    expect(openFilePaths(useTabs.getState())).toEqual([existing, unavailable]);
+    expect(editor.activeInput()?.path).toBe(unavailable);
+    expect(useTabErrors.getState()).toEqual({ [selected]: message });
+  });
+});
+
 describe("EditorController", () => {
+  it("returns navigation context to the editor when activating a non-text tab", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    setProjectViewLead({ path: "/p/src", dir: true });
+    await ctrl.openInput({ kind: "agent-session", key: "task" });
+    expect(useProjectViewLead.getState().lead).toBeNull();
+  });
+
+  it("goes back to the line a stand-in view shows (Markdown Preview only), not the hidden caret", async () => {
+    const text = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.md": text, "/p/b.md": "b\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.md", { selection: { line: 45, col: 0 }, focus: false });
+    // The preview was scrolled after the file opened; then a link opens another file.
+    setShownLine("/p/a.md", 20);
+    try {
+      await ctrl.openFile("/p/b.md", { focus: false });
+      await ctrl.back();
+      const slot = ctrl.activeSlot!;
+      expect(slot.model.path).toBe("/p/a.md");
+      expect(slot.caret().line).toBe(20);
+    } finally {
+      setShownLine("/p/a.md", null);
+    }
+  });
+
+  it("goes back to the file whose last tab was just closed, then to the place before it", async () => {
+    const text = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
+    ctrl = new EditorController(createMemoryBackend({ "/p/x.ts": "x\n", "/p/a.ts": text }));
+    ctrl.start();
+    await ctrl.openFile("/p/x.ts", { focus: false });
+    await ctrl.openFile("/p/a.ts", { selection: { line: 30, col: 2 }, focus: false });
+    await ctrl.closeEverything();
+    expect(ctrl.activeSlot).toBeNull();
+    await ctrl.back();
+    expect(ctrl.activeSlot!.model.path).toBe("/p/a.ts");
+    expect(ctrl.activeSlot!.caret()).toMatchObject({ line: 30, col: 2 });
+    await ctrl.back();
+    expect(ctrl.activeSlot!.model.path).toBe("/p/x.ts");
+  });
+
+  it("keeps a diff preview open when a file opens from it, and goes back to the diff", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/x.ts": "x\n", "/p/b.ts": "b\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/x.ts", { focus: false });
+    const diff = { kind: "diff", key: "diff:/p/a.ts", path: "/p/a.ts" };
+    await ctrl.openInput(diff, { preview: true });
+    // ⌘/Ctrl-click in the diff: the declaration opens in a tab of its own.
+    await ctrl.openFile("/p/b.ts", { focus: false });
+    const keys = () => Object.values(useTabs.getState().panes).flatMap((p) => p.tabs.map((t) => t.input.key));
+    expect(keys()).toContain(diff.key);
+    await ctrl.back();
+    expect(ctrl.activeInput()?.key).toBe(diff.key);
+    await ctrl.back();
+    expect(ctrl.activeSlot!.model.path).toBe("/p/x.ts");
+    await ctrl.forward();
+    expect(ctrl.activeInput()?.key).toBe(diff.key);
+    // Recent Locations lists text places only.
+    expect(ctrl.nav.snapshot().entries.map((e) => e.path)).toEqual(["/p/x.ts", "/p/b.ts"]);
+  });
+
+  it("goes back to a diff closed without leaving it first", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "a\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const diff = { kind: "diff", key: "diff:/p/a.ts", path: "/p/a.ts" };
+    await ctrl.openInput(diff, { preview: true });
+    await ctrl.closeEverything();
+    await ctrl.back();
+    expect(ctrl.activeInput()?.key).toBe(diff.key);
+    await ctrl.back();
+    expect(ctrl.activeSlot!.model.path).toBe("/p/a.ts");
+  });
+
+  it("goes back to a diff where it was left, open or closed", async () => {
+    // The diff viewer gives the input that reopens it at its caret.
+    const dispose = registerEditorKind({
+      kind: "diff",
+      title: () => "diff",
+      component: () => null,
+      navigationInput: (input) => ({ ...input, data: { line: 7 } }),
+    });
+    try {
+      ctrl = new EditorController(createMemoryBackend({ "/p/b.ts": "b\n" }));
+      ctrl.start();
+      const diff = { kind: "diff", key: "diff:/p/a.ts", path: "/p/a.ts", data: { line: null } };
+      await ctrl.openInput(diff, { preview: true });
+      await ctrl.openFile("/p/b.ts", { focus: false });
+      // Still open, it shows afresh when activated: at the caret too.
+      await ctrl.back();
+      expect(ctrl.activeInput()).toMatchObject({ key: diff.key, data: { line: 7 } });
+      await ctrl.forward();
+      await ctrl.closeInput(diff.key);
+      await ctrl.back();
+      expect(ctrl.activeInput()).toMatchObject({ key: diff.key, data: { line: 7 } });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("gives the keyboard to the next tab when the focused one closes", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "a\n", "/p/b.ts": "b\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const first = ctrl.activeSlot!;
+    await ctrl.openFile("/p/b.ts", { focus: false });
+    const second = ctrl.activeSlot!;
+    const hosts = [document.createElement("div"), document.createElement("div")];
+    document.body.append(...hosts);
+    try {
+      const a = first.mount(hosts[0]!);
+      ctrl.onMounted(first);
+      const b = second.mount(hosts[1]!);
+      ctrl.onMounted(second);
+      b.focus();
+      expect(b.hasFocus).toBe(true);
+      await ctrl.closeActiveTab();
+      expect(a.hasFocus).toBe(true);
+    } finally {
+      hosts.forEach((h) => h.remove());
+    }
+  });
+
+  it("autosaves on blur, but not while focus is in a popup over the editor", async () => {
+    const backend = createMemoryBackend({ "/p/a.c": "int main() {\n    \n}\n" });
+    const save = vi.spyOn(backend, "save");
+    ctrl = new EditorController(backend);
+    ctrl.start();
+    await ctrl.openFile("/p/a.c", { focus: false });
+    const slot = ctrl.activeSlot!;
+    const host = document.createElement("div");
+    const popup = document.createElement("div");
+    popup.setAttribute("data-popup", "");
+    const popupList = document.createElement("button");
+    popup.appendChild(popupList);
+    const elsewhere = document.createElement("button");
+    document.body.append(host, popup, elsewhere);
+    try {
+      const view = slot.mount(host);
+      ctrl.onMounted(slot);
+      const type = () => view.dispatch({ changes: { from: 0, insert: "x" }, userEvent: "input.type" });
+      // Into a popup (⌥↵ intentions): nothing is saved while it is open.
+      view.focus();
+      type();
+      popupList.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(save).not.toHaveBeenCalled();
+      // Back to the editor (popup closed): still nothing.
+      view.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(save).not.toHaveBeenCalled();
+      // From the popup elsewhere: saved then.
+      popupList.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      elsewhere.focus();
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+      // Straight elsewhere: saved.
+      view.focus();
+      type();
+      elsewhere.focus();
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    } finally {
+      host.remove();
+      popup.remove();
+      elsewhere.remove();
+    }
+  });
+
   it("leaves modified Enter to a non-text editor after switching from a focused file", async () => {
     ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\ntwo\n" }));
     ctrl.start();
@@ -170,7 +420,7 @@ describe("EditorController", () => {
     expect(pane().tabs.map((t) => t.input.path)).toEqual(["/p/a.ts", "/p/c.ts"]);
   });
 
-  it("carries the plain project's editor tabs into its automatic workspace", async () => {
+  it("keeps editor tabs and unsaved documents through attach and detach", async () => {
     const settings = {};
     useProject.setState({
       project: { root: "/attach-a", name: "A", trusted: true, isGit: false, settings },
@@ -181,19 +431,31 @@ describe("EditorController", () => {
     ctrl.start();
     await ctrl.openFile("/attach-a/one.txt", { focus: false, preview: false });
     await ctrl.openFile("/attach-a/two.txt", { focus: false, preview: false });
+    const slot = ctrl.activeSlot!;
+    const host = document.createElement("div");
+    const view = slot.mount(host);
+    ctrl.onMounted(slot);
+    view.dispatch({ changes: { from: 0, insert: "unsaved " }, userEvent: "input.type" });
+    const tabs = useTabs.getState();
     useProject.setState({
       project: {
-        root: "/attach-workspace",
-        name: "A",
+        root: "/attach-a",
+        name: "A, attach-b",
         trusted: true,
         isGit: false,
         settings,
         workspace: { version: 1, name: "A", projects: ["/attach-a", "/attach-b"] },
       },
     });
-    await vi.waitFor(() =>
-      expect(openFilePaths(useTabs.getState())).toEqual(["/attach-a/one.txt", "/attach-a/two.txt"]),
-    );
+    expect(useTabs.getState()).toBe(tabs);
+    expect(ctrl.activeSlot).toBe(slot);
+    expect(view.state.doc.toString()).toContain("unsaved ");
+    expect(openFilePaths(useTabs.getState())).toEqual(["/attach-a/one.txt", "/attach-a/two.txt"]);
+    useProject.setState({ project: { root: "/attach-a", name: "A", trusted: true, isGit: false, settings } });
+    expect(useTabs.getState()).toBe(tabs);
+    expect(ctrl.activeSlot).toBe(slot);
+    expect(view.state.doc.toString()).toContain("unsaved ");
+    host.remove();
     useProject.setState({ project: null });
   });
 
@@ -217,6 +479,24 @@ describe("EditorController", () => {
     useProject.setState({ lightEdit: false });
   });
 
+  it("opens a file requested while the LightEdit session is being restored", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/x/a.txt": "a", "/y/b.md": "b", "/z/launch.lua": "l" }));
+    ctrl.start();
+    useProject.setState({ lightEdit: true });
+    await ctrl.openFile("/x/a.txt", { focus: false });
+    await ctrl.openFile("/y/b.md", { focus: false });
+    useProject.setState({ lightEdit: false });
+    // A launch with a file path: LightEdit starts and the file opens before the old tabs are back.
+    useProject.setState({ lightEdit: true });
+    await ctrl.openFile("/z/launch.lua", { focus: false });
+    expect(openFilePaths(useTabs.getState())).toEqual(["/x/a.txt", "/y/b.md", "/z/launch.lua"]);
+    const s = useTabs.getState();
+    const active = s.panes[s.activePane]!;
+    expect(active.tabs.find((t) => t.id === active.active)?.input.path).toBe("/z/launch.lua");
+    await ctrl.closeEverything();
+    useProject.setState({ lightEdit: false });
+  });
+
   it("closes a tab by its input key", async () => {
     ctrl = new EditorController(createMemoryBackend());
     ctrl.start();
@@ -227,6 +507,39 @@ describe("EditorController", () => {
       .find((t) => t.input.path === "/p/b.ts")!.input.key;
     await ctrl.closeInput(key);
     expect(openFilePaths(useTabs.getState())).toEqual(["/p/a.ts"]);
+  });
+
+  it("offers Find Usages immediately before Go To in the editor context menu", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\n" }));
+    ctrl.start();
+    await ctrl.openFile("/p/a.ts", { focus: false });
+    const slot = ctrl.activeSlot!;
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const view = slot.mount(host);
+    vi.spyOn(view, "posAtCoords").mockReturnValue(null);
+    try {
+      ctrl.onContextMenu(slot, new MouseEvent("contextmenu"));
+      const items = useContextMenuStore.getState().menu!.items;
+      const goTo = items.findIndex((item) => "label" in item && item.label === "Go To");
+      expect(items[goTo - 1]).toEqual({ kind: "action", action: "find.usages", label: "Find Usages" });
+      const submenu = resolveMenuItems(items).find((item) => item.label === "Go To")!.submenu!;
+      expect(submenu.map((item) => (item.kind === "action" ? item.action : "-"))).toEqual([
+        "navigate.declaration",
+        "navigate.implementation",
+        "navigate.typeDeclaration",
+        "navigate.superMethod",
+        "navigate.relatedSymbol",
+        "navigate.gotoTest",
+        "-",
+        "navigate.callHierarchy",
+        "navigate.typeHierarchy",
+      ]);
+    } finally {
+      hideContextMenu();
+      slot.unmount();
+      host.remove();
+    }
   });
 
   it("builds IDEA's editor tab menu", async () => {
@@ -253,7 +566,146 @@ describe("EditorController", () => {
     const items = resolveMenuItems(ctrl.tabMenu(pane.id, pane.tabs[0]!));
     expect(items.find((i) => i.label === "Close Tabs to the Left")?.disabled).toBe(true);
     expect(items.find((i) => i.label === "Close Tabs to the Right")?.disabled).toBe(false);
+    const tabMenu = () => ctrl!.tabMenu(pane.id, pane.tabs[0]!);
+    const openIn = () => resolveMenuItems(resolveMenuItems(tabMenu()).find((i) => i.label === "Open In")!.submenu!);
+    const reveal = "project.revealInFinder|/p/a.ts";
+    expect(openIn().map((i) => i.key)).toContain(reveal);
+    useRemote.setState({
+      session: { target: { kind: "ssh", config: "box" }, root: "/p", host: "box", os: "linux", commands: [] },
+    });
+    expect(openIn().map((i) => i.key)).not.toContain(reveal);
+    useRemote.setState({ session: null });
     dispose();
     useProject.setState({ project: null, settings: null });
+  });
+
+  it.each(["editor", "tab"])(
+    "offers grouped Git actions in the %s menu and preserves action enablement",
+    async (menu) => {
+      const groups = [
+        ["vcs.commit", "vcs.addToVcs"],
+        [
+          "vcs.annotate",
+          "vcs.showDiff",
+          "vcs.compareWithBranch",
+          "vcs.compareWithRevision",
+          "vcs.showHistory",
+          "vcs.showCurrentRevision",
+          "vcs.showHistoryForSelection",
+          "vcs.rollback",
+        ],
+        ["vcs.push", "vcs.pull", "vcs.fetch"],
+        ["vcs.merge", "vcs.rebase"],
+        ["vcs.branches", "vcs.newBranch", "vcs.newTag", "vcs.resetHead"],
+        ["vcs.stash", "vcs.unstash"],
+        ["GitHub", "vcs.manageRemotes", "vcs.clone"],
+      ];
+      const github = [
+        "github.pullRequests",
+        "github.createPullRequest",
+        "github.checkoutPullRequest",
+        "github.openInBrowser",
+      ];
+      const ids = [...groups.flat().filter((id) => id !== "GitHub"), ...github];
+      const dispose = registerActions(
+        ids.map((id) => ({
+          id,
+          title: id,
+          when: id === "vcs.clone" ? undefined : id.startsWith("github.") ? "projectOpen" : "vcsAvailable",
+          run: () => undefined,
+        })),
+      );
+      useProject.setState({ project: { name: "p", root: "/p", trusted: true, isGit: true, settings: {} } as never });
+      ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\n" }));
+      ctrl.start();
+      await ctrl.openFile("/p/a.ts", { focus: false });
+      const slot = ctrl.activeSlot!;
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const view = slot.mount(host);
+      vi.spyOn(view, "posAtCoords").mockReturnValue(null);
+      const items = () => {
+        if (menu === "editor") {
+          ctrl!.onContextMenu(slot, new MouseEvent("contextmenu"));
+          return useContextMenuStore.getState().menu!.items;
+        }
+        const state = useTabs.getState();
+        const pane = state.panes[state.activePane]!;
+        return ctrl!.tabMenu(pane.id, pane.tabs[0]!);
+      };
+      const gitItems = () => resolveMenuItems(items()).find((item) => item.label === "Git")!.submenu!;
+      try {
+        setContext("projectOpen", true);
+        setContext("vcsAvailable", true);
+        expect(
+          gitItems().map((item) =>
+            item.kind === "separator" ? "-" : item.kind === "action" ? item.action : item.label,
+          ),
+        ).toEqual(groups.flatMap((group, i) => (i ? ["-", ...group] : group)));
+        const resolved = resolveMenuItems(gitItems());
+        expect(resolved.filter((item) => item.kind === "item").every((item) => !item.disabled)).toBe(true);
+        const githubItems = resolved.find((item) => item.label === "GitHub")!.submenu!;
+        expect(resolveMenuItems(githubItems).map((item) => item.key)).toEqual(github);
+        expect(gitItems()).toContainEqual({
+          kind: "action",
+          action: "vcs.compareWithBranch",
+          arg: { path: "/p/a.ts" },
+        });
+
+        setContext("vcsAvailable", false);
+        expect(
+          resolveMenuItems(gitItems())
+            .filter((item) => item.kind === "item" && item.key.startsWith("vcs.") && item.key !== "vcs.clone")
+            .every((item) => item.disabled),
+        ).toBe(true);
+        expect(resolveMenuItems(gitItems()).find((item) => item.key === "vcs.clone")?.disabled).toBe(false);
+        setContext("projectOpen", false);
+        expect(resolveMenuItems(githubItems).every((item) => item.disabled)).toBe(true);
+      } finally {
+        dispose();
+        hideContextMenu();
+        slot.unmount();
+        host.remove();
+        useProject.setState({ project: null, settings: null });
+        setContext("vcsAvailable", false);
+        setContext("projectOpen", false);
+      }
+    },
+  );
+
+  it("switches an open image tab to a text tab when a matching text editor wrapper registers", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/arch.diagram.svg": "<svg/>" }));
+    ctrl.start();
+    await ctrl.openInput({ kind: "image", key: "image:/p/arch.diagram.svg", path: "/p/arch.diagram.svg" });
+    expect(openFilePaths(useTabs.getState())).toEqual([]);
+    const offWrapper = registerTextEditorWrapper({
+      id: "plugin.acme.diagram.canvas",
+      matches: (p) => p.endsWith(".diagram.svg"),
+      component: () => null,
+    });
+    try {
+      expect(openFilePaths(useTabs.getState())).toEqual(["/p/arch.diagram.svg"]);
+      await vi.waitFor(() => expect(ctrl?.activeSlot?.model.path).toBe("/p/arch.diagram.svg"));
+    } finally {
+      offWrapper();
+    }
+  });
+});
+
+describe("editor action when clauses", () => {
+  const editorBehind = { textEditorActive: true, editorTextFocus: false, editorFocus: false, popupOpen: true };
+
+  it.each([
+    ["TEXT_WHEN", TEXT_WHEN],
+    ["EDITOR_WHEN", EDITOR_WHEN],
+  ])("%s runs on the editor from a popup such as Find Action", (_, when) => {
+    expect(evaluateWhen(when, { ...editorBehind, toolWindowFocus: false })).toBe(true);
+  });
+
+  it.each([
+    ["TEXT_WHEN", TEXT_WHEN],
+    ["EDITOR_WHEN", EDITOR_WHEN],
+  ])("%s leaves keys to a tool window's speed search, e.g. ⌘⌫ to Delete Line", (_, when) => {
+    expect(evaluateWhen(when, { ...editorBehind, toolWindowFocus: true })).toBe(false);
   });
 });

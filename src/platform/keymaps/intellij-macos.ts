@@ -3,6 +3,8 @@
  * contract between features (which register actions) and keymaps.
  */
 export const intellijMacos: Record<string, string[]> = {
+  "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Meta+O"],
@@ -15,8 +17,8 @@ export const intellijMacos: Record<string, string[]> = {
   "navigate.switcherBack": ["Ctrl+Shift+Tab"],
   "navigate.recentFiles": ["Meta+E"],
   "navigate.recentLocations": ["Meta+Shift+E"],
-  "navigate.back": ["Meta+[", "Meta+Alt+Left", "Button4"],
-  "navigate.forward": ["Meta+]", "Meta+Alt+Right", "Button5"],
+  "navigate.back": ["Meta+[", "Meta+Alt+Left", "Button4", "SwipeRight"],
+  "navigate.forward": ["Meta+]", "Meta+Alt+Right", "Button5", "SwipeLeft"],
   "navigate.gotoLine": ["Meta+L"],
   "navigate.declaration": ["Meta+B"],
   "navigate.implementation": ["Meta+Alt+B", "Meta+Alt+Button1"],
@@ -55,6 +57,7 @@ export const intellijMacos: Record<string, string[]> = {
   "navigate.nextEditLocation": [],
   "navigate.gotoTest": ["Meta+Shift+T"],
   "navigate.superMethod": ["Meta+U"],
+  "navigate.relatedSymbol": ["Ctrl+Meta+Up"],
   "navigate.nextMethod": ["Ctrl+Shift+Down"],
   "navigate.previousMethod": ["Ctrl+Shift+Up"],
   "navigate.nextOccurrence": ["Meta+Alt+Down"],
@@ -170,10 +173,14 @@ export const intellijMacos: Record<string, string[]> = {
   "refactor.inline": ["Meta+Alt+N"],
   "refactor.move": ["F6"],
   "refactor.safeDelete": ["Meta+Delete"],
+  "refactor.extractInterface": [],
+  "refactor.pullMembersUp": [],
+  "refactor.pushMembersDown": [],
 
   // File / editor tabs
   "file.save": ["Meta+S"],
   "file.settings": ["Meta+,"],
+  "file.projectStructure": ["Meta+;"],
   "file.openProject": ["Meta+Shift+Alt+O"],
   "file.newScratchFile": ["Meta+Shift+N"],
   "editor.closeTab": ["Meta+W"],
@@ -192,7 +199,8 @@ export const intellijMacos: Record<string, string[]> = {
   "window.previous": ["Meta+Alt+Shift+`"],
   "file.reloadFromDisk": ["Meta+Alt+Y"],
   // Before the project view's ⇧⌘C (Copy Absolute Path), which wins there.
-  "editor.copyPath": ["Meta+Shift+C"],
+  "editor.copyPath": [],
+  "editor.copyPathReference": ["Meta+Shift+C"],
 
   // Project view (when: projectViewFocus)
   "project.newFile": ["Meta+N"],
@@ -206,6 +214,7 @@ export const intellijMacos: Record<string, string[]> = {
   "project.paste": ["Meta+V"],
   "project.copyAbsolutePath": ["Meta+Shift+C"],
   "project.open": ["F4", "Meta+Down"],
+  "project.openInRightSplit": ["Shift+Enter"],
   "project.findUsages": ["Alt+F7"],
   "project.reformatCode": ["Meta+Alt+L"],
   "project.optimizeImports": ["Ctrl+Alt+O"],
@@ -213,6 +222,9 @@ export const intellijMacos: Record<string, string[]> = {
   "project.reloadFromDisk": ["Meta+Alt+Y"],
   "project.expandAll": ["Meta+="],
   "project.collapseAll": ["Meta+-"],
+  // In the test results tree (keyWhen).
+  "run.expandAllTests": ["Meta+="],
+  "run.collapseAllTests": ["Meta+-"],
 
   // Tool windows
   "toolwindow.project": ["Meta+1"],
@@ -232,7 +244,8 @@ export const intellijMacos: Record<string, string[]> = {
   "toolwindow.resizeRight": ["Ctrl+Alt+Right"],
   "toolwindow.resizeUp": ["Ctrl+Alt+Up"],
   "toolwindow.resizeDown": ["Ctrl+Alt+Down"],
-  "layout.restoreDefault": ["Shift+F12"],
+  "layout.restoreCurrent": ["Shift+F12"],
+  "layout.restoreDefault": [],
   "toolwindow.jumpToLast": ["F12"],
   "toolwindow.hideActive": ["Shift+Escape"],
   "toolwindow.focusEditor": ["Escape"],
@@ -284,7 +297,7 @@ export const intellijMacos: Record<string, string[]> = {
   "debug.setValue": ["F2"],
   "debug.jumpToSource": ["F4", "Meta+Down"],
   "debug.evaluate": ["Alt+F8"],
-  "debug.quickEvaluate": ["Meta+Alt+F8"],
+  "debug.quickEvaluate": ["Meta+Alt+F8", "Alt+Button1"],
   "debug.browseConsoleHistory": ["Meta+Alt+E"],
 
   // VCS
@@ -296,7 +309,10 @@ export const intellijMacos: Record<string, string[]> = {
   "vcs.showMessageHistory": ["Ctrl+M"],
   "vcs.update": ["Meta+T"],
   "vcs.rollback": ["Meta+Alt+Z"],
+  "vcs.addToVcs": ["Meta+Alt+A"],
   "vcs.showDiff": ["Meta+D"],
+  "vcs.log.changes.showDiff": ["Meta+D"],
+  "vcs.showDiffInNewWindow": [],
   "vcs.nextChange": ["Ctrl+Alt+Shift+Down"],
   "vcs.prevChange": ["Ctrl+Alt+Shift+Up"],
   "vcs.branches": [],
@@ -308,6 +324,8 @@ export const intellijMacos: Record<string, string[]> = {
   "view.quickSwitchScheme": ["Ctrl+`"],
   // Commit tool window (change lists) and Git log; keyWhen limits them to those tool windows.
   "vcs.changelist.move": ["Meta+Shift+M"],
+  "vcs.shelveSilently": ["Meta+Shift+H"],
+  "vcs.unshelveSilently": ["Meta+Alt+U"],
   "vcs.changelist.edit": ["F2", "Shift+F6"],
   "vcs.log.copyRevision": ["Meta+Alt+Shift+C"],
   "vcs.log.goToRef": ["Meta+F"],
@@ -317,15 +335,16 @@ export const intellijMacos: Record<string, string[]> = {
   "view.resetZoom": ["Ctrl+Alt+0"],
   "editor.increaseFontSize": ["Alt+Shift+."],
   "editor.decreaseFontSize": ["Alt+Shift+,"],
-  // Diff viewer (after Debug: F7 / ⇧F7 / F4 there win while a diff is focused)
+  // Diff viewer (after Debug: F7 / ⇧F7 / F4 / ⌘↓ there win while a diff is focused)
   "diff.nextDifference": ["F7"],
   "diff.prevDifference": ["Shift+F7"],
-  "diff.jumpToSource": ["F4"],
+  "diff.jumpToSource": ["F4", "Meta+Down"],
   "diff.applyLeftSide": ["Ctrl+Meta+Right"],
   "diff.applyRightSide": ["Ctrl+Meta+Left"],
   "diff.nextFile": ["Ctrl+Shift+Right"],
   "diff.prevFile": ["Ctrl+Shift+Left"],
   "diff.showSettings": ["Meta+Shift+D"],
+  "diff.focusOppositePane": ["Ctrl+Shift+Tab"],
   // After Show Diff: ⌘D is Compare With… in the project view.
   "project.compareWith": ["Meta+D"],
   // Editing extras, image viewer (keyWhen: image focused) and Markdown editor layouts
@@ -346,10 +365,37 @@ export const intellijMacos: Record<string, string[]> = {
   "markdown.previewOnly": [],
   // HTTP Client / Database console: run the request or statement at the caret.
   "http.runRequest": ["Meta+Enter"],
+  "graphql.runQuery": ["Meta+Enter"],
   "http.runAll": [],
+  "db.toggleBooleanCell": ["Space"],
+  "db.setCellNull": ["Meta+Backspace"],
+  "db.setCellDefault": ["Meta+Shift+Backspace"],
+  "db.reformatValue": ["Meta+Alt+L"],
+  "db.openValueWindow": [],
+  "db.findInValue": ["Meta+F"],
   "db.execute": ["Meta+Enter"],
+  "python.console.executeSelection": ["Alt+Shift+E"],
+  "db.nextResultTab": ["Meta+Shift+]", "Ctrl+Right"],
+  "db.previousResultTab": ["Meta+Shift+[", "Ctrl+Left"],
+  // Table editor with pending changes (after `vcs.rollback`, so ⌥⌘Z reverts the table's edits there).
+  "db.goToColumn": ["Meta+F12"],
+  "db.submitChanges": ["Meta+Enter"],
+  "db.revertChanges": ["Meta+Alt+Z"],
+  // Data editor (table editor / result grid), IDEA's Console.TableResult.* defaults.
+  "db.reloadPage": ["Meta+R"],
+  "db.firstPage": [],
+  "db.previousPage": ["Meta+Alt+Up"],
+  "db.nextPage": ["Meta+Alt+Down"],
+  "db.lastPage": [],
+  "db.addRow": ["Meta+N"],
+  "db.deleteRows": [],
+  "db.restoreRows": [],
+  "db.exportData": [],
+  "db.editCell": [],
   "db.showToolWindow": [],
   "agents.newTask": ["Meta+Shift+I"],
+  "agents.focusInput": ["Meta+L"],
+  "agents.cycleEffort": ["Alt+T"],
   "agents.showToolWindow": [],
   "agents.sendToAgent": [],
   // Database tool window (when the tree has focus; `db.openConsole` anywhere).
@@ -383,6 +429,8 @@ export const intellijMacos: Record<string, string[]> = {
   "db.runSqlScript": [],
   "db.sqlScript": [],
   "db.goToReferencedTable": [],
+  "db.selectOpened": [],
+  "db.expandAll": [],
   "db.collapseAll": [],
   // Terminal (keyWhen: terminalFocus); after VCS Update / Go to Test so it wins there.
   "terminal.new": ["Meta+T"],
@@ -399,4 +447,6 @@ export const intellijMacos: Record<string, string[]> = {
   "find.openInWindow": ["Alt+F7"],
   "find.field.newLine": ["Meta+Shift+Enter"],
   "find.field.recentSearches": ["Alt+Down"],
+  "editor.pasteHistory.paste": ["Enter"],
+  "editor.pasteHistory.remove": ["Delete", "Backspace"],
 };

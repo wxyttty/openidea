@@ -12,11 +12,16 @@ pub enum ToolKind {
     Debugger,
     /// Loaded into another tool's process, e.g. a jdtls agent.
     Plugin,
+    Formatter,
+    /// A command the IDE itself runs, e.g. the Dev Containers CLI.
+    Cli,
 }
 
 /// Where release archives come from.
 #[derive(Clone, Copy, Debug)]
 pub enum ReleaseSource {
+    /// One pinned archive, verified against its SHA-256 before extraction.
+    Fixed { version: &'static str, url: &'static str, sha256: &'static str },
     /// Latest GitHub release of `owner/repo`; assets plus links in the release notes.
     GitHub { repo: &'static str },
     /// `api.releases.hashicorp.com` product.
@@ -31,6 +36,8 @@ pub enum ReleaseSource {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Method {
+    /// An app-owned plugin jar, materialized without a network download.
+    Bundled { filename: &'static str, version: &'static str, bytes: &'static [u8] },
     /// `rustup component add <component>`.
     Rustup { component: &'static str },
     /// npm / pnpm packages installed into `<tools>/node_modules`; the first is the primary one.
@@ -46,6 +53,11 @@ pub enum Method {
     PipTarget { package: &'static str, module: &'static str },
     /// `gem install` into `<tools>/<name>/gems`, launched through `GEM_HOME` wrappers in `bin/`.
     Gem { gem: &'static str },
+    /// `gem install <gem>` into the active Ruby (the project's, installed from a project window),
+    /// launched through that Ruby's own executables. For tools that re-launch themselves under
+    /// Bundler (ruby-lsp), which breaks in a gem home under a path with spaces
+    /// (`~/Library/Application Support`: Bundler `exec`s a lone path string, and Ruby splits it).
+    GemActive { gem: &'static str },
     /// `dotnet tool install --tool-path <tools>/<name>/tool <package>`, launched
     /// through `DOTNET_ROOT` wrappers in `bin/`.
     DotnetTool { package: &'static str },
@@ -56,10 +68,12 @@ pub enum Method {
 impl Method {
     pub fn label(&self) -> &'static str {
         match self {
+            Method::Bundled { .. } => "Bundled",
             Method::Rustup { .. } => "rustup",
             Method::Npm { .. } => "npm",
             Method::Go { .. } => "go install",
             Method::Gem { .. } => "gem",
+            Method::GemActive { .. } => "gem (project Ruby)",
             Method::DotnetTool { .. } => "dotnet tool",
             Method::PipVenv { .. } => "pip (virtualenv)",
             Method::PipUser { .. } => "pip --user",
@@ -68,6 +82,7 @@ impl Method {
             Method::Release { source: ReleaseSource::EclipseJdtls, .. } => "Eclipse download",
             Method::Release { source: ReleaseSource::OpenVsx { .. }, .. } => "Open VSX",
             Method::Release { source: ReleaseSource::MavenCentral { .. }, .. } => "Maven Central",
+            Method::Release { source: ReleaseSource::Fixed { .. }, .. } => "Verified download",
             Method::Release { .. } => "GitHub release",
         }
     }
@@ -102,7 +117,7 @@ impl ToolSpec {
 
 use Arch::{Arm64, X64};
 use Os::{Linux, Mac, Windows};
-use ToolKind::{Debugger, LanguageServer, Plugin};
+use ToolKind::{Cli, Debugger, Formatter, LanguageServer, Plugin};
 
 const V: Option<(&str, &[&str])> = None;
 const JAVA: &[(&str, &str)] = &[("java", "Java is required (https://adoptium.net)")];
@@ -119,6 +134,84 @@ const fn ver(cmd: &'static str) -> Option<(&'static str, &'static [&'static str]
 pub const TYPESCRIPT: &str = "typescript@6";
 
 pub static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "unity-debug",
+        display: "Unity Debugger",
+        kind: Debugger,
+        commands: &["unity-debug"],
+        method: Method::Release {
+            source: ReleaseSource::Fixed {
+                version: "3.0.1",
+                url: "https://github.com/Unity-Technologies/vscode-unity-debug/releases/download/Version-3.0.1/unity-debug-3.0.1.vsix",
+                sha256: "4fa00660e0b52b0413726f80962e7d3d6efd41ac6cfd4df39520cae4a8ba5bd0",
+            },
+            assets: &[any_arch(Mac, "*.vsix"), any_arch(Linux, "*.vsix"), any_arch(Windows, "*.vsix")],
+            locate: &["UnityDebug.exe"],
+        },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/Unity-Technologies/vscode-unity-debug",
+        needs: if cfg!(windows) {
+            &[]
+        } else {
+            &[("mono", "Mono is required to run the Unity debugger (https://www.mono-project.com)")]
+        },
+    },
+    ToolSpec {
+        name: "prettier",
+        display: "Prettier",
+        kind: Formatter,
+        commands: &["prettier"],
+        method: Method::Npm { packages: &["prettier"] },
+        fallback: None,
+        version: ver("prettier"),
+        needs: NODE,
+        homepage: "https://prettier.io",
+    },
+    ToolSpec {
+        name: "devcontainer",
+        display: "Dev Containers CLI",
+        kind: Cli,
+        commands: &["devcontainer"],
+        method: Method::Npm { packages: &["@devcontainers/cli"] },
+        fallback: None,
+        version: ver("devcontainer"),
+        needs: NODE,
+        homepage: "https://github.com/devcontainers/cli",
+    },
+    ToolSpec {
+        name: "oxfmt",
+        display: "oxfmt",
+        kind: Formatter,
+        commands: &["oxfmt"],
+        method: Method::Npm { packages: &["oxfmt"] },
+        fallback: None,
+        version: ver("oxfmt"),
+        needs: NODE,
+        homepage: "https://oxc.rs/docs/guide/usage/formatter",
+    },
+    ToolSpec {
+        name: "oxlint",
+        display: "oxlint",
+        kind: LanguageServer,
+        commands: &["oxlint"],
+        method: Method::Npm { packages: &["oxlint"] },
+        fallback: None,
+        version: ver("oxlint"),
+        needs: NODE,
+        homepage: "https://oxc.rs/docs/guide/usage/linter",
+    },
+    ToolSpec {
+        name: "eslint",
+        display: "ESLint Language Server",
+        kind: LanguageServer,
+        commands: &["vscode-eslint-language-server"],
+        method: Method::Npm { packages: &["vscode-langservers-extracted"] },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/hrsh7th/vscode-langservers-extracted",
+        needs: NODE,
+    },
     ToolSpec {
         name: "rust-analyzer",
         display: "rust-analyzer",
@@ -197,6 +290,50 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: &[],
     },
     ToolSpec {
+        name: "pylsp",
+        display: "pylsp-rope (Python refactorings)",
+        kind: LanguageServer,
+        commands: &["pylsp"],
+        method: Method::PipVenv { package: "pylsp-rope" },
+        fallback: None,
+        version: ver("pylsp"),
+        homepage: "https://github.com/python-rope/pylsp-rope",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "pyrefly",
+        display: "Pyrefly (Python)",
+        kind: LanguageServer,
+        commands: &["pyrefly"],
+        method: Method::PipVenv { package: "pyrefly" },
+        fallback: None,
+        version: ver("pyrefly"),
+        homepage: "https://pyrefly.org",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "ruff",
+        display: "Ruff",
+        kind: LanguageServer,
+        commands: &["ruff"],
+        method: Method::PipVenv { package: "ruff" },
+        fallback: None,
+        version: ver("ruff"),
+        homepage: "https://docs.astral.sh/ruff/",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "djlsp",
+        display: "Django Template LSP",
+        kind: LanguageServer,
+        commands: &["djlsp"],
+        method: Method::PipVenv { package: "django-template-lsp" },
+        fallback: None,
+        version: ver("djlsp"),
+        homepage: "https://github.com/fourdigits/django-template-lsp",
+        needs: &[],
+    },
+    ToolSpec {
         name: "bash-language-server",
         display: "Bash Language Server",
         kind: LanguageServer,
@@ -263,6 +400,17 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: &[],
     },
     ToolSpec {
+        name: "astro-ls",
+        display: "Astro Language Server",
+        kind: LanguageServer,
+        commands: &["astro-ls"],
+        method: Method::Npm { packages: &["@astrojs/language-server", TYPESCRIPT] },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/withastro/astro/tree/main/packages/language-tools",
+        needs: NODE,
+    },
+    ToolSpec {
         name: "svelte-language-server",
         display: "Svelte Language Server",
         kind: LanguageServer,
@@ -308,6 +456,17 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: &[],
     },
     ToolSpec {
+        name: "prisma-language-server",
+        display: "Prisma Language Server",
+        kind: LanguageServer,
+        commands: &["prisma-language-server"],
+        method: Method::Npm { packages: &["@prisma/language-server"] },
+        fallback: None,
+        version: V,
+        homepage: "https://github.com/prisma/language-tools",
+        needs: &[],
+    },
+    ToolSpec {
         name: "intelephense",
         display: "Intelephense (PHP)",
         kind: LanguageServer,
@@ -316,6 +475,87 @@ pub static TOOLS: &[ToolSpec] = &[
         fallback: None,
         version: V,
         homepage: "https://intelephense.com",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "phpactor",
+        display: "Phpactor (PHP)",
+        kind: LanguageServer,
+        commands: &["phpactor"],
+        // One PHP archive for every platform, run through the project's PHP.
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "phpactor/phpactor" },
+            assets: &[
+                any_arch(Mac, "phpactor.phar"),
+                any_arch(Linux, "phpactor.phar"),
+                any_arch(Windows, "phpactor.phar"),
+            ],
+            locate: &["phpactor.phar"],
+        },
+        fallback: None,
+        version: ver("phpactor"),
+        homepage: "https://phpactor.readthedocs.io",
+        needs: &[("php", "Phpactor runs on PHP")],
+    },
+    ToolSpec {
+        name: "laravel-lsp",
+        display: "Laravel LSP",
+        kind: LanguageServer,
+        commands: &["laravel-lsp"],
+        // Plain binaries per platform (`server-v*-<arch>-<os>[.exe]`).
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "laravel/lsp" },
+            assets: &[
+                rule(Mac, Arm64, "server-v*-arm64-darwin"),
+                rule(Mac, X64, "server-v*-x64-darwin"),
+                rule(Linux, Arm64, "server-v*-arm64-linux"),
+                rule(Linux, X64, "server-v*-x64-linux"),
+                rule(Windows, X64, "server-v*-x64-win32.exe"),
+            ],
+            locate: &[
+                "laravel-lsp",
+                "server-v*-arm64-darwin",
+                "server-v*-x64-darwin",
+                "server-v*-arm64-linux",
+                "server-v*-x64-linux",
+                "server-v*-x64-win32",
+            ],
+        },
+        fallback: None,
+        version: ver("laravel-lsp"),
+        homepage: "https://github.com/laravel/lsp",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "phoxite",
+        display: "Phoxite",
+        kind: LanguageServer,
+        commands: &["phoxite-lsp"],
+        // Plain binaries per platform (`phoxite-lsp-<target triple>[.exe]`), each with a
+        // `.sha256` beside it.
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "samehelhawary/phoxite" },
+            assets: &[
+                rule(Mac, Arm64, "phoxite-lsp-aarch64-apple-darwin"),
+                rule(Mac, X64, "phoxite-lsp-x86_64-apple-darwin"),
+                rule(Linux, Arm64, "phoxite-lsp-aarch64-unknown-linux-gnu"),
+                rule(Linux, X64, "phoxite-lsp-x86_64-unknown-linux-gnu"),
+                rule(Windows, Arm64, "phoxite-lsp-aarch64-pc-windows-msvc.exe"),
+                rule(Windows, X64, "phoxite-lsp-x86_64-pc-windows-msvc.exe"),
+            ],
+            locate: &[
+                "phoxite-lsp",
+                "phoxite-lsp-aarch64-apple-darwin",
+                "phoxite-lsp-x86_64-apple-darwin",
+                "phoxite-lsp-aarch64-unknown-linux-gnu",
+                "phoxite-lsp-x86_64-unknown-linux-gnu",
+                "phoxite-lsp-aarch64-pc-windows-msvc",
+                "phoxite-lsp-x86_64-pc-windows-msvc",
+            ],
+        },
+        fallback: None,
+        version: ver("phoxite-lsp"),
+        homepage: "https://github.com/samehelhawary/phoxite",
         needs: &[],
     },
     ToolSpec {
@@ -554,6 +794,52 @@ pub static TOOLS: &[ToolSpec] = &[
         needs: &[],
     },
     ToolSpec {
+        name: "java-analyzer",
+        display: "java-analyzer",
+        kind: LanguageServer,
+        commands: &["java-analyzer"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "l0ng-ai/java-analyzer" },
+            assets: &[
+                rule(Mac, Arm64, "java-analyzer-macos-aarch64.gz"),
+                rule(Mac, X64, "java-analyzer-macos-x86_64.gz"),
+                rule(Linux, Arm64, "java-analyzer-linux-aarch64.gz"),
+                rule(Linux, X64, "java-analyzer-linux-x86_64.gz"),
+                rule(Windows, Arm64, "java-analyzer-windows-aarch64.zip"),
+                rule(Windows, X64, "java-analyzer-windows-x86_64.zip"),
+            ],
+            locate: &["java-analyzer"],
+        },
+        fallback: None,
+        version: ver("java-analyzer"),
+        homepage: "https://github.com/l0ng-ai/java-analyzer",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "kmp-lsp",
+        display: "kmp-lsp",
+        kind: LanguageServer,
+        commands: &["kmp-lsp"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "Hessesian/kmp-lsp" },
+            // These distributions include the native JAR indexer next to the server.
+            // The single-binary .gz and Windows .zip assets do not.
+            assets: &[
+                rule(Mac, Arm64, "kmp-lsp-darwin-aarch64.tar.gz"),
+                rule(Mac, X64, "kmp-lsp-darwin-x86_64.tar.gz"),
+                rule(Linux, Arm64, "kmp-lsp-linux-aarch64.tar.gz"),
+                rule(Linux, X64, "kmp-lsp-linux-x86_64.tar.gz"),
+                rule(Windows, Arm64, "kmp-lsp-win32-arm64-*.vsix"),
+                rule(Windows, X64, "kmp-lsp-win32-x64-*.vsix"),
+            ],
+            locate: &["kmp-lsp"],
+        },
+        fallback: None,
+        version: ver("kmp-lsp"),
+        homepage: "https://github.com/Hessesian/kmp-lsp",
+        needs: &[],
+    },
+    ToolSpec {
         name: "java-debug",
         display: "Java Debugger (Microsoft java-debug)",
         kind: Debugger,
@@ -578,15 +864,16 @@ pub static TOOLS: &[ToolSpec] = &[
         display: "Lombok (jdtls agent)",
         kind: Plugin,
         commands: &["lombok.jar"],
-        // Newer than the Lombok a project pins: old ones fail inside current ECJ.
-        method: Method::Release {
-            source: ReleaseSource::MavenCentral { group: "org.projectlombok", artifact: "lombok" },
-            assets: &[
-                any_arch(Mac, "lombok-*.jar"),
-                any_arch(Linux, "lombok-*.jar"),
-                any_arch(Windows, "lombok-*.jar"),
-            ],
-            locate: &["lombok.jar"],
+        // Equinox removed getModuleClassLoader(boolean), breaking lombok.config lookup (lombok#4059);
+        // ECJ 3.46.200 keeps the constructor call in a constructor's statements, which
+        // @SneakyThrows / @NonNull must not wrap or precede (lombok#4089).
+        // Builders on compact record constructors need the patch in java/lombok/patches.
+        // Return to Maven Central once an official release includes all of these fixes.
+        // Source commit, build instructions and checksum: java/lombok/README.md.
+        method: Method::Bundled {
+            filename: "lombok-1.18.48-openidea.3.jar",
+            version: "1.18.48-openidea.3",
+            bytes: include_bytes!("../../../java/lombok/lombok-1.18.48-openidea.3.jar"),
         },
         fallback: None,
         version: V,
@@ -601,17 +888,29 @@ pub static TOOLS: &[ToolSpec] = &[
         method: Method::Release {
             source: ReleaseSource::GitHub { repo: "Kotlin/kotlin-lsp" },
             assets: &[
+                // Current releases (kotlin-server-*): the CLI distribution is a
+                // .sit on macOS, .tar.gz on Linux and .win.zip on Windows. x64 ships as the
+                // un-suffixed archive, aarch64 as `-aarch64`; the un-suffixed one
+                // comes first in the release notes, which is what the x64 pattern
+                // matches first. Without a matching rule the installer used to fall
+                // through to a loose `kotlin-*.zip` pattern and POSIX picked the
+                // Windows archive (#723).
+                rule(Mac, Arm64, "kotlin-server-*-aarch64.sit"),
+                rule(Mac, X64, "kotlin-server-*.sit"),
+                rule(Linux, Arm64, "kotlin-server-*-aarch64.tar.gz"),
+                rule(Linux, X64, "kotlin-server-*.tar.gz"),
+                rule(Windows, X64, "kotlin-server-*.win.zip"),
+                rule(Windows, Arm64, "kotlin-server-*-aarch64.win.zip"),
+                // Old releases named the archives kotlin-lsp-*.
                 rule(Mac, Arm64, "kotlin-lsp-*-mac-aarch64.zip"),
                 rule(Mac, X64, "kotlin-lsp-*-mac-x64.zip"),
                 rule(Linux, X64, "kotlin-lsp-*-linux-x64.zip"),
                 rule(Linux, Arm64, "kotlin-lsp-*-linux-aarch64.zip"),
                 rule(Windows, X64, "kotlin-lsp-*-win-x64.zip"),
-                // Older releases ship one platform-independent archive.
-                any_arch(Mac, "kotlin-*.zip"),
-                any_arch(Linux, "kotlin-*.zip"),
-                any_arch(Windows, "kotlin-*.zip"),
             ],
-            locate: &["kotlin-lsp", "kotlin-lsp.sh", "kotlin-lsp.cmd"],
+            // `bin/intellij-server` is the launcher; current releases still ship the
+            // `kotlin-lsp.sh` / `kotlin-lsp.cmd` wrappers around it, deprecated, and old ones only those.
+            locate: &["intellij-server", "kotlin-lsp", "kotlin-lsp.sh", "kotlin-lsp.cmd"],
         },
         fallback: None,
         version: V,
@@ -713,6 +1012,49 @@ pub static TOOLS: &[ToolSpec] = &[
         fallback: None,
         version: ver("texlab"),
         homepage: "https://github.com/latex-lsp/texlab",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "tinymist",
+        display: "Tinymist (Typst)",
+        kind: LanguageServer,
+        commands: &["tinymist"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "Myriad-Dreamin/tinymist" },
+            assets: &[
+                rule(Mac, Arm64, "tinymist-aarch64-apple-darwin.tar.gz"),
+                rule(Mac, X64, "tinymist-x86_64-apple-darwin.tar.gz"),
+                rule(Linux, X64, "tinymist-x86_64-unknown-linux-gnu.tar.gz"),
+                rule(Linux, Arm64, "tinymist-aarch64-unknown-linux-gnu.tar.gz"),
+                rule(Windows, X64, "tinymist-x86_64-pc-windows-msvc.zip"),
+                rule(Windows, Arm64, "tinymist-aarch64-pc-windows-msvc.zip"),
+            ],
+            locate: &["tinymist"],
+        },
+        fallback: None,
+        version: ver("tinymist"),
+        homepage: "https://myriad-dreamin.github.io/tinymist/",
+        needs: &[],
+    },
+    ToolSpec {
+        name: "slint-lsp",
+        display: "Slint LSP",
+        kind: LanguageServer,
+        commands: &["slint-lsp"],
+        method: Method::Release {
+            source: ReleaseSource::GitHub { repo: "slint-ui/slint" },
+            assets: &[
+                any_arch(Mac, "slint-lsp-universal-apple-darwin.tar.gz"),
+                rule(Linux, X64, "slint-lsp-x86_64-unknown-linux-gnu.tar.gz"),
+                rule(Linux, Arm64, "slint-lsp-aarch64-unknown-linux-gnu.tar.gz"),
+                rule(Windows, X64, "slint-lsp-x86_64-pc-windows-msvc.zip"),
+                rule(Windows, Arm64, "slint-lsp-aarch64-pc-windows-msvc.zip"),
+            ],
+            locate: &["slint-lsp"],
+        },
+        fallback: None,
+        version: ver("slint-lsp"),
+        homepage: "https://slint.dev",
         needs: &[],
     },
     ToolSpec {
@@ -869,7 +1211,7 @@ pub static TOOLS: &[ToolSpec] = &[
         display: "Ruby LSP (Shopify)",
         kind: LanguageServer,
         commands: &["ruby-lsp"],
-        method: Method::Gem { gem: "ruby-lsp" },
+        method: Method::GemActive { gem: "ruby-lsp" },
         fallback: None,
         version: V,
         homepage: "https://shopify.github.io/ruby-lsp",
@@ -934,6 +1276,8 @@ mod tests {
     fn registry_names_match_language_configs() {
         let langs = ide_language::LanguageRegistry::load(None).unwrap().all();
         let mut known = std::collections::HashSet::new();
+        // The Unity debugger comes with Unity projects, apart from the C# debugger.
+        known.insert(("unity-debug".to_owned(), "unity-debug".to_owned()));
         for l in &langs {
             for s in &l.language_servers {
                 known.insert((s.name.clone(), s.command.clone()));
@@ -942,7 +1286,8 @@ mod tests {
                 known.insert((d.adapter.clone(), d.command.clone()));
             }
         }
-        for t in TOOLS.iter().filter(|t| t.kind != Plugin) {
+        // The host selects the formatter of each file (Prettier or oxfmt) and runs its own CLIs.
+        for t in TOOLS.iter().filter(|t| !matches!(t.kind, Plugin | Formatter | Cli)) {
             assert!(
                 known.contains(&(t.name.to_string(), t.commands[0].to_string())),
                 "{} / {} is not referenced by languages/*.toml",
@@ -969,5 +1314,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The v263 kotlin-server-* release notes: the CLI distribution archives plus
+    /// the VS Code extension and checksums; each platform must pick its native
+    /// distribution and the aarch64 archive must never be picked on x64.
+    #[test]
+    fn kotlin_lsp_runs_its_launcher_rather_than_the_deprecated_wrapper() {
+        let Method::Release { locate, .. } = &find("kotlin-lsp").unwrap().method else { unreachable!() };
+        let names: Vec<String> = locate.iter().map(|n| n.to_string()).collect();
+        let tmp = tempfile::tempdir().unwrap();
+        // Current releases: `kotlin-lsp.sh` warns that it will go and execs `bin/intellij-server`.
+        let current = tmp.path().join("current");
+        let dist = current.join("kotlin-server-263.7084.0");
+        std::fs::create_dir_all(dist.join("bin")).unwrap();
+        std::fs::write(dist.join("kotlin-lsp.sh"), "").unwrap();
+        std::fs::write(dist.join("bin/intellij-server"), "").unwrap();
+        assert_eq!(crate::archive::locate(&current, &names), Some(dist.join("bin/intellij-server")));
+        // Older releases have only the script.
+        let old = tmp.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("kotlin-lsp.sh"), "").unwrap();
+        assert_eq!(crate::archive::locate(&old, &names), Some(old.join("kotlin-lsp.sh")));
+    }
+
+    #[test]
+    fn kotlin_lsp_picks_the_native_archive_for_each_platform() {
+        use crate::platform::{Platform, select_asset};
+        let names = [
+            "kotlin-server-0.0.27-mac-amd64.vsix",
+            "kotlin-server-0.0.27-mac-amd64.vsix.sha256",
+            "kotlin-server-0.0.27-mac-aarch64.vsix",
+            "kotlin-server-0.0.27-mac-aarch64.vsix.sha256",
+            "kotlin-server-0.0.27-linux-amd64.vsix",
+            "kotlin-server-0.0.27-linux-amd64.vsix.sha256",
+            "kotlin-server-0.0.27-linux-aarch64.vsix",
+            "kotlin-server-0.0.27-linux-aarch64.vsix.sha256",
+            "kotlin-server-0.0.27-win-amd64.vsix",
+            "kotlin-server-0.0.27-win-amd64.vsix.sha256",
+            "kotlin-server-0.0.27-win-aarch64.vsix",
+            "kotlin-server-0.0.27-win-aarch64.vsix.sha256",
+            "kotlin-server-263.7084.0.sit",
+            "kotlin-server-263.7084.0.sit.sha256",
+            "kotlin-server-263.7084.0-aarch64.sit",
+            "kotlin-server-263.7084.0-aarch64.sit.sha256",
+            "kotlin-server-263.7084.0.tar.gz",
+            "kotlin-server-263.7084.0.tar.gz.sha256",
+            "kotlin-server-263.7084.0-aarch64.tar.gz",
+            "kotlin-server-263.7084.0-aarch64.tar.gz.sha256",
+            "kotlin-server-263.7084.0.win.zip",
+            "kotlin-server-263.7084.0.win.zip.sha256",
+            "kotlin-server-263.7084.0-aarch64.win.zip",
+            "kotlin-server-263.7084.0-aarch64.win.zip.sha256",
+        ];
+        let rules = find("kotlin-lsp").unwrap().asset_rules();
+        let mac_arm = Platform { os: Mac, arch: Arm64 };
+        assert_eq!(select_asset(&names, rules, mac_arm), Some("kotlin-server-263.7084.0-aarch64.sit"));
+        let mac_x64 = Platform { os: Mac, arch: X64 };
+        assert_eq!(select_asset(&names, rules, mac_x64), Some("kotlin-server-263.7084.0.sit"));
+        let linux_x64 = Platform { os: Linux, arch: X64 };
+        assert_eq!(select_asset(&names, rules, linux_x64), Some("kotlin-server-263.7084.0.tar.gz"));
+        let linux_arm = Platform { os: Linux, arch: Arm64 };
+        assert_eq!(select_asset(&names, rules, linux_arm), Some("kotlin-server-263.7084.0-aarch64.tar.gz"));
+        let win_x64 = Platform { os: Windows, arch: X64 };
+        assert_eq!(select_asset(&names, rules, win_x64), Some("kotlin-server-263.7084.0.win.zip"));
+        let win_arm = Platform { os: Windows, arch: Arm64 };
+        assert_eq!(select_asset(&names, rules, win_arm), Some("kotlin-server-263.7084.0-aarch64.win.zip"));
     }
 }

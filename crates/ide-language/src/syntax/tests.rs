@@ -759,6 +759,7 @@ fn outline_html_css_xml() {
           Field body
             Field div
             Field script
+              Variable a
         ",
     );
     check_outline(
@@ -886,6 +887,17 @@ fn outline_more_languages() {
         ",
     );
     check_outline(
+        "prisma",
+        "datasource db {\n  provider = \"sqlite\"\n}\nmodel User {\n  id Int @id\n  @@map(\"users\")\n}\nenum Role {\n  ADMIN\n}\n",
+        "
+        Module db
+        Class User
+          Field id
+        Enum Role
+          EnumMember ADMIN
+        ",
+    );
+    check_outline(
         "nix",
         "{ pkgs, ... }:\nlet\n  foo = 1;\n  bar = x: x;\nin { inherit foo; }\n",
         "
@@ -970,6 +982,113 @@ fn g() {}
 }
 
 #[test]
+fn folding_typescript_import_run_ending_with_multiline_import() {
+    let src = "import { ZodError } from 'zod'\nimport { Library } from './library.js'\nimport {\n  CreationIntent,\n} from './creation-assistant.js'\n";
+    assert!(folds("typescript", src).contains(&(0, 4, FoldKind::Imports)));
+}
+
+#[test]
+fn folding_script_imports_in_web_containers() {
+    use ide_core::DocId;
+    use std::sync::Arc;
+
+    let src = "<template><div/></template>\n<script setup lang=\"ts\">\nimport { ref, normalizeStyle } from 'vue'\nimport { Button, CheckableTagGroup, Divider, Space } from 'antdv-next'\n</script>\n";
+    let cache = SyntaxCache::new(Arc::new(Syntax::new()));
+    for id in ["vue", "html", "svelte", "jsp"] {
+        let expected = (2, 3, FoldKind::Imports);
+        assert!(folds(id, src).contains(&expected), "{id}");
+        let doc = DocId::next();
+        cache.open(doc, &lang(id), 0);
+        let cached = cache.folding(doc, &lang(id), 0, src);
+        assert!(cached.iter().any(|f| (f.start_line, f.end_line, f.kind) == expected), "{id}");
+    }
+
+    let js = "<script>\r\nimport a from 'a'\r\nimport b from 'b'\r\n</script>\r\n";
+    assert!(folds("vue", js).contains(&(1, 2, FoldKind::Imports)));
+    let json = "<script type=\"application/json\">\nimport a from 'a'\nimport b from 'b'\n</script>\n";
+    assert!(!folds("vue", json).iter().any(|f| f.2 == FoldKind::Imports));
+}
+
+#[test]
+fn folding_xml_custom_regions() {
+    for (start, end) in [
+        ("<!--region要折叠的内容-->", "<!-- endregion -->"),
+        ("<!--region name-->", "<!--endregion-->"),
+        ("<!-- <editor-fold desc=\"Head\"> -->", "<!-- </editor-fold> -->"),
+    ] {
+        let text = format!("<project>\n  {start}\n  <name>demo</name>\n  {end}\n</project>\n");
+        assert!(folds("xml", &text).contains(&(1, 3, FoldKind::Region)), "{text}");
+    }
+}
+
+#[test]
+fn folding_custom_regions_use_configured_comment_tokens() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../fixtures/folding/regions.json")).unwrap();
+    let registry = LanguageRegistry::load(None).unwrap();
+    let cache = SyntaxCache::new(std::sync::Arc::new(Syntax::new()));
+    for language in fixture["languages"].as_array().unwrap() {
+        let id = language.as_str().unwrap();
+        let cfg = registry.get(&lang(id)).unwrap();
+        let mut tokens = Vec::new();
+        if let Some(line) = &cfg.line_comment {
+            tokens.push((line.as_str(), ""));
+        }
+        if let Some((open, close)) = &cfg.block_comment {
+            tokens.push((open.as_str(), close.as_str()));
+        }
+        for (open, close) in tokens {
+            for space in ["", " ", "  "] {
+                // Word delimiters require a separator in the language itself.
+                if space.is_empty() && open.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+                    continue;
+                }
+                let wrap = |body: &str| format!("  {open}{space}{body}{space}{close}");
+                for marker in fixture["markers"].as_array().unwrap() {
+                    let start = wrap(marker["start"].as_str().unwrap());
+                    let end = wrap(marker["end"].as_str().unwrap());
+                    let tokens = folding::CommentTokens::from(&cfg);
+                    assert_eq!(folding::region_marker(&start, &tokens), Some(true), "{id}: {start}");
+                    assert_eq!(folding::region_marker(&end, &tokens), Some(false), "{id}: {end}");
+                    // Ruby block delimiters must occupy separate lines; Haskell
+                    // interprets `--` followed immediately by a symbol as an operator.
+                    if (id == "ruby" && open == "=begin") || (id == "haskell" && space.is_empty()) {
+                        continue;
+                    }
+                    let text = format!("{start}\n\n{end}\n");
+                    let expected = vec![(0, 2, FoldKind::Region)];
+                    assert_eq!(folds(id, &text), expected, "{id}: {text}");
+                    let doc = ide_core::DocId::next();
+                    cache.open(doc, &lang(id), 0);
+                    let actual = cache.folding(doc, &lang(id), 0, &text);
+                    assert_eq!(cache.folding(doc, &lang(id), 0, &text), actual);
+                    cache.close(doc);
+                    assert_eq!(
+                        actual.iter().map(|f| (f.start_line, f.end_line, f.kind)).collect::<Vec<_>>(),
+                        expected,
+                        "cached {id}: {text}"
+                    );
+                    let nested = format!("{end}\n\n{start}\n{start}\n\n{end}\n{end}\n{start}\n");
+                    assert_eq!(
+                        folds(id, &nested),
+                        vec![(2, 6, FoldKind::Region), (3, 5, FoldKind::Region)],
+                        "nested {id}: {nested}"
+                    );
+                }
+                for invalid in fixture["invalid"].as_array().unwrap() {
+                    let start = wrap(invalid.as_str().unwrap());
+                    assert_eq!(
+                        folding::region_marker(&start, &folding::CommentTokens::from(&cfg)),
+                        None,
+                        "invalid {id}: {start}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn folding_python_bodies_start_at_header() {
     let src = "import os\nimport sys\n\nclass A:\n    def f(self):\n        return [\n            1,\n        ]\n\n\ndef g():\n    pass\n";
     assert_eq!(
@@ -981,6 +1100,77 @@ fn folding_python_bodies_start_at_header() {
             (5, 7, FoldKind::Region),
             (10, 11, FoldKind::Region),
         ]
+    );
+}
+
+#[test]
+fn folding_python_docstrings_are_comments() {
+    let src = r#""""Module doc.
+More.
+"""
+
+class A:
+    """Class doc.
+    More.
+    """
+    def f(self):
+        """Method doc.
+        More.
+        """
+        return 1
+"#;
+    assert_eq!(
+        folds("python", src),
+        vec![
+            (0, 2, FoldKind::Comment),
+            (4, 12, FoldKind::Region),
+            (5, 7, FoldKind::Comment),
+            (8, 12, FoldKind::Region),
+            (9, 11, FoldKind::Comment),
+        ]
+    );
+}
+
+#[test]
+fn folding_python_single_line_or_later_strings_are_not_docstrings() {
+    // A one-line docstring has nothing to fold; a multi-line string that is not
+    // the opening statement stays an ordinary string fold, not a doc comment.
+    let src = r#"x = 1
+"""Later string.
+Still later.
+"""
+
+def f():
+    """One line."""
+    return 1
+"#;
+    let found = folds("python", src);
+    assert!(!found.contains(&(1, 3, FoldKind::Comment)), "later string must not be a doc comment: {found:?}");
+    assert!(found.contains(&(1, 3, FoldKind::Region)), "later string still folds as a string: {found:?}");
+    assert!(!found.iter().any(|f| f.2 == FoldKind::Comment), "single-line docstring has no fold: {found:?}");
+}
+
+#[test]
+fn folding_elixir_doc_strings_are_comments() {
+    let src = r#"defmodule Foo do
+  @moduledoc """
+  Module doc.
+  More.
+  """
+
+  @doc ~S"""
+  Function doc.
+  More.
+  """
+  def bar, do: :ok
+
+  @doc "one line"
+  def baz, do: :ok
+end
+"#;
+    assert_eq!(
+        folds("elixir", src),
+        vec![(0, 14, FoldKind::Region), (1, 4, FoldKind::Comment), (6, 9, FoldKind::Comment),]
     );
 }
 
@@ -1287,6 +1477,88 @@ fn merge_visibility_matches_by_name_and_position() {
 }
 
 #[test]
+fn merge_kinds_names_types_a_server_reported_as_values_or_type_parameters() {
+    fn kinds(items: &[OutlineItem], out: &mut Vec<(String, SymbolKind)>) {
+        for i in items {
+            out.push((i.name.clone(), i.kind));
+            kinds(&i.children, out);
+        }
+    }
+    /// The syntax outline with each kind replaced as a server reports it.
+    fn as_server(ts: &[OutlineItem], server: &[(&str, SymbolKind)]) -> Vec<OutlineItem> {
+        fn set(items: &mut [OutlineItem], server: &[(&str, SymbolKind)], at: &mut usize) {
+            for i in items {
+                i.kind = server[*at].1;
+                assert_eq!(i.name, server[*at].0);
+                *at += 1;
+                set(&mut i.children, server, at);
+            }
+        }
+        let mut lsp = ts.to_vec();
+        set(&mut lsp, server, &mut 0);
+        lsp
+    }
+    fn merged(language: &str, src: &str, server: &[(&str, SymbolKind)]) -> Vec<(String, SymbolKind)> {
+        let ts = syntax().outline(&lang(language), src);
+        let mut lsp = as_server(&ts, server);
+        crate::merge_kinds(&mut lsp, &ts);
+        let mut out = Vec::new();
+        kinds(&lsp, &mut out);
+        out
+    }
+    use SymbolKind as K;
+    let owned = |v: &[(&str, SymbolKind)]| v.iter().map(|(n, k)| (n.to_string(), *k)).collect::<Vec<_>>();
+
+    // typescript-language-server: a type alias is a Variable; `const` is one too.
+    let ts = "type Cents = number;\ninterface Shape {}\nconst rate = 1;\n";
+    assert_eq!(
+        merged("typescript", ts, &[("Cents", K::Variable), ("Shape", K::Interface), ("rate", K::Variable)]),
+        owned(&[("Cents", K::TypeAlias), ("Shape", K::Interface), ("rate", K::Variable)]),
+    );
+
+    // rust-analyzer: type aliases and associated types are TypeParameters, a trait an Interface.
+    let rs = "pub type Meters = u32;\ntrait Measure { type Unit; }\nstruct Rope;\nimpl Measure for Rope { type Unit = Meters; }\n";
+    assert_eq!(
+        merged(
+            "rust",
+            rs,
+            &[
+                ("Meters", K::TypeParameter),
+                ("Measure", K::Interface),
+                ("Unit", K::TypeParameter),
+                ("Rope", K::Struct),
+                ("impl Measure for Rope", K::Variable),
+                ("Unit", K::TypeParameter),
+            ],
+        ),
+        owned(&[
+            ("Meters", K::TypeAlias),
+            ("Measure", K::Interface),
+            ("Unit", K::TypeAlias),
+            ("Rope", K::Struct),
+            ("impl Measure for Rope", K::Variable),
+            ("Unit", K::TypeAlias),
+        ]),
+    );
+
+    // sourcekit-lsp: typealias and associatedtype are TypeParameters.
+    let swift = "typealias Meters = Int\nprotocol Measure { associatedtype Unit }\n";
+    assert_eq!(
+        merged("swift", swift, &[("Meters", K::TypeParameter), ("Measure", K::Interface), ("Unit", K::TypeParameter)]),
+        owned(&[("Meters", K::TypeAlias), ("Measure", K::Interface), ("Unit", K::TypeAlias)]),
+    );
+
+    // A type kind the server chose stays: clangd's Class for a typedef, gopls's Struct.
+    let c = "typedef unsigned int meters;\n";
+    assert_eq!(merged("c", c, &[("meters", K::Class)]), owned(&[("meters", K::Class)]));
+    let go = "package p\n\ntype Point struct{}\n";
+    assert_eq!(
+        merged("go", go, &[("p", K::Package), ("Point", K::Struct)]),
+        owned(&[("p", K::Package), ("Point", K::Struct)])
+    );
+}
+
+#[test]
 fn spelling_regions_cover_declared_names_only() {
     let src = "// note\nfn parse_input(raw_text: &str) -> Value { let mut counter = helper(raw_text); \"hi\" }\n";
     let found: Vec<(&str, SpellingKind)> =
@@ -1329,4 +1601,349 @@ fn spelling_regions_cover_declared_names_only() {
         .map(|r| &java[r.start..r.end])
         .collect();
     assert_eq!(names, ["Bird", "fly", "text"]);
+}
+
+#[test]
+fn spelling_regions_mark_raw_strings() {
+    let py = r#"a = r"\user" + R'\mesage' + fr"\wrd" + rb"\foo" + "\user""#;
+    let found: Vec<(&str, bool)> = syntax()
+        .spelling_regions(&lang("python"), py)
+        .unwrap()
+        .iter()
+        .filter(|r| r.kind == SpellingKind::String)
+        .map(|r| (&py[r.start..r.end], r.raw))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (r#"r"\user""#, true),
+            (r"R'\mesage'", true),
+            (r#"fr"\wrd""#, true),
+            (r#"rb"\foo""#, true),
+            (r#""\user""#, false),
+        ]
+    );
+    // C# verbatim / Rust raw literals are named by the grammar itself.
+    let cs = r#"var s = @"C:\mesage";"#;
+    let raw = syntax().spelling_regions(&lang("csharp"), cs).unwrap().iter().any(|r| r.raw);
+    assert!(raw, "C# verbatim string should be raw");
+    let rs = r#"let s = r"\mesage";"#;
+    let raw = syntax().spelling_regions(&lang("rust"), rs).unwrap().iter().any(|r| r.raw);
+    assert!(raw, "Rust raw string should be raw");
+}
+
+// ---------------------------------------------------------------------------
+// Script regions of Vue SFCs and HTML documents
+
+#[test]
+fn script_regions_skip_typed_blocks() {
+    let src = "<html><body><script type=\"module\">var x = 1;</script>\
+               <script type=\"application/json\">{\"a\":1}</script>\
+               <script type=\"importmap\">{}</script>\
+               <script>var y = 2;</script></body></html>";
+    let regions = syntax().script_regions(&lang("html"), src);
+    assert_eq!(regions.len(), 2, "module and plain scripts; json/importmap skipped");
+    assert_eq!(regions[0].language.as_str(), "javascript");
+}
+
+#[test]
+fn script_regions_pick_the_lang_attribute() {
+    let src = "<script setup lang=\"tsx\">\nconst App = () => <div/>\n</script>\n";
+    let regions = syntax().script_regions(&lang("vue"), src);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].language.as_str(), "tsx");
+    assert!(regions[0].text.contains("const App"));
+}
+
+#[test]
+fn script_regions_empty_for_other_languages() {
+    assert!(syntax().script_regions(&lang("rust"), "fn main() {}").is_empty());
+    assert!(syntax().script_regions(&lang("vue"), "<template><div/></template>").is_empty());
+}
+
+#[test]
+fn script_regions_classify_attributes() {
+    for language in ["vue", "html"] {
+        for (attributes, expected) in [
+            ("", Some("javascript")),
+            ("setup lang=ts", Some("typescript")),
+            ("lang='typescript'", Some("typescript")),
+            ("lang=tsx", Some("tsx")),
+            ("lang=js", Some("javascript")),
+            ("lang=jsx", Some("javascript")),
+            ("LANG=TS", Some("typescript")),
+            ("type=module", Some("javascript")),
+            ("TYPE=' text/JAVASCRIPT '", Some("javascript")),
+            ("type=application/javascript", Some("javascript")),
+            ("type=application/json", None),
+            ("type='application/ld+json'", None),
+            ("type=text/template", None),
+            ("type=importmap", None),
+            ("type=speculationrules", None),
+            ("lang=coffee", None),
+            ("lang=ts type=application/json", None),
+            ("src='./external.ts' lang=ts", None),
+            ("SRC=external.js", None),
+            ("src", None),
+        ] {
+            let src = format!("<script {attributes}>const value = 1;</script>");
+            let regions = syntax().script_regions(&lang(language), &src);
+            assert_eq!(regions.len(), usize::from(expected.is_some()), "{language}: {attributes}");
+            if let Some(expected) = expected {
+                assert_eq!(regions[0].language.as_str(), expected, "{attributes}");
+                assert_eq!(regions[0].text, "const value = 1;");
+                assert_eq!(&src[regions[0].base..regions[0].base + regions[0].text.len()], regions[0].text);
+            }
+        }
+    }
+}
+
+#[test]
+fn script_regions_preserve_document_offsets_and_line_endings() {
+    use super::lines::LineIndex;
+
+    let src = "<template>中文😀</template>\r\n<script lang=ts>const 名 = '😀';\r\n</script>\r\n<script setup lang=jsx>const View = () => <div/>;</script>";
+    let regions = syntax().script_regions(&lang("vue"), src);
+    assert_eq!(regions.len(), 2);
+    let idx = LineIndex::new(src);
+    let doc = ide_text::Document::new(src);
+    for (region, (body, pos)) in
+        regions.iter().zip([("const 名 = '😀';\r\n", Pos::new(1, 16)), ("const View = () => <div/>;", Pos::new(3, 23))])
+    {
+        assert_eq!(region.base, src.find(body).unwrap());
+        assert_eq!(region.text, body);
+        assert_eq!(idx.pos(region.base), pos);
+        assert_eq!(idx.pos(region.base), doc.byte_to_pos(src[..region.base].replace("\r\n", "\n").len()));
+        assert_eq!(
+            idx.pos(region.base + body.len()),
+            doc.byte_to_pos(src[..region.base + body.len()].replace("\r\n", "\n").len())
+        );
+        if let Some(name) = body.find('名') {
+            assert_eq!(
+                idx.range(region.base + name, region.base + name + '名'.len_utf8()),
+                Range::new(Pos::new(1, 22), Pos::new(1, 23))
+            );
+        }
+    }
+    let same_line = "<template>中文😀</template><script>let x = 1;</script>";
+    let region = &syntax().script_regions(&lang("html"), same_line)[0];
+    assert_eq!(LineIndex::new(same_line).pos(region.base), Pos::new(0, 33));
+}
+
+#[test]
+fn script_regions_tolerate_incomplete_markup() {
+    for src in [
+        "<script",
+        "<script lang=",
+        "<script lang='ts",
+        "<script>const unfinished =",
+        "<template><div><script lang=ts>const x = 1;</script>",
+        "<script></script>",
+        "<script src='missing.js'>ignored</script><script>const x = 1;",
+    ] {
+        for region in syntax().script_regions(&lang("vue"), src) {
+            assert_eq!(src.get(region.base..region.base + region.text.len()), Some(region.text.as_str()));
+        }
+    }
+}
+
+#[test]
+fn script_regions_large_vue_document() {
+    for count in [2_000, 4_000, 8_000] {
+        let src =
+            "<template><div>中文😀</div></template>\r\n<script setup lang=ts>const x = 1;</script>\r\n".repeat(count);
+        let start = std::time::Instant::now();
+        let regions = syntax().script_regions(&lang("vue"), &src);
+        eprintln!("script regions: {} bytes, {count} blocks: {:?}", src.len(), start.elapsed());
+        assert_eq!(regions.len(), count);
+        assert!(regions.windows(2).all(|pair| pair[0].base < pair[1].base));
+    }
+}
+
+#[test]
+fn script_regions_tolerate_deep_markup() {
+    let src = "<div>".repeat(1_000) + "<script>const x = 1;</script>";
+    let regions = syntax().script_regions(&lang("html"), &src);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].base, src.find("const").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Outline with nested <script> declarations (Vue SFC / HTML)
+
+#[test]
+fn html_outline_nests_script_declarations() {
+    let src = "<html><body>\n<script>\nfunction boot() {}\nconst app = 1;\n</script>\n\
+               <script type=\"application/json\">{\"a\": 1}</script>\n</body></html>";
+    check_outline(
+        "html",
+        src,
+        "
+        Field html
+          Field body
+            Field script
+              Function boot
+              Constant app
+            Field script
+        ",
+    );
+}
+
+#[test]
+fn vue_outline_nests_script_declarations_without_a_grammar() {
+    let src = "<template>\n  <div class=\"app\"/>\n</template>\n\
+               <script setup lang=\"ts\">\ninterface Props { size: number }\nfunction scale(n: number) {}\n</script>\n\
+               <style scoped>\n.app { color: red }\n</style>";
+    check_outline(
+        "vue",
+        src,
+        "
+        Field template
+        Field script
+          Interface Props
+            Property size
+          Function scale
+        Field style
+        ",
+    );
+}
+
+#[test]
+fn script_outline_positions_are_document_coordinates() {
+    use super::lines::LineIndex;
+    let src = "<template><!-- 😀 --></template>\r\n<script lang=\"ts\">\r\nconst answer = 42;\r\n</script>";
+    let outline = syntax().outline(&lang("vue"), src);
+    let decl = &outline.iter().find(|i| i.name == "script").unwrap().children[0];
+    // Cross-check against the document's own byte -> UTF-16 conversion.
+    let idx = LineIndex::new(src);
+    let at = src.find("answer").unwrap();
+    assert_eq!(decl.selection_range, idx.range(at, at + "answer".len()));
+    // `@def.constant` captures the declarator (`answer = 42`), not the `const` keyword.
+    assert_eq!(decl.range, idx.range(at, src.find("42;").unwrap() + 2));
+}
+
+#[test]
+fn cached_outline_matches_syntax_outline_for_web_documents() {
+    use ide_core::DocId;
+    use std::sync::Arc;
+    let cache = SyntaxCache::new(Arc::new(Syntax::new()));
+    let id = DocId::next();
+    let src = "<template><div/></template>\n<script lang=\"ts\">\nconst app = 1;\n</script>\n";
+    cache.open(id, &lang("vue"), 0);
+    assert_eq!(cache.outline(id, &lang("vue"), 0, src), syntax().outline(&lang("vue"), src));
+    cache.open(id, &lang("html"), 0);
+    assert_eq!(cache.outline(id, &lang("html"), 0, src), syntax().outline(&lang("html"), src));
+}
+
+#[test]
+fn script_outlines_compose_positions_across_multiple_blocks() {
+    use super::lines::LineIndex;
+
+    let src = "<template>中文😀</template><script lang=ts>/* 中文😀 */ function first() { return 1; }</script>\r\n<script setup lang=ts>/* 中文😀 */ const second = 2;\r\nfunction third() {}\r\n</script>";
+    let lines = LineIndex::new(src);
+    for id in ["html", "vue", "svelte", "jsp"] {
+        let items = syntax().outline(&lang(id), src);
+        let scripts: Vec<_> = items.iter().filter(|item| item.name == "script").collect();
+        assert_eq!(scripts.len(), 2, "{id}");
+        assert_eq!(scripts[0].children.len(), 1);
+        assert_eq!(scripts[1].children.len(), 2);
+        for (item, name) in scripts.iter().flat_map(|s| &s.children).zip(["first", "second", "third"]) {
+            let byte = src.find(name).unwrap();
+            assert_eq!(item.name, name);
+            assert_eq!(item.selection_range, lines.range(byte, byte + name.len()), "{id}: {name}");
+        }
+    }
+}
+
+#[test]
+fn script_outline_attaches_to_case_insensitive_html_tags() {
+    check_outline("html", "<SCRIPT>function boot() {}</SCRIPT>", "Field SCRIPT\n  Function boot");
+}
+
+#[test]
+fn outline_restructuredtext_levels_follow_first_use_of_each_adornment() {
+    let src = "\
+=========
+ Project
+=========
+
+Install
+~~~~~~~
+
+From source
+-----------
+
+Literal block::
+
+    Not a title
+    -----------
+
+Intro
+--
+
+A paragraph
+with a line
+------------
+
+.. comment
+-----------
+
+Usage
+~~~~~
+
+.. note::
+
+   Indented
+   --------
+
+Short underline, still a title
+------
+
+Underline only
+==============
+";
+    check_outline(
+        "restructuredtext",
+        src,
+        "
+        Key Project
+          Key Install
+            Key From source
+          Key Usage
+            Key Short underline, still a title
+              Key Underline only
+        ",
+    );
+    let items = syntax().outline(&lang("restructuredtext"), src);
+    let project = &items[0];
+    assert_eq!(project.range.start, Pos::new(0, 0));
+    assert_eq!((project.selection_range.start, project.selection_range.end), (Pos::new(1, 1), Pos::new(1, 8)));
+    let install = &project.children[0];
+    assert_eq!((install.range.start, install.range.end), (Pos::new(4, 0), Pos::new(23, 11)));
+    assert!(syntax().outline(&lang("restructuredtext"), "Title\n\n").is_empty());
+}
+
+#[test]
+fn outline_restructuredtext_unicode_crlf_and_cached_edits() {
+    use ide_core::DocId;
+    use std::sync::Arc;
+
+    let src = "=========\r\n 中文😀\r\n=========\r\n\r\n子章节\r\n------\r\n\r\nBody\r\n\r\nOther\r\n------\r\n";
+    let id = DocId::next();
+    let language = lang("restructuredtext");
+    let cache = SyntaxCache::new(Arc::new(Syntax::new()));
+    cache.open(id, &language, 0);
+    let items = cache.outline(id, &language, 0, src);
+    assert_eq!(items, syntax().outline(&language, src));
+    assert_eq!(items[0].name, "中文😀");
+    assert_eq!(items[0].selection_range, Range::new(Pos::new(1, 1), Pos::new(1, 5)));
+    assert_eq!(items[0].children[0].name, "子章节");
+    assert_eq!(items[0].children[0].selection_range, Range::new(Pos::new(4, 0), Pos::new(4, 3)));
+    assert_eq!(items[0].children[0].range.end, Pos::new(7, 4));
+    assert_eq!(items[0].children[1].name, "Other");
+    let edited = src.replace("子章节", "新章节😀");
+    let updated = cache.outline(id, &language, 1, &edited);
+    assert_eq!(updated, syntax().outline(&language, &edited));
+    assert_eq!(updated[0].children[0].selection_range.end, Pos::new(4, 5));
+    assert_ne!(items, updated);
 }

@@ -9,8 +9,9 @@ import { Decoration, EditorView, ViewPlugin, type DecorationSet } from "@codemir
 import { editorsFor, activeEditor, type EditorDocContext, type TextEditorHandle } from "@/editor/api";
 import { call, commands, type DebugSessionId, type StepInTarget } from "@/platform/ipc";
 import { suspendKeyboardDispatch } from "@/platform/keymap";
+import type { PopupAnchor } from "@/ui";
 import { notifications } from "@/workbench/contributions";
-import { useExecutionPoint } from "../state";
+import { useExecutionPoint, resumeExecution } from "../state";
 import { useOverlays, type InlineStepTarget } from "../ui/popoverStore";
 import styles from "./editor.module.css";
 
@@ -29,7 +30,8 @@ function callPattern(name: string, flags: string): RegExp {
 }
 
 function isCallBoundary(text: string, from: number): boolean {
-  return !/[\p{L}\p{N}_$]$/u.test(text.slice(Math.max(0, from - 2), from));
+  // Not `[\p{L}\p{N}_$]$`: V8 (Node 26) misses an astral letter with a lone class before `$`.
+  return !/(?:\p{L}|\p{N}|[_$])$/u.test(text.slice(Math.max(0, from - 2), from));
 }
 
 function identifierEnd(text: string, from: number): number {
@@ -101,6 +103,29 @@ function editorShowing(path: string): TextEditorHandle | null {
   return editorsFor(path)[0] ?? null;
 }
 
+export function smartStepAnchor(): PopupAnchor {
+  const { path, line } = useExecutionPoint.getState();
+  const view = path && editorShowing(path)?.view;
+  if (!view) return "center";
+  const measure = () => {
+    const doc = view.state.doc;
+    if (line < 0 || line >= doc.lines) return null;
+    const point = view.coordsAtPos(doc.line(line + 1).from, 1);
+    const viewport = view.scrollDOM.getBoundingClientRect();
+    if (
+      !point ||
+      point.left < viewport.left ||
+      point.left > viewport.right ||
+      point.bottom <= viewport.top ||
+      point.top >= viewport.bottom
+    )
+      return null;
+    return new DOMRect(point.left, point.top, 0, point.bottom - point.top);
+  };
+  const initial = measure();
+  return initial ? { contextElement: view.contentDOM, getBoundingClientRect: () => measure() ?? initial } : "center";
+}
+
 /**
  * Starts inline picking when the paused line is open in an editor and every
  * target can be placed on it; returns false otherwise (caller shows the dialog).
@@ -139,7 +164,7 @@ export function chooseStepTarget(id?: number) {
   const target = id ?? s.inline?.ranges[s.inline.index]?.id;
   cancelSmartStep();
   if (target == null) return;
-  void call(commands.debugStepInTarget(s.session, s.thread, target)).catch((e) =>
+  void resumeExecution(s.session, () => call(commands.debugStepInTarget(s.session, s.thread, target))).catch((e) =>
     notifications().notify({
       group: "run",
       level: "error",

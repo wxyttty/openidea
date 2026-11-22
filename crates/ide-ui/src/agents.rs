@@ -156,7 +156,7 @@ impl AgentPanel {
             cx.notify();
             return;
         }
-        match ide_host::ops::agent::providers(&self.host, "main") {
+        match ide_host::ops::agent::agent_providers(&self.host, "main") {
             Ok(providers) => {
                 if self.selected_provider >= providers.len() {
                     self.selected_provider = 0;
@@ -179,10 +179,10 @@ impl AgentPanel {
             return;
         }
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
-        let sink: ide_host::ops::Emit<AgentEvent> = Arc::new(move |event| {
+        let channel = ide_host::ops::Channel::new(move |event| {
             let _ = tx.unbounded_send(event);
         });
-        match ide_host::ops::agent::subscribe(&self.host, "main", sink) {
+        match ide_host::ops::agent::agent_subscribe(&self.host, "main", channel, "gpui".into()) {
             Ok(tasks) => {
                 self.tasks = tasks;
                 self.subscribed = Some(project.root.clone());
@@ -206,6 +206,7 @@ impl AgentPanel {
     fn on_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
             AgentEvent::Task { task } => {
+                let task = *task;
                 if let Some(existing) = self.tasks.iter_mut().find(|existing| existing.id == task.id) {
                     *existing = task.clone();
                 } else {
@@ -213,7 +214,7 @@ impl AgentPanel {
                 }
                 if self.selected_task.is_none() {
                     self.selected_task = Some(task.id.clone());
-                    self.entries = ide_host::ops::agent::entries(&self.host, "main", task.id, None).unwrap_or_default();
+                    self.entries = ide_host::ops::agent::agent_entries(&self.host, "main", task.id, None).unwrap_or_default();
                 }
             }
             AgentEvent::Removed { id } => {
@@ -225,7 +226,7 @@ impl AgentPanel {
             }
             AgentEvent::Truncated { task, .. } => {
                 if self.selected_task.as_deref() == Some(task.as_str())
-                    && let Ok(entries) = ide_host::ops::agent::entries(&self.host, "main", task, None)
+                    && let Ok(entries) = ide_host::ops::agent::agent_entries(&self.host, "main", task, None)
                 {
                     self.entries = entries;
                 }
@@ -243,14 +244,40 @@ impl AgentPanel {
                     }
                 }
             }
-            AgentEvent::Entry { .. } => {}
+            AgentEvent::Append { task, subagent: None, index, from, text } => {
+                // The streamed text repeats from `from` (UTF-16 units) what the entry
+                // already holds, so only the tail is appended.
+                if self.selected_task.as_deref() == Some(task.as_str())
+                    && let Some(entry) = self.entries.get_mut(index as usize)
+                {
+                    let (held, tail) = match entry {
+                        AgentEntry::Agent { text } => (text.len(), text.as_str()),
+                        AgentEntry::Thought { text, .. } => (text.len(), text.as_str()),
+                        _ => (0, ""),
+                    };
+                    let _ = tail;
+                    if (from as usize) <= held && held < from as usize + text.len() {
+                        let rest = text[held - from as usize..].to_owned();
+                        match entry {
+                            AgentEntry::Agent { text } => text.push_str(&rest),
+                            AgentEntry::Thought { text, .. } => text.push_str(&rest),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            AgentEvent::Entry { .. } | AgentEvent::Append { .. } => {}
+            AgentEvent::Limits { .. }
+            | AgentEvent::ModelCatalog { .. }
+            | AgentEvent::Providers
+            | AgentEvent::Attention { .. } => {}
         }
         cx.notify();
     }
 
     fn select_task(&mut self, id: String, cx: &mut Context<Self>) {
         self.selected_task = Some(id.clone());
-        self.entries = ide_host::ops::agent::entries(&self.host, "main", id, None).unwrap_or_default();
+        self.entries = ide_host::ops::agent::agent_entries(&self.host, "main", id, None).unwrap_or_default();
         cx.notify();
     }
 
@@ -278,7 +305,7 @@ impl AgentPanel {
             let host = self.host.clone();
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
             self.host.runtime.spawn(async move {
-                let result = ide_host::ops::agent::prompt(&host, "main", task, prompt, true)
+                let result = ide_host::ops::agent::agent_prompt(&host, "main", task, prompt, true)
                     .await
                     .map_err(|err| err.to_string());
                 let _ = tx.unbounded_send(result);
@@ -315,10 +342,13 @@ impl AgentPanel {
             config: Vec::new(),
             isolation: self.isolation,
             base: None,
+            mcp_overrides: Default::default(),
+            skill_overrides: Default::default(),
+            idle: false,
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
-            let result = ide_host::ops::agent::create(&host, "main", request).await.map_err(|err| err.to_string());
+            let result = ide_host::ops::agent::agent_create(&host, "main", request).await.map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.request_task = Some(cx.spawn(async move |this, cx| {
@@ -330,7 +360,7 @@ impl AgentPanel {
                             this.selected_task = Some(task.id.clone());
                             this.tasks.push(task.clone());
                             this.entries =
-                                ide_host::ops::agent::entries(&this.host, "main", task.id, None).unwrap_or_default();
+                                ide_host::ops::agent::agent_entries(&this.host, "main", task.id, None).unwrap_or_default();
                         }
                         Err(err) => {
                             tracing::info!(%err, "agent: create failed");
@@ -346,7 +376,7 @@ impl AgentPanel {
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
         let Some(task) = self.selected_task.clone() else { return };
-        if let Err(err) = ide_host::ops::agent::cancel(&self.host, "main", task, None) {
+        if let Err(err) = ide_host::ops::agent::agent_cancel(&self.host, "main", task, None) {
             self.notice = Some(err.to_string().into());
         }
         cx.notify();
@@ -359,11 +389,11 @@ impl AgentPanel {
     /// lets a tool-needing task continue instead of waiting forever.
     pub fn respond(&mut self, permission: u32, option: Option<String>, cx: &mut Context<Self>) {
         let Some(task) = self.selected_task.clone() else { return };
-        match ide_host::ops::agent::respond(&self.host, "main", task.clone(), permission, option) {
+        match ide_host::ops::agent::agent_respond(&self.host, "main", task.clone(), permission, option) {
             Ok(()) => {
                 // Re-read the conversation so the entry shows its chosen option
                 // immediately, before the next streamed event arrives.
-                self.entries = ide_host::ops::agent::entries(&self.host, "main", task, None).unwrap_or_default();
+                self.entries = ide_host::ops::agent::agent_entries(&self.host, "main", task, None).unwrap_or_default();
                 self.notice = None;
             }
             Err(err) => self.notice = Some(err.to_string().into()),
@@ -392,7 +422,7 @@ impl AgentPanel {
         let host = self.host.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
-            let result = ide_host::ops::agent::registry_list(&host, "main", ide_core::RequestId::next())
+            let result = ide_host::ops::agent::agent_registry_list(&host, ide_core::RequestId::next())
                 .await
                 .map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
@@ -442,13 +472,8 @@ impl AgentPanel {
                 }
             });
             let install_id = id.clone();
-            let result = ide_host::ops::agent::registry_install(
-                &host,
-                "main",
-                install_id,
-                ide_core::RequestId::next(),
-                channel,
-            )
+            let result =
+                ide_host::ops::agent::agent_registry_install(&host, install_id, ide_core::RequestId::next(), channel)
             .await
             .map_err(|err| err.to_string());
             let _ = tx.unbounded_send(match result {
@@ -485,7 +510,7 @@ impl AgentPanel {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         self.host.runtime.spawn(async move {
             let result =
-                ide_host::ops::agent::set_config(&host, "main", task, option, value).await.map_err(|err| err.to_string());
+                ide_host::ops::agent::agent_set_config(&host, "main", task, option, value).await.map_err(|err| err.to_string());
             let _ = tx.unbounded_send(result);
         });
         self.request_task = Some(cx.spawn(async move |this, cx| {
@@ -507,7 +532,7 @@ impl AgentPanel {
         let (label, text, color) = match entry {
             AgentEntry::User { text, .. } => ("YOU", text.clone(), theme.accent),
             AgentEntry::Agent { text } => ("AGENT", text.clone(), theme.foreground),
-            AgentEntry::Thought { text } => ("THOUGHT", text.clone(), theme.fg_muted()),
+            AgentEntry::Thought { text, .. } => ("THOUGHT", text.clone(), theme.fg_muted()),
             AgentEntry::Tool { title, kind, status, output, .. } => {
                 let output = output.as_deref().unwrap_or("").trim();
                 let text = if output.is_empty() { title.clone() } else { format!("{title}\n{output}") };
@@ -525,6 +550,15 @@ impl AgentPanel {
                 "SUBAGENT",
                 format!("{} · {status:?}", title.clone().unwrap_or_else(|| "subagent".into())),
                 theme.fg_secondary(),
+            ),
+            AgentEntry::Question { title, questions, chosen, .. } => (
+                "QUESTION",
+                format!(
+                    "{title} · {} · {}",
+                    questions.iter().map(|q| q.question.clone()).collect::<Vec<_>>().join(" / "),
+                    chosen.clone().unwrap_or_else(|| "pending".into())
+                ),
+                theme.warning,
             ),
             AgentEntry::Message { incoming, text } => {
                 ("MESSAGE", format!("{} {text}", if *incoming { "→" } else { "←" }), theme.fg_secondary())
@@ -685,7 +719,7 @@ impl Render for AgentPanel {
             conversation = conversation.child(Self::entry_element(entry, &entry_theme));
             // A pending permission renders its options as buttons: the agent
             // blocks its turn until one is answered.
-            if let AgentEntry::Permission { id, title, options, chosen } = entry
+            if let AgentEntry::Permission { id, title, options, chosen, .. } = entry
                 && chosen.is_none()
             {
                 let mut row = div().w_full().flex().items_center().gap_2().p_2().rounded(px(4.));

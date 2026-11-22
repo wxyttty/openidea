@@ -21,17 +21,24 @@ describe("IDEA keymap parity", () => {
     ["vcs.branches", [], ["Ctrl+Shift+`"]],
     // Git.CreateNewBranch shares Inline's shortcut.
     ["vcs.newBranch", ["Meta+Alt+N"], ["Ctrl+Alt+N"]],
+    // ChangesView.AddUnversioned; on Windows the diff viewer's Apply Right Side wins while a diff is focused.
+    ["vcs.addToVcs", ["Meta+Alt+A"], ["Ctrl+Alt+A"]],
     ["refactor.inline", ["Meta+Alt+N"], ["Ctrl+Alt+N"]],
     ["debug.resume", ["Meta+Alt+R", "F9"], ["F9"]],
     ["code.quickDefinition", ["Alt+Space", "Meta+Y"], ["Ctrl+Shift+I"]],
-    ["editor.copyPath", ["Meta+Shift+C"], ["Ctrl+Shift+C"]],
+    ["editor.copyPathReference", ["Meta+Shift+C"], ["Ctrl+Shift+C"]],
     ["project.open", ["F4", "Meta+Down"], ["F4"]],
+    // Diff.OpenInEditor copies EditSource's shortcuts.
+    ["diff.jumpToSource", ["F4", "Meta+Down"], ["F4"]],
     ["project.delete", ["Delete", "Backspace", "Meta+Backspace"], ["Delete"]],
     ["file.reloadFromDisk", ["Meta+Alt+Y"], ["Ctrl+Alt+Y"]],
     ["project.reloadFromDisk", ["Meta+Alt+Y"], ["Ctrl+Alt+Y"]],
     ["project.expandAll", ["Meta+="], ["Ctrl+="]],
     ["project.collapseAll", ["Meta+-"], ["Ctrl+-"]],
+    ["run.expandAllTests", ["Meta+="], ["Ctrl+="]],
+    ["run.collapseAllTests", ["Meta+-"], ["Ctrl+-"]],
     ["navigate.searchText", ["Meta+Alt+Shift+E"], ["Ctrl+Alt+Shift+E"]],
+    ["python.console.executeSelection", ["Alt+Shift+E"], ["Alt+Shift+E"]],
     ["window.next", ["Meta+Alt+`"], ["Ctrl+Alt+]"]],
     ["window.previous", ["Meta+Alt+Shift+`"], ["Ctrl+Alt+["]],
     ["code.commentBlock", ["Meta+Alt+/", "Ctrl+Shift+/"], ["Ctrl+Shift+/"]],
@@ -69,15 +76,16 @@ describe("IDEA keymap parity", () => {
     ["navigate.nextHighlightedUsage", ["Ctrl+Alt+Down"], ["Ctrl+Alt+Down"]],
     ["analyze.inspectFile", ["Alt+Shift+I"], ["Alt+Shift+I"]],
     ["project.copyElement", ["F5"], ["F5"]],
-    ["debug.quickEvaluate", ["Meta+Alt+F8"], ["Ctrl+Alt+F8"]],
+    ["debug.quickEvaluate", ["Meta+Alt+F8", "Alt+Button1"], ["Ctrl+Alt+F8", "Alt+Button1"]],
     ["run.chooseDebugConfig", ["Ctrl+Alt+D"], ["Alt+Shift+F9"]],
     ["editor.nextSplitter", ["Alt+Tab"], ["Alt+Tab"]],
     ["toolwindow.resizeLeft", ["Ctrl+Alt+Left"], ["Ctrl+Alt+Shift+Left"]],
     ["toolwindow.closeContent", ["Meta+W", "Ctrl+Shift+F4"], ["Ctrl+F4", "Ctrl+Shift+F4"]],
-    ["layout.restoreDefault", ["Shift+F12"], ["Shift+F12"]],
+    ["layout.restoreCurrent", ["Shift+F12"], ["Shift+F12"]],
     ["workbench.stopBackgroundProcesses", ["Meta+Shift+F2"], ["Ctrl+Shift+F2"]],
-    ["navigate.back", ["Meta+[", "Meta+Alt+Left", "Button4"], ["Ctrl+Alt+Left", "Button4"]],
-    ["navigate.forward", ["Meta+]", "Meta+Alt+Right", "Button5"], ["Ctrl+Alt+Right", "Button5"]],
+    ["navigate.back", ["Meta+[", "Meta+Alt+Left", "Button4", "SwipeRight"], ["Ctrl+Alt+Left", "Button4"]],
+    ["navigate.forward", ["Meta+]", "Meta+Alt+Right", "Button5", "SwipeLeft"], ["Ctrl+Alt+Right", "Button5"]],
+    ["file.projectStructure", ["Meta+;"], ["Ctrl+Alt+Shift+S"]],
   ])("%s", (id, mac, win) => {
     expect(intellijMacos[id]).toEqual(mac);
     expect(intellijWindows[id]).toEqual(win);
@@ -92,10 +100,12 @@ describe("IDEA keymap parity", () => {
   it.each([intellijMacos, intellijWindows])("lets scoped actions win shared keys", (km) => {
     order(km, "code.splitLine", "http.runRequest");
     order(km, "code.splitLine", "db.execute");
-    order(km, "editor.copyPath", "project.copyAbsolutePath");
+    order(km, "editor.copyPathReference", "project.copyAbsolutePath");
     order(km, "file.reloadFromDisk", "project.reloadFromDisk");
     order(km, "code.unfold", "project.expandAll");
     order(km, "code.fold", "project.collapseAll");
+    order(km, "code.unfold", "run.expandAllTests");
+    order(km, "code.fold", "run.collapseAllTests");
     order(km, "navigate.nextError", "vcs.changelist.edit");
     order(km, "debug.setValue", "vcs.changelist.edit");
     order(km, "find.replaceInFile", "find.rerun");
@@ -104,5 +114,6 @@ describe("IDEA keymap parity", () => {
     order(km, "find.inFile", "vcs.log.goToRef");
     // Inline (text editor only) wins over New Branch.
     order(km, "vcs.newBranch", "refactor.inline");
+    order(km, "vcs.addToVcs", "diff.applyRightSide");
   });
 });

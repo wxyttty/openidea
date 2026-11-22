@@ -89,10 +89,7 @@ impl RemoteHostPanel {
         let connection = match self.host.project("main") {
             Ok(project) => {
                 let settings = project.settings.effective();
-                ide_remote::server(&settings, Some(&server)).ok().map(|config| match config.kind {
-                    ide_core::remote_settings::DeploymentType::Local => FsConnection::Local,
-                    ide_core::remote_settings::DeploymentType::Sftp => FsConnection::Sftp { ssh: config.ssh_config.clone() },
-                })
+                ide_remote::server(&settings, Some(&server)).ok().map(|config| ide_remote::connection(&config))
             }
             Err(_) => None,
         };
@@ -115,7 +112,7 @@ impl RemoteHostPanel {
                     match result {
                         Ok(root) => {
                             panel.notice = None;
-                            panel.open_path(root, cx);
+                            panel.open_path(root.root, cx);
                         }
                         Err(err) => panel.notice = Some(format!("Cannot reach the server root: {err}").into()),
                     }

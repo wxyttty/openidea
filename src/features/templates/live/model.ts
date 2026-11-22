@@ -21,6 +21,8 @@ export interface TemplateVariable {
 }
 
 export interface LiveTemplate {
+  /** Read-only contribution, withdrawn with its plugin. */
+  pluginOrigin?: string;
   id: string;
   /** Settings grouping, e.g. "Rust", "Surround". */
   group: string;
@@ -267,6 +269,8 @@ export interface ExpansionEnv {
 export interface Expansion {
   /** `@codemirror/autocomplete` snippet template. */
   snippet: string;
+  /** Variable names of the editable fields, in tab order. */
+  fields: string[];
   /** The first tab stop asks for completion (`complete()`). */
   completeFirst: boolean;
   /** Per tab stop, in order: whether it asks for completion. */
@@ -358,7 +362,7 @@ export function expandTemplate(t: Pick<LiveTemplate, "body" | "variables">, env:
     }
   }
   if (!hasEnd) snippet += "${0}";
-  return { snippet, completeFirst: completing[0] ?? false, completing, preview };
+  return { snippet, fields: [...stops.keys()], completeFirst: completing[0] ?? false, completing, preview };
 }
 
 /**

@@ -10,6 +10,8 @@ import { CLAUSE_WORDS, isReserved } from "./dialect";
 import { identName, inLiteral, lex, type Lexed, type Token } from "./lexer";
 
 export interface TableRef {
+  /** Database of a three-part name (`database.schema.table`), as written. */
+  database?: string;
   /** Schema as written (`null`: unqualified). */
   schema: string | null;
   /** Table / CTE name; a derived table's alias. */
@@ -97,6 +99,10 @@ const CLAUSES: Record<string, Clause> = {
 const SET_OPS = new Set(["UNION", "INTERSECT", "EXCEPT"]);
 const QUERY_START = new Set(["SELECT", "WITH", "VALUES", "TABLE"]);
 
+/** The clause a keyword starts (Snowflake's QUALIFY filters like HAVING). */
+const clauseOf = (t: Token, driver: DbDriver): Clause | undefined =>
+  CLAUSES[t.upper] ?? (driver === "snowflake" && t.upper === "QUALIFY" ? "having" : undefined);
+
 const isIdent = (t: Token | undefined): t is Token =>
   !!t && (t.kind === "quoted" || (t.kind === "word" && !CLAUSE_WORDS.has(t.upper)));
 const isP = (t: Token | undefined, p: string) => !!t && t.kind === "punct" && t.text === p;
@@ -174,7 +180,7 @@ export function analyze(text: string, pos: number, driver: DbDriver, lexed: Lexe
   blocks.forEach((g, depth) => {
     // Within an enclosing block, the "caret" is the paren of the block nested in it.
     const [ra, rb] = blockRange(st, parens, g, depth === 0 ? nb : blocks[depth - 1]!);
-    for (const r of parseRefs(st, parens, g, ra, rb, ctes, depth)) {
+    for (const r of parseRefs(st, parens, g, ra, rb, ctes, depth, driver)) {
       refs.push(r.ref);
       if (depth === 0) refEnds.set(r.end, r.ref);
     }
@@ -194,7 +200,10 @@ export function analyze(text: string, pos: number, driver: DbDriver, lexed: Lexe
   const p = before[k];
   const pi = k;
   const block = blocks[0]!;
-  const clause = clauseAt(st, parens, block, open.length ? open.at(-1)! : -1, nb);
+  const clause = clauseAt(st, parens, block, open.length ? open.at(-1)! : -1, nb, driver);
+  // Snowflake `col:path`: the keys of a VARIANT are not in the model.
+  const variantPath =
+    driver === "snowflake" && isP(p, ":") && p!.to === (pi + 1 < before.length ? before[pi + 1]!.from : prefix.from);
 
   let context: SqlContext;
   if (literal) context = { kind: "none" };
@@ -208,7 +217,7 @@ export function analyze(text: string, pos: number, driver: DbDriver, lexed: Lexe
   else if (isW(p, "LATERAL", "ONLY") && isW(before[pi - 1], "JOIN", "FROM"))
     context = { kind: "table", join: isW(before[pi - 1], "JOIN") };
   else if (isP(p, ",") && clause === "from" && parens.parent[pi] === block) context = { kind: "table", join: false };
-  else if (isW(p, "AS") || isP(p, "::")) context = { kind: "none" };
+  else if (isW(p, "AS") || isP(p, "::") || variantPath) context = { kind: "none" };
   else if (refEnds.has(pi) && !qualifier.length && (clause === "from" || clause === "other")) {
     const ref = refEnds.get(pi)!;
     context = { kind: "afterTable", ref };
@@ -253,7 +262,14 @@ function blockRange(st: Token[], parens: Parens, g: number, caret: number): [num
 }
 
 /** The clause the caret is in: the last clause keyword of its block before it. */
-function clauseAt(st: Token[], parens: Parens, block: number, innermost: number, caret: number): Clause {
+function clauseAt(
+  st: Token[],
+  parens: Parens,
+  block: number,
+  innermost: number,
+  caret: number,
+  driver: DbDriver,
+): Clause {
   // Inside a non-query paren (function call, IN list), the clause is the one around that paren.
   const limit = innermost > block ? innermost : caret;
   let clause: Clause = "other";
@@ -261,7 +277,7 @@ function clauseAt(st: Token[], parens: Parens, block: number, innermost: number,
     const t = st[i]!;
     if (t.kind !== "word") continue;
     if (SET_OPS.has(t.upper)) clause = "other";
-    const c = CLAUSES[t.upper];
+    const c = clauseOf(t, driver);
     if (c) clause = c;
   }
   return clause;
@@ -362,6 +378,7 @@ function parseRefs(
   b: number,
   ctes: TableRef[],
   depth: number,
+  driver: DbDriver,
 ): Array<{ ref: TableRef; end: number }> {
   const out: Array<{ ref: TableRef; end: number }> = [];
   const level = parens.level(g, a, b);
@@ -373,7 +390,7 @@ function parseRefs(
     if (isP(t, "(")) {
       const c = parens.close.get(j)!;
       const columns = outputColumns(st, parens, j, j + 1, c);
-      const al = alias(st, c + 1, b);
+      const al = alias(st, c + 1, b, driver);
       if (al)
         out.push({
           ref: {
@@ -408,10 +425,14 @@ function parseRefs(
     const last = parts.at(-1)!;
     const name = identName(last);
     const schema = parts.length > 1 ? identName(parts.at(-2)!) : null;
-    const al = alias(st, k, b);
-    const cte = schema === null ? ctes.find((c) => c.name.toLowerCase() === name.toLowerCase()) : undefined;
+    const al = alias(st, k, b, driver);
+    const cte =
+      schema === null
+        ? ctes.find((c) => (driver === "clickhouse" ? c.name === name : c.name.toLowerCase() === name.toLowerCase()))
+        : undefined;
     out.push({
       ref: {
+        ...(parts.length > 2 ? { database: identName(parts.at(-3)!) } : {}),
         schema,
         name,
         alias: al?.name ?? null,
@@ -435,7 +456,7 @@ function parseRefs(
         item(i + 1, t.upper === "JOIN" || t.upper === "STRAIGHT_JOIN", t.upper === "INTO");
         continue;
       }
-      const c = CLAUSES[t.upper];
+      const c = clauseOf(t, driver);
       if (c) clause = c;
     } else if (isP(t, ",") && clause === "from") item(i + 1);
   }
@@ -443,13 +464,13 @@ function parseRefs(
 }
 
 /** An alias at `k` (`AS x`, or a bare non-keyword identifier). */
-function alias(st: Token[], k: number, b: number): { name: string; tok: Token; end: number } | null {
+function alias(st: Token[], k: number, b: number, driver: DbDriver): { name: string; tok: Token; end: number } | null {
   let j = k;
   const as = isW(st[j], "AS");
   if (as) j++;
   const t = st[j];
   if (j >= b || !t) return null;
-  if (t.kind === "quoted" || (t.kind === "word" && !CLAUSE_WORDS.has(t.upper) && (as || !isReserved(t.text)))) {
+  if (t.kind === "quoted" || (t.kind === "word" && !CLAUSE_WORDS.has(t.upper) && (as || !isReserved(t.text, driver)))) {
     return { name: identName(t), tok: t, end: j };
   }
   return null;

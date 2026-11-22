@@ -5,8 +5,9 @@
  * Compiler messages reach the Problems view and editors as `build`
  * diagnostics, published (and cleared on the next build) by the backend.
  *
- * Explicit builds show the tool window without taking focus. A failed build
- * also selects the first error and opens its location in the editor.
+ * Build tool window open/focus follows Settings › Compiler (`build.openToolWindow` /
+ * `build.focusToolWindow`). Before-launch builds pass `activate: false` and stay
+ * hidden until a failure. A failed build also selects the first error and opens it.
  */
 import { create } from "zustand";
 import { Channel } from "@tauri-apps/api/core";
@@ -24,9 +25,29 @@ import {
   type RequestId,
 } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
+import { workflowSettings, type BuildToolWindowWhen } from "@/platform/workflowSettings";
 import { maybeEditorService, notifications, toolWindowService } from "@/workbench/contributions";
 import { cancelTask, removeTask, upsertTask, useTasks } from "@/workbench/tasks";
 import { appendOutput, finishSummary, firstError, messageFiles, type BuildStatus, type ConsoleLine } from "./model";
+
+function whenMatches(when: BuildToolWindowWhen, reason: "start" | "error"): boolean {
+  return when === "always" || (when === "onError" && reason === "error");
+}
+
+/**
+ * Opens/focuses Build according to settings. `requested` is the caller's
+ * `activate` flag: false keeps before-launch builds hidden at start.
+ */
+function showBuildWindow(reason: "start" | "error", requested: boolean) {
+  if (reason === "start" && !requested) return;
+  const { openToolWindow, focusToolWindow } = workflowSettings().build;
+  if (!whenMatches(openToolWindow, reason)) return;
+  try {
+    toolWindowService().show("build", whenMatches(focusToolWindow, reason));
+  } catch {
+    // No workbench (tests / settings window).
+  }
+}
 
 export const BUILD_TASK_ID = "build:compile";
 export const BUILD_RUNNING = "build.running";
@@ -41,15 +62,27 @@ export interface BuildBackend {
     request: RequestId,
     clear: string[],
     onEvent: (e: BuildEvent) => void,
+    cmake: string | null,
+  ): Promise<BuildResult>;
+  compileFile(
+    file: string,
+    request: RequestId,
+    clear: string[],
+    onEvent: (e: BuildEvent) => void,
   ): Promise<BuildResult>;
   cancel(request: RequestId): void;
 }
 
 const tauriBackend: BuildBackend = {
-  run(kind, file, request, clear, onEvent) {
+  run(kind, file, request, clear, onEvent, cmake) {
     const channel = new Channel<BuildEvent>();
     channel.onmessage = onEvent;
-    return call(commands.buildRun(kind, file, request, clear, channel));
+    return call(commands.buildRun(kind, file, cmake, request, clear, channel));
+  },
+  compileFile(file, request, clear, onEvent) {
+    const channel = new Channel<BuildEvent>();
+    channel.onmessage = onEvent;
+    return call(commands.buildCompileFile(file, request, clear, channel));
   },
   cancel(request) {
     void commands.cancelRequest(request);
@@ -78,6 +111,8 @@ export interface BuildState {
   files: string[];
   /** Key of the selected tree node (a message node shows its detail beside the tree). */
   selected: string | null;
+  /** Directory of the running step (console lines after it resolve paths against it). */
+  stepCwd: string | null;
 }
 
 const INITIAL: BuildState = {
@@ -93,6 +128,7 @@ const INITIAL: BuildState = {
   lines: [],
   files: [],
   selected: null,
+  stepCwd: null,
 };
 
 export const useBuildRun = create<BuildState>(() => INITIAL);
@@ -103,11 +139,11 @@ const TITLES: Record<BuildKind, string> = { build: "Build", rebuild: "Rebuild", 
 export function applyBuildEvent(s: BuildState, e: BuildEvent): Partial<BuildState> {
   switch (e.kind) {
     case "started":
-      return { title: e.title, system: e.system };
+      return { title: e.title, system: e.system, stepCwd: null };
     case "step":
-      return { lines: appendOutput(s.lines, `${e.command}\n`, "system") };
+      return { stepCwd: e.cwd, lines: appendOutput(s.lines, `${e.command}\n`, "system", e.cwd) };
     case "output":
-      return { lines: appendOutput(s.lines, e.text, e.stderr ? "err" : "out") };
+      return { lines: appendOutput(s.lines, e.text, e.stderr ? "err" : "out", s.stepCwd ?? undefined) };
     case "message":
       return { messages: [...s.messages, e.message] };
     case "progress":
@@ -127,6 +163,7 @@ export async function startBuild(
   kind: BuildKind,
   file: string | null = null,
   activate = true,
+  cmake: string | null = null,
 ): Promise<BuildResult | null> {
   if (isBuilding() || !useProject.getState().project) return null;
   const request = nextRequestId();
@@ -134,26 +171,62 @@ export async function startBuild(
   const cancel = () => backend.cancel(request);
   const previous = useBuildRun.getState().files;
   useBuildRun.setState({ ...INITIAL, request, kind, file, title: taskTitle, status: "running", files: previous });
+  setContext(BUILD_LAST_STATUS, null);
   setContext(BUILD_RUNNING, true);
-  if (activate) {
-    try {
-      toolWindowService().show("build", false);
-    } catch {
-      // No workbench (tests / settings window).
-    }
-  }
+  showBuildWindow("start", activate);
   upsertTask({ id: BUILD_TASK_ID, title: taskTitle, message: null, fraction: null, done: false, cancel });
+  return executeBuild(
+    request,
+    taskTitle,
+    (files, onEvent) => backend.run(kind, file, request, files, onEvent, cmake),
+    cancel,
+  );
+}
+
+/**
+ * Compiles one file without building its module. Saves all documents first; a
+ * second build while one runs is ignored (IDEA disables the actions).
+ */
+export async function startCompileFile(file: string, activate = true): Promise<BuildResult | null> {
+  if (isBuilding() || !useProject.getState().project) return null;
+  const request = nextRequestId();
+  const taskTitle = "Compile File";
+  const cancel = () => backend.cancel(request);
+  const previous = useBuildRun.getState().files;
+  useBuildRun.setState({ ...INITIAL, request, kind: null, file, title: taskTitle, status: "running", files: previous });
+  setContext(BUILD_LAST_STATUS, null);
+  setContext(BUILD_RUNNING, true);
+  showBuildWindow("start", activate);
+  upsertTask({ id: BUILD_TASK_ID, title: taskTitle, message: null, fraction: null, done: false, cancel });
+  return executeBuild(
+    request,
+    taskTitle,
+    (files, onEvent) => backend.compileFile(file, request, files, onEvent),
+    cancel,
+  );
+}
+
+/** Streams one backend build into the Build tool window until it finishes. */
+async function executeBuild(
+  request: RequestId,
+  taskTitle: string,
+  invoke: (previous: string[], onEvent: (e: BuildEvent) => void) => Promise<BuildResult>,
+  cancel: () => void,
+): Promise<BuildResult | null> {
+  const ownsBuild = () => useBuildRun.getState().request === request;
   await maybeEditorService()
     ?.saveAll()
     .catch(() => undefined);
+  if (!ownsBuild()) return null;
 
   let queue: BuildEvent[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   const flush = () => {
+    clearTimeout(timer);
     timer = undefined;
     const events = queue;
     queue = [];
-    if (useBuildRun.getState().request !== request || !events.length) return;
+    if (!ownsBuild() || !events.length) return;
     let s = useBuildRun.getState();
     for (const e of events) s = { ...s, ...applyBuildEvent(s, e) };
     useBuildRun.setState(s);
@@ -161,14 +234,15 @@ export async function startBuild(
       upsertTask({ id: BUILD_TASK_ID, title: taskTitle, message: s.message, fraction: null, done: false, cancel });
   };
   const onEvent = (e: BuildEvent) => {
+    if (!ownsBuild()) return;
     queue.push(e);
     timer ??= setTimeout(flush, 16);
   };
 
   let result: BuildResult | null = null;
   try {
-    result = await backend.run(kind, file, request, previous, onEvent);
-    clearTimeout(timer);
+    result = await invoke(useBuildRun.getState().files, onEvent);
+    if (!ownsBuild()) return null;
     flush();
     const status: BuildStatus = result.success ? "success" : "failed";
     useBuildRun.setState({
@@ -194,7 +268,7 @@ export async function startBuild(
     });
     if (!result.success) showFailure();
   } catch (e) {
-    clearTimeout(timer);
+    if (!ownsBuild()) return null;
     flush();
     if (isCancelled(e)) {
       useBuildRun.setState({ status: "cancelled", files: [], message: null });
@@ -217,13 +291,16 @@ export async function startBuild(
       showFailure();
     }
   } finally {
-    if (useBuildRun.getState().request === request) useBuildRun.setState({ request: null });
-    setContext(
-      BUILD_LAST_STATUS,
-      result?.success ? "success" : useBuildRun.getState().status === "cancelled" ? "cancelled" : "failed",
-    );
-    setContext(BUILD_RUNNING, false);
-    upsertTask({ id: BUILD_TASK_ID, title: taskTitle, message: null, fraction: 1, done: true });
+    clearTimeout(timer);
+    if (ownsBuild()) {
+      useBuildRun.setState({ request: null });
+      setContext(
+        BUILD_LAST_STATUS,
+        result?.success ? "success" : useBuildRun.getState().status === "cancelled" ? "cancelled" : "failed",
+      );
+      setContext(BUILD_RUNNING, false);
+      upsertTask({ id: BUILD_TASK_ID, title: taskTitle, message: null, fraction: 1, done: true });
+    }
   }
   return result;
 }
@@ -242,15 +319,11 @@ export function selectBuildNode(key: string | null) {
 }
 
 /**
- * A failed build activates the tool window without focusing it, selects the
- * first error and navigates to it, as IDEA does by default.
+ * A failed build may open/focus the tool window (per settings), then selects
+ * the first error and navigates to it, as IDEA does by default.
  */
 function showFailure() {
-  try {
-    toolWindowService().show("build", false);
-  } catch {
-    // No workbench (tests / settings window).
-  }
+  showBuildWindow("error", true);
   const first = firstError(useBuildRun.getState().messages);
   if (!first) return;
   selectBuildNode(first.key);
@@ -268,12 +341,14 @@ export function stopBuild() {
 /** Runs the last build again (the tool window's rerun button). */
 export function rerunBuild() {
   const { kind, file } = useBuildRun.getState();
-  return startBuild(kind ?? "build", file);
+  if (!kind) return file ? startCompileFile(file) : startBuild("build", null);
+  return startBuild(kind, file);
 }
 
 export function resetBuildRun() {
   stopBuild();
   removeTask(BUILD_TASK_ID);
   setContext(BUILD_RUNNING, false);
+  setContext(BUILD_LAST_STATUS, null);
   useBuildRun.setState(INITIAL);
 }

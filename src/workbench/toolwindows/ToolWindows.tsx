@@ -1,4 +1,6 @@
 import {
+  createContext,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -15,10 +17,26 @@ import { create } from "zustand";
 import { call, commands } from "@/platform/ipc";
 import { shortcutLabel } from "@/platform/keymap";
 import { useProject } from "@/platform/project";
-import { dragRequiresAlt, Icon, IconButton, Menu, showContextMenu, tooltipAttrs, type MenuItem, T } from "@/ui";
+import {
+  beginDrag,
+  dragRequiresAlt,
+  Icon,
+  IconButton,
+  lockDragCursor,
+  Menu,
+  showContextMenu,
+  tooltipAttrs,
+  type MenuItem,
+} from "@/ui";
+import { useChromeIconSize } from "@/ui/density";
 import { FOCUSABLE } from "@/ui/popupState";
 import { TabStripRegistry } from "@/ui/Tabs";
-import { useContributions, type ToolWindowAnchor, type ToolWindowContribution } from "../contributions";
+import {
+  ToolWindowShownProvider,
+  useContributions,
+  type ToolWindowAnchor,
+  type ToolWindowContribution,
+} from "../contributions";
 import { useDistractionFree } from "../distractionFree";
 import {
   hideToolWindow,
@@ -37,12 +55,15 @@ import {
   toggleMaximizeToolWindow,
   toggleToolWindow,
   useToolWindowLayout,
+  viewModeOf,
   type SlotRecord,
   type ToolWindowSlot,
+  type ToolWindowViewMode,
 } from "./store";
 import { contentTabRegistry } from "./content";
+import { toolWindowTitle } from "./title";
 import styles from "./ToolWindows.module.css";
-import { tx } from "@/platform/i18n";
+import { tx, useI18n } from "@/platform/i18n";
 
 function byOrder(a: ToolWindowContribution, b: ToolWindowContribution) {
   return (a.order ?? 100) - (b.order ?? 100) || a.title.localeCompare(b.title);
@@ -64,16 +85,36 @@ export function useToolWindows(): ToolWindowContribution[] {
 }
 
 /** Visible window per area, ignoring ids that aren't registered (yet) or don't dock there. */
+export function useEffectiveMaximized(windows: ToolWindowContribution[]): ToolWindowAnchor | null {
+  const visible = useToolWindowLayout((s) => s.visible);
+  const maximized = useToolWindowLayout((s) => s.maximized);
+  return useMemo(() => {
+    if (!maximized) return null;
+    const hasVisible = ([maximized, `${maximized}-split`] as const).some((slot) => {
+      const id = visible[slot];
+      return !!id && windows.some((w) => w.id === id && slotOf(w) === slot);
+    });
+    return hasVisible ? maximized : null;
+  }, [visible, windows, maximized]);
+}
+
 export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotRecord {
   const visible = useToolWindowLayout((s) => s.visible);
+  const effectiveMaximized = useEffectiveMaximized(windows);
   return useMemo(() => {
     const out = {} as SlotRecord;
     for (const slot of SLOTS) {
       const id = visible[slot];
-      out[slot] = id && windows.some((w) => w.id === id && slotOf(w) === slot) ? id : null;
+      out[slot] =
+        id &&
+        windows.some(
+          (w) => w.id === id && slotOf(w) === slot && (!effectiveMaximized || w.anchor === effectiveMaximized),
+        )
+          ? id
+          : null;
     }
     return out;
-  }, [visible, windows]);
+  }, [visible, windows, effectiveMaximized]);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +149,22 @@ export function moveToMenu(tw: ToolWindowContribution): MenuItem {
   };
 }
 
+/** IDEA's View Modes that keep the window in the main window (no Float, no Window). */
+const VIEW_MODES: ToolWindowViewMode[] = ["dockPinned", "dockUnpinned", "undock"];
+
+/** "View Mode" submenu (IDEA: tool window options › View Mode): the `toolwindow.viewMode.*` actions for this window. */
+function viewModeMenu(id: string, current: ToolWindowViewMode): MenuItem {
+  return {
+    label: "View Mode",
+    submenu: VIEW_MODES.map((mode): MenuItem => ({
+      kind: "action",
+      action: `toolwindow.viewMode.${mode}`,
+      arg: id,
+      checked: mode === current,
+    })),
+  };
+}
+
 /** Stripe button context menu, as in IDEA: Hide (removes the button), Move to, Show Tool Window Names. */
 function stripeButtonMenu(tw: ToolWindowContribution, showNames: boolean): MenuItem[] {
   return [
@@ -131,8 +188,7 @@ async function setShowToolWindowNames(on: boolean) {
   useProject.setState({ settings });
 }
 
-/** Stripe button widths: icons only, and the range with names. */
-const STRIPE_ICONS = 32;
+/** Stripe button widths with names; icons only follow `--stripe-icon-button` (smaller in compact mode). */
 const STRIPE_MIN = 44;
 const STRIPE_DEFAULT = 56;
 const STRIPE_MAX = 96;
@@ -200,8 +256,8 @@ function StripeHandle({
 }) {
   const sign = side === "left" ? 1 : -1;
   // The stripe follows the pointer; names show from STRIPE_MIN (truncated), icons only below it.
-  const resolve = (raw: number) => {
-    const px = Math.round(Math.min(STRIPE_MAX, Math.max(STRIPE_ICONS, raw)));
+  const resolve = (raw: number, icons: number) => {
+    const px = Math.round(Math.min(STRIPE_MAX, Math.max(icons, raw)));
     return px < STRIPE_MIN ? { names: false, width, px } : { names: true, width: px, px };
   };
 
@@ -212,12 +268,13 @@ function StripeHandle({
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const origin = e.clientX;
-    const start = names ? width : STRIPE_ICONS;
-    const cursor = document.body.style.cursor;
-    document.body.style.cursor = "col-resize";
+    const icons = parseFloat(getComputedStyle(stripe).getPropertyValue("--stripe-icon-button")) || 30;
+    const start = names ? width : icons;
+    const releaseCursor = lockDragCursor("col-resize");
     let next = { names, width, px: start };
     const move = (ev: globalThis.PointerEvent) => {
-      const r = resolve(start + sign * (ev.clientX - origin));
+      if (!(ev.buttons & 1)) return end();
+      const r = resolve(start + sign * (ev.clientX - origin), icons);
       if (r.names !== next.names) onPreview(r.names);
       next = r;
       stripe.style.setProperty("--stripe-drag", `${r.px}px`);
@@ -226,7 +283,7 @@ function StripeHandle({
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", end);
       el.removeEventListener("pointercancel", end);
-      document.body.style.cursor = cursor;
+      releaseCursor();
       stripe.style.removeProperty("--stripe-drag");
       onCommit(next.names, next.width);
     };
@@ -307,11 +364,14 @@ function startStripeDrag(e: PointerEvent<HTMLButtonElement>, id: string) {
   const button = e.currentTarget;
   const start = { x: e.clientX, y: e.clientY };
   let ghost: HTMLElement | null = null;
+  let endDrag: (() => void) | null = null;
   const place = (x: number, y: number) => {
     if (ghost) ghost.style.transform = `translate(${x - start.x}px, ${y - start.y}px)`;
   };
   const onMove = (ev: globalThis.PointerEvent) => {
     if (!ghost) {
+      // Reordered macOS tap: no button held, so not a drag (see pointerDrag.ts).
+      if (!(ev.buttons & 1)) return finish(false);
       if (Math.hypot(ev.clientX - start.x, ev.clientY - start.y) < DRAG_THRESHOLD) return;
       const r = button.getBoundingClientRect();
       ghost = button.cloneNode(true) as HTMLElement;
@@ -324,8 +384,10 @@ function startStripeDrag(e: PointerEvent<HTMLButtonElement>, id: string) {
         height: `${r.height}px`,
       });
       document.body.appendChild(ghost);
+      endDrag = beginDrag();
       useStripeDrag.setState({ id, drop: null });
     }
+    if (!(ev.buttons & 1)) return;
     place(ev.clientX, ev.clientY);
     const drop = stripeDropAt(ev.clientX, ev.clientY);
     const cur = useStripeDrag.getState().drop;
@@ -338,6 +400,7 @@ function startStripeDrag(e: PointerEvent<HTMLButtonElement>, id: string) {
     window.removeEventListener("keydown", onKey, true);
     if (!ghost) return;
     ghost.remove();
+    endDrag?.();
     const { drop } = useStripeDrag.getState();
     useStripeDrag.setState({ id: null, drop: null });
     dragEnded = true;
@@ -359,8 +422,10 @@ function startStripeDrag(e: PointerEvent<HTMLButtonElement>, id: string) {
 }
 
 function StripeBadge({ useBadge }: { useBadge: () => number | string | null }) {
+  // Settings › Appearance › Tool Windows › "Show tool window badges".
+  const showBadges = useProject((s) => s.settings?.appearance?.showToolWindowBadges) !== false;
   const value = useBadge();
-  if (value === null || value === 0 || value === "") return null;
+  if (!showBadges || value === null || value === 0 || value === "") return null;
   return <span className={styles.badge}>{typeof value === "number" && value > 99 ? "99+" : value}</span>;
 }
 
@@ -377,6 +442,7 @@ function StripeButton({
   side: "left" | "right";
   showName: boolean;
 }) {
+  const iconSize = useChromeIconSize();
   const shortcut = shortcutLabel(`toolwindow.${tw.id}`);
   const dragged = useStripeDrag((s) => s.id === tw.id);
   return (
@@ -387,10 +453,9 @@ function StripeButton({
         showName && styles.stripeNamed,
         active && styles.stripeActive,
         active && focused && styles.stripeFocused,
-        side === "right" && styles.stripeRight,
         dragged && styles.stripeDragged,
       )}
-      aria-label={tx(tw.title)}
+      aria-label={toolWindowTitle(tw)}
       aria-pressed={active}
       aria-keyshortcuts={shortcut}
       data-stripe-button={tw.id}
@@ -402,15 +467,16 @@ function StripeButton({
         e.preventDefault();
         showContextMenu(e, stripeButtonMenu(tw, showName));
       }}
-      {...tooltipAttrs(tw.title, shortcut)}
+      data-tooltip-stripe={side}
+      {...tooltipAttrs(toolWindowTitle(tw), shortcut, true)}
     >
       <span className={styles.stripeIcon}>
-        <Icon name={tw.icon} size={18} />
+        <Icon name={tw.icon} size={iconSize} />
         {tw.useBadge && <StripeBadge useBadge={tw.useBadge} />}
       </span>
       {showName && (
         <span className={clsx(styles.stripeLabel, !/\s/.test(tw.title) && styles.stripeLabelWord)} aria-hidden="true">
-          <T>{tw.title}</T>
+          {toolWindowTitle(tw)}
         </span>
       )}
     </button>
@@ -419,6 +485,7 @@ function StripeButton({
 
 /** Stripe "…": tool windows without a stripe button; opening one adds its button (IDEA). */
 function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
+  const iconSize = useChromeIconSize();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLButtonElement>(null);
   const items = useMemo<MenuItem[]>(
@@ -428,6 +495,7 @@ function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
         .map((w) => ({
           id: w.id,
           label: w.title,
+          verbatim: w.verbatim,
           icon: w.icon,
           shortcut: shortcutLabel(`toolwindow.${w.id}`),
           run: () => showToolWindow(w.id, true),
@@ -444,9 +512,10 @@ function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
+        data-tooltip-stripe="left"
         {...tooltipAttrs("More Tool Windows")}
       >
-        <Icon name="more-horizontal" size={18} />
+        <Icon name="more-horizontal" size={iconSize} />
       </button>
       <Menu
         open={open}
@@ -509,7 +578,7 @@ export function ToolWindowStripe({
           <StripeButton tw={w} active={isActive(w)} focused={focused === w.id} side={side} showName={showNames} />
         </div>
       ))}
-      <div className={styles.stripeSlot}>{indicator(slot, null)}</div>
+      <div className={clsx(styles.stripeSlot, styles.stripeSlotEnd)}>{indicator(slot, null)}</div>
     </div>
   );
 
@@ -551,44 +620,85 @@ function staticHeaderMenu(items: MenuItem[] | undefined): (id: string) => MenuIt
 
 const noTitleMenu = (): { label: string; items: MenuItem[] } | null => null;
 
-function ToolWindowView({ tw, hidden }: { tw: ToolWindowContribution; hidden: boolean }) {
-  const ref = useRef<HTMLElement>(null);
-  const focusRequest = useToolWindowLayout((s) => s.focusRequest);
-  const maximized = useToolWindowLayout((s) => s.maximized === tw.anchor);
-  const [moreOpen, setMoreOpen] = useState(false);
-  const [titleOpen, setTitleOpen] = useState(false);
-  const moreRef = useRef<HTMLButtonElement>(null);
-  const titleRef = useRef<HTMLButtonElement>(null);
-  const Content = tw.component;
-  const Actions = tw.headerActions;
-  const Tabs = tw.headerContent;
+/** The tool window around its content, for `ToolWindowHeader` and `useOwnToolWindowHeader`. */
+const ToolWindowFrame = createContext<{ tw: ToolWindowContribution; setOwnHeader: (own: boolean) => void } | null>(
+  null,
+);
 
-  useEffect(() => {
-    if (!focusRequest || focusRequest.id !== tw.id || hidden) return;
-    const raf = requestAnimationFrame(() => {
-      const root = ref.current;
-      if (!root) return;
-      const body = root.querySelector<HTMLElement>("[data-toolwindow-body]");
-      // Like IDEA, activation focuses the content (a field, list or tree), never a button or
-      // link: a scripted focus on one draws its focus ring (an empty view's "New…" link).
-      const content = [...(body?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].find(
-        (el) => !el.matches('button, a[href], [role="button"], [role="link"]'),
-      );
-      if (body && !content && !body.hasAttribute("tabindex")) body.tabIndex = -1;
-      const target = body?.querySelector<HTMLElement>("[data-autofocus]") ?? content ?? body ?? root;
-      target.focus({ preventScroll: true });
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [focusRequest, tw.id, hidden]);
+/**
+ * Takes the header over from the tool window while `own` is true: its content
+ * then places `ToolWindowHeader`s itself, as IDEA gives each cell of a split
+ * tool window (the Terminal's Split Right / Split Down) its own header.
+ */
+export function useOwnToolWindowHeader(own: boolean) {
+  const setOwnHeader = useContext(ToolWindowFrame)?.setOwnHeader;
+  useLayoutEffect(() => {
+    if (!setOwnHeader || !own) return;
+    setOwnHeader(true);
+    return () => setOwnHeader(false);
+  }, [setOwnHeader, own]);
+}
+
+export interface ToolWindowHeaderProps {
+  /** Shows the window's title (a split's first cell). */
+  title?: boolean;
+  /** Shows the window's own buttons: header actions, ⋮ options and hide (a split's last cell). */
+  actions?: boolean;
+  /** Its tab strip is the one Close Tab (⌘W) acts on. */
+  closeTarget?: boolean;
+  /** Content tabs, after the title. */
+  children?: ReactNode;
+}
+
+/** A header row of the tool window whose content renders it (see `useOwnToolWindowHeader`). */
+export function ToolWindowHeader({
+  title = true,
+  actions = true,
+  closeTarget = false,
+  children,
+}: ToolWindowHeaderProps) {
+  const tw = useContext(ToolWindowFrame)?.tw;
+  if (!tw) return null;
+  return (
+    <HeaderRow tw={tw} title={title} actions={actions}>
+      <TabStripRegistry.Provider value={closeTarget ? contentTabRegistry(tw.id) : null}>
+        {children}
+      </TabStripRegistry.Provider>
+    </HeaderRow>
+  );
+}
+
+/** Makes the tab strips in `children`, rendered in a tool window's content, the ones Close Tab (⌘W) acts on. */
+export function ToolWindowContentTabs({ children }: { children: ReactNode }) {
+  const tw = useContext(ToolWindowFrame)?.tw;
+  return (
+    <TabStripRegistry.Provider value={tw ? contentTabRegistry(tw.id) : null}>{children}</TabStripRegistry.Provider>
+  );
+}
+
+/**
+ * The Options (`⋮` Move To / Maximize / Hide) and Hide (`—`) buttons of a tool
+ * window that uses `useOwnToolWindowHeader` without a full `ToolWindowHeader`.
+ */
+export function ToolWindowCornerActions({ className }: { className?: string }) {
+  const tw = useContext(ToolWindowFrame)?.tw;
+  if (!tw) return null;
+  return <ToolWindowActionsBar tw={tw} className={className} />;
+}
+
+function ToolWindowActionsBar({ tw, className }: { tw: ToolWindowContribution; className?: string }) {
+  const maximized = useToolWindowLayout((s) => s.maximized === tw.anchor);
+  const viewMode = useToolWindowLayout((s) => viewModeOf(tw.id, s.viewModes));
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const Actions = tw.headerActions;
 
   const useHeaderMenu = typeof tw.headerMenu === "function" ? tw.headerMenu : staticHeaderMenu(tw.headerMenu);
   const own = useHeaderMenu(tw.id);
-  const useTitleMenu = tw.titleMenu ?? noTitleMenu;
-  const titleMenu = useTitleMenu(tw.id);
-  const titleItems = titleMenu?.items ?? own;
   const more: MenuItem[] = [
     ...own,
     ...(own.length ? [{ kind: "separator" } as MenuItem] : []),
+    viewModeMenu(tw.id, viewMode),
     moveToMenu(tw),
     {
       label: maximized ? "Restore Size" : "Maximize",
@@ -600,93 +710,211 @@ function ToolWindowView({ tw, hidden }: { tw: ToolWindowContribution; hidden: bo
   ];
 
   return (
+    <>
+      <div className={clsx(styles.headerActions, className)}>
+        {Actions && (
+          <div className={styles.headerContributedActions}>
+            <Actions id={tw.id} />
+          </div>
+        )}
+        <IconButton
+          ref={moreRef}
+          icon="more"
+          title="Options"
+          size="small"
+          iconSize={16}
+          aria-haspopup="menu"
+          aria-expanded={moreOpen}
+          onClick={() => setMoreOpen((v) => !v)}
+        />
+        <IconButton
+          icon="minus"
+          title="Hide"
+          shortcut={shortcutLabel("toolwindow.hideActive")}
+          size="small"
+          iconSize={16}
+          onClick={() => hideToolWindow(tw.id)}
+        />
+      </div>
+      <Menu
+        open={moreOpen}
+        onClose={() => setMoreOpen(false)}
+        anchor={moreRef}
+        items={more}
+        placement="bottom-end"
+        aria-label={tx`${toolWindowTitle(tw)} options`}
+      />
+    </>
+  );
+}
+
+function HeaderRow({
+  tw,
+  title,
+  actions,
+  children,
+}: {
+  tw: ToolWindowContribution;
+  title: boolean;
+  actions: boolean;
+  children?: ReactNode;
+}) {
+  const [titleOpen, setTitleOpen] = useState(false);
+  const titleRef = useRef<HTMLButtonElement>(null);
+  const showTitle = title && !(tw.headerContent && tw.tabsReplaceTitle);
+  // The title is translated here: show it in a language chosen while the window is open.
+  useI18n((s) => s.texts);
+
+  const useHeaderMenu = typeof tw.headerMenu === "function" ? tw.headerMenu : staticHeaderMenu(tw.headerMenu);
+  const own = useHeaderMenu(tw.id);
+  const useTitleMenu = tw.titleMenu ?? noTitleMenu;
+  const titleMenu = useTitleMenu(tw.id);
+  const titleItems = titleMenu?.items ?? (tw.plainTitle ? [] : own);
+  const windowTitle = toolWindowTitle(tw);
+  const titleLabel = titleMenu ? tx(titleMenu.label) : windowTitle;
+
+  return (
+    <header
+      className={clsx(styles.header, tw.headerContent && styles.headerTabbed)}
+      onDoubleClick={(e) => {
+        if (!(e.target as Element).closest('button, a, input, [role="tablist"], [role="separator"]'))
+          toggleMaximizeToolWindow(tw.id);
+      }}
+      onMouseDown={(e) => {
+        // A middle click on the header hides the window (like the Hide button).
+        // Not a press on the header's tabs or buttons, which close and act
+        // themselves: their event would otherwise hide the whole window too.
+        if (e.button !== 1 || (e.target as Element).closest('button, a, [role="tablist"], [role="separator"]')) return;
+        e.preventDefault();
+        hideToolWindow(tw.id);
+      }}
+    >
+      {!showTitle ? null : titleItems.length > 0 ? (
+        <>
+          <button
+            ref={titleRef}
+            type="button"
+            className={styles.titleButton}
+            title={titleLabel}
+            aria-haspopup="menu"
+            aria-expanded={titleOpen}
+            onClick={() => setTitleOpen((v) => !v)}
+          >
+            <span className={styles.title}>{titleLabel}</span>
+            <Icon name="chevron-down" size={12} className={styles.titleChevron} />
+          </button>
+          <Menu
+            open={titleOpen}
+            onClose={() => setTitleOpen(false)}
+            anchor={titleRef}
+            items={titleItems}
+            aria-label={titleMenu ? tx`${toolWindowTitle(tw)} views` : tx`${toolWindowTitle(tw)} view options`}
+          />
+        </>
+      ) : (
+        <span className={clsx(styles.title, styles.titlePlain)} title={windowTitle}>
+          {windowTitle}
+        </span>
+      )}
+      {children && <div className={clsx(styles.headerContent, !showTitle && styles.headerContentOnly)}>{children}</div>}
+      {actions && <ToolWindowActionsBar tw={tw} />}
+    </header>
+  );
+}
+
+/** How long an activated tool window waits for lazily loaded content to focus. */
+const LATE_FOCUS_MS = 5000;
+
+function ToolWindowView({ tw, hidden }: { tw: ToolWindowContribution; hidden: boolean }) {
+  const ref = useRef<HTMLElement>(null);
+  const focusRequest = useToolWindowLayout((s) => s.focusRequest);
+  const [ownHeader, setOwnHeader] = useState(false);
+  const frame = useMemo(() => ({ tw, setOwnHeader }), [tw]);
+  const Content = tw.component;
+  const Tabs = tw.headerContent;
+
+  useEffect(() => {
+    if (!focusRequest || focusRequest.id !== tw.id || hidden) return;
+    let observer: MutationObserver | null = null;
+    let timer = 0;
+    const stop = () => {
+      observer?.disconnect();
+      observer = null;
+      window.clearTimeout(timer);
+    };
+    const raf = requestAnimationFrame(() => {
+      const root = ref.current;
+      if (!root) return;
+      const body = root.querySelector<HTMLElement>("[data-toolwindow-body]");
+      // Like IDEA, activation focuses the content (a field, list or tree), never a button or
+      // link: a scripted focus on one draws its focus ring (an empty view's "New…" link).
+      const contentTarget = () =>
+        body?.querySelector<HTMLElement>("[data-autofocus]") ??
+        [...(body?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].find(
+          (el) => !el.matches('button, a[href], [role="button"], [role="link"]'),
+        );
+      const target = contentTarget();
+      if (target || !body) {
+        (target ?? root).focus({ preventScroll: true });
+        return;
+      }
+      if (!body.hasAttribute("tabindex")) body.tabIndex = -1;
+      body.focus({ preventScroll: true });
+      // Lazily loaded views (the Terminal) render their field after this: focus it when it
+      // appears, unless focus has moved on meanwhile.
+      observer = new MutationObserver(() => {
+        if (document.activeElement !== body) return stop();
+        const late = contentTarget();
+        if (!late) return;
+        stop();
+        late.focus({ preventScroll: true });
+      });
+      observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-autofocus"] });
+      timer = window.setTimeout(stop, LATE_FOCUS_MS);
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      stop();
+    };
+  }, [focusRequest, tw.id, hidden]);
+
+  return (
     <section
       ref={ref}
       className={styles.window}
       data-toolwindow={tw.id}
-      aria-label={tx(tw.title)}
+      data-focus-scope=""
+      aria-label={toolWindowTitle(tw)}
       hidden={hidden}
       tabIndex={-1}
+      // WebKit doesn't focus a clicked button. A menu opened from this window would then hand
+      // focus back to the editor on close, hiding an unpinned or undocked window.
+      onClickCapture={(e) => {
+        const button = (e.target as Element).closest<HTMLElement>("button[aria-haspopup]");
+        if (button && e.currentTarget.contains(button)) button.focus({ preventScroll: true });
+      }}
     >
-      <header
-        className={clsx(styles.header, Tabs && styles.headerTabbed)}
-        onDoubleClick={(e) => e.target === e.currentTarget && toggleMaximizeToolWindow(tw.id)}
-      >
-        {Tabs && tw.tabsReplaceTitle ? null : titleItems.length > 0 ? (
-          <>
-            <button
-              ref={titleRef}
-              type="button"
-              className={styles.titleButton}
-              aria-haspopup="menu"
-              aria-expanded={titleOpen}
-              onClick={() => setTitleOpen((v) => !v)}
-            >
-              <span className={styles.title}>
-                <T>{titleMenu?.label ?? tw.title}</T>
-              </span>
-              <Icon name="chevron-down" size={12} className={styles.titleChevron} />
-            </button>
-            <Menu
-              open={titleOpen}
-              onClose={() => setTitleOpen(false)}
-              anchor={titleRef}
-              items={titleItems}
-              aria-label={titleMenu ? tx`${tw.title} views` : tx`${tw.title} view options`}
-            />
-          </>
-        ) : (
-          <span className={clsx(styles.title, styles.titlePlain)}>
-            <T>{tw.title}</T>
-          </span>
-        )}
-        {Tabs && (
-          <div className={clsx(styles.headerContent, tw.tabsReplaceTitle && styles.headerContentOnly)}>
+      {!ownHeader && (
+        <HeaderRow tw={tw} title actions>
+          {Tabs && (
             <TabStripRegistry.Provider value={contentTabRegistry(tw.id)}>
               <Tabs id={tw.id} />
             </TabStripRegistry.Provider>
-          </div>
-        )}
-        <div className={styles.headerSpacer} />
-        <div className={styles.headerActions}>
-          {Actions && <Actions id={tw.id} />}
-          <IconButton
-            ref={moreRef}
-            icon="more"
-            title="Options"
-            size="small"
-            iconSize={16}
-            aria-haspopup="menu"
-            aria-expanded={moreOpen}
-            onClick={() => setMoreOpen((v) => !v)}
-          />
-          <IconButton
-            icon="minus"
-            title="Hide"
-            shortcut={shortcutLabel("toolwindow.hideActive")}
-            size="small"
-            iconSize={16}
-            onClick={() => hideToolWindow(tw.id)}
-          />
-        </div>
-        <Menu
-          open={moreOpen}
-          onClose={() => setMoreOpen(false)}
-          anchor={moreRef}
-          items={more}
-          placement="bottom-end"
-          aria-label={tx`${tw.title} options`}
-        />
-      </header>
+          )}
+        </HeaderRow>
+      )}
       <div className={styles.body} data-toolwindow-body="">
-        <Content id={tw.id} />
+        <ToolWindowFrame.Provider value={frame}>
+          <ToolWindowShownProvider value={!hidden}>
+            <Content id={tw.id} />
+          </ToolWindowShownProvider>
+        </ToolWindowFrame.Provider>
       </div>
     </section>
   );
 }
 
 const MIN: Record<ToolWindowAnchor, number> = { left: 140, right: 160, bottom: 90 };
-const MAXIMIZED: Record<ToolWindowAnchor, string> = { left: "82%", right: "82%", bottom: "88%" };
 /** The editor keeps at least this much room when a tool window is resized (see the grid template). */
 const EDITOR_MIN = { width: 200, height: 60 };
 /** Smallest area when a side is split: stacked (left / right) and side by side (bottom). */
@@ -728,10 +956,10 @@ function SplitHandle({ anchor, hidden }: { anchor: ToolWindowAnchor; hidden: boo
     e.preventDefault();
     el.setPointerCapture(e.pointerId);
     const origin = stacked ? e.clientY : e.clientX;
-    const cursor = document.body.style.cursor;
-    document.body.style.cursor = stacked ? "row-resize" : "col-resize";
+    const releaseCursor = lockDragCursor(stacked ? "row-resize" : "col-resize");
     let ratio: number | null = null;
     const move = (ev: globalThis.PointerEvent) => {
+      if (!(ev.buttons & 1)) return end();
       ratio = ratioOf(m.clamp(m.first + (stacked ? ev.clientY : ev.clientX) - origin), m.total);
       apply(m.areas, ratio);
     };
@@ -739,7 +967,7 @@ function SplitHandle({ anchor, hidden }: { anchor: ToolWindowAnchor; hidden: boo
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", end);
       el.removeEventListener("pointercancel", end);
-      document.body.style.cursor = cursor;
+      releaseCursor();
       if (ratio !== null) setToolWindowSplit(anchor, ratio);
       // Back to the store's value (unchanged when the ratio was clamped to it).
       apply(m.areas, useToolWindowLayout.getState().splits[anchor]);
@@ -773,8 +1001,89 @@ function SplitHandle({ anchor, hidden }: { anchor: ToolWindowAnchor; hidden: boo
 }
 
 /**
+ * Inner edge of an undocked window: resizes it over the editor. Moves only the
+ * area's size variable while dragging; the side's size is stored on release.
+ */
+function UndockEdge({ anchor }: { anchor: ToolWindowAnchor }) {
+  const vertical = anchor !== "bottom";
+  const sign = anchor === "left" ? 1 : -1;
+  const measure = (el: HTMLElement) => {
+    const area = el.parentElement;
+    // The grid: undocked areas are positioned against it.
+    const grid = area?.offsetParent as HTMLElement | null;
+    if (!area || !grid) return null;
+    const room = vertical ? grid.clientWidth - EDITOR_MIN.width : grid.clientHeight - EDITOR_MIN.height;
+    return { area, size: vertical ? area.offsetWidth : area.offsetHeight, max: Math.max(MIN[anchor], room) };
+  };
+  const clamp = (raw: number, max: number) => Math.min(max, Math.max(MIN[anchor], Math.round(raw)));
+  const commit = (area: HTMLElement, px: number) => {
+    setToolWindowSize(anchor, px);
+    // Back to the store's value when it did not change (a clamped or too small size).
+    area.style.setProperty("--undock-size", `${useToolWindowLayout.getState().sizes[anchor]}px`);
+  };
+
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    const m = measure(el);
+    if (e.button !== 0 || !m) return;
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    const origin = vertical ? e.clientX : e.clientY;
+    const releaseCursor = lockDragCursor(vertical ? "col-resize" : "row-resize");
+    let next = m.size;
+    const move = (ev: globalThis.PointerEvent) => {
+      if (!(ev.buttons & 1)) return end();
+      next = clamp(m.size + sign * ((vertical ? ev.clientX : ev.clientY) - origin), m.max);
+      m.area.style.setProperty("--undock-size", `${next}px`);
+    };
+    const end = () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", end);
+      el.removeEventListener("pointercancel", end);
+      releaseCursor();
+      commit(m.area, next);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", end);
+    el.addEventListener("pointercancel", end);
+  };
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const dir = (vertical ? ["ArrowLeft", "ArrowRight"] : ["ArrowUp", "ArrowDown"]).indexOf(e.key);
+    const m = measure(e.currentTarget);
+    if (dir < 0 || !m) return;
+    e.preventDefault();
+    commit(m.area, clamp(m.size + sign * (dir ? 1 : -1) * KEY_STEP, m.max));
+  };
+
+  return (
+    <div
+      role="separator"
+      aria-orientation={vertical ? "vertical" : "horizontal"}
+      aria-label={`Resize undocked ${anchor} tool window`}
+      tabIndex={0}
+      className={styles.undockEdge}
+      onPointerDown={onPointerDown}
+      onKeyDown={onKeyDown}
+    />
+  );
+}
+
+/** Whether the window shown in `slot` is undocked (shows over the editor). */
+function undockedIn(
+  visible: SlotRecord,
+  slot: ToolWindowSlot,
+  viewModes: Readonly<Record<string, ToolWindowViewMode>>,
+) {
+  const id = visible[slot];
+  return !!id && viewModeOf(id, viewModes) === "undock";
+}
+
+/**
  * One side's tool windows: the primary area and the split area, each an
- * island; with both showing they share the side at the stored ratio.
+ * island; with both showing they share the side at the stored ratio. An area
+ * showing an undocked window leaves the grid track and lies over the editor at
+ * the side's edge (the same element, so its window keeps focus and state).
  */
 function SidePanel({
   anchor,
@@ -786,29 +1095,51 @@ function SidePanel({
   visible: SlotRecord;
 }) {
   const mounted = useToolWindowLayout((s) => s.mounted);
-  const split = !!visible[anchor] && !!visible[`${anchor}-split`];
+  const viewModes = useToolWindowLayout((s) => s.viewModes);
+  const size = useToolWindowLayout((s) => s.sizes[anchor]);
+  const maximized = useEffectiveMaximized(windows) === anchor;
+  const undocked = (slot: ToolWindowSlot) => undockedIn(visible, slot, viewModes);
+  const docked = (slot: ToolWindowSlot) => !!visible[slot] && !undocked(slot);
+  const split = docked(anchor) && docked(`${anchor}-split`);
+  // Two undocked areas share the side's length like docked ones.
+  const bothUndocked = undocked(anchor) && undocked(`${anchor}-split`);
   // A lone area takes the whole side: flex-grow below 1 would leave the rest empty.
   const ratio = useToolWindowLayout((s) => s.splits[anchor]);
   const area = (slot: ToolWindowSlot, grow: number) => {
     const visibleId = visible[slot];
     const list = windows.filter((w) => slotOf(w) === slot && (mounted.has(w.id) || w.id === visibleId));
     if (!list.length) return null;
+    const over = undocked(slot);
+    const share = bothUndocked ? (slot === anchor ? ratio : 1 - ratio) : 1;
     return (
       <div
-        className={clsx(styles.island, styles.anchor)}
-        // The stored ratio; SplitHandle moves it directly while dragging.
-        style={{ flexGrow: grow }}
+        className={clsx(styles.island, styles.anchor, over && styles.undocked)}
+        // Docked: the stored ratio, which SplitHandle moves directly while dragging.
+        style={
+          over
+            ? ({
+                "--undock-size": `${size}px`,
+                "--undock-share": share,
+                "--undock-gap": bothUndocked ? "calc(var(--island-gap) / 2)" : "0px",
+              } as CSSProperties)
+            : { flexGrow: grow }
+        }
         data-slot={slot}
         hidden={!visibleId}
       >
         {list.map((w) => (
           <ToolWindowView key={w.id} tw={w} hidden={w.id !== visibleId} />
         ))}
+        {over && !maximized && <UndockEdge anchor={anchor} />}
       </div>
     );
   };
   return (
-    <div className={clsx(styles.side, anchor === "bottom" && styles.sideRow)} data-anchor={anchor}>
+    <div
+      className={clsx(styles.side, anchor === "bottom" && styles.sideRow)}
+      data-anchor={anchor}
+      hidden={!sideVisible(visible, anchor)}
+    >
       {area(anchor, split ? ratio : 1)}
       <SplitHandle anchor={anchor} hidden={!split} />
       {area(`${anchor}-split`, split ? 1 - ratio : 1)}
@@ -828,7 +1159,7 @@ function syncTracks(grid: HTMLElement, visible: SlotRecord) {
   const s = useToolWindowLayout.getState();
   for (const a of ["left", "right", "bottom"] as const) {
     const shown = sideVisible(visible, a);
-    const size = !shown ? "0px" : s.maximized === a ? MAXIMIZED[a] : `${s.sizes[a]}px`;
+    const size = !shown ? "0px" : `${s.sizes[a]}px`;
     grid.style.setProperty(`--tw-${a}`, size);
     grid.style.setProperty(`--gap-${a}`, shown ? "var(--island-gap)" : "0px");
   }
@@ -841,6 +1172,7 @@ function syncTracks(grid: HTMLElement, visible: SlotRecord) {
 function GapHandle({
   anchor,
   visibleIds,
+  maximized,
   gridRef,
   editorRef,
   sync,
@@ -848,6 +1180,7 @@ function GapHandle({
   anchor: ToolWindowAnchor;
   /** Windows shown on this side (primary and split area). */
   visibleIds: string[];
+  maximized: ToolWindowAnchor | null;
   gridRef: RefObject<HTMLDivElement | null>;
   editorRef: RefObject<HTMLDivElement | null>;
   sync: () => void;
@@ -879,10 +1212,10 @@ function GapHandle({
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const origin = vertical ? e.clientX : e.clientY;
-    const cursor = document.body.style.cursor;
-    document.body.style.cursor = vertical ? "col-resize" : "row-resize";
+    const releaseCursor = lockDragCursor(vertical ? "col-resize" : "row-resize");
     let next = m.size;
     const move = (ev: globalThis.PointerEvent) => {
+      if (!(ev.buttons & 1)) return end();
       const raw = m.size + sign * ((vertical ? ev.clientX : ev.clientY) - origin);
       // Dragged past half the minimum: collapse, as IDEA does.
       next = raw < MIN[anchor] / 2 ? 0 : clamp(raw, m.max);
@@ -892,7 +1225,7 @@ function GapHandle({
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", end);
       el.removeEventListener("pointercancel", end);
-      document.body.style.cursor = cursor;
+      releaseCursor();
       if (next === 0) visibleIds.forEach(hideToolWindow);
       else if (next !== m.size) commit(next);
       else sync();
@@ -917,7 +1250,7 @@ function GapHandle({
       aria-orientation={vertical ? "vertical" : "horizontal"}
       aria-label={`Resize ${anchor} tool window`}
       tabIndex={0}
-      hidden={!visibleIds.length}
+      hidden={!visibleIds.length || !!maximized}
       className={styles.gap}
       data-gap={anchor}
       onPointerDown={onPointerDown}
@@ -947,6 +1280,7 @@ function useToolWindowAppearance() {
 export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
   const windows = useToolWindows();
   const visible = useEffectiveVisible(windows);
+  const maximized = useEffectiveMaximized(windows);
   const appearance = useToolWindowAppearance();
   const { bars, widescreen } = appearance;
   const stripes = useStripes();
@@ -980,7 +1314,6 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
     />
   );
   const sizes = useToolWindowLayout((s) => s.sizes);
-  const maximized = useToolWindowLayout((s) => s.maximized);
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
   // The right stripe holds the right side's windows and Bottom Right.
   const hasRight = windows.some((w) => {
@@ -994,15 +1327,28 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
   const rightStripe = bars && (hasRight || dragging);
   const gridRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  // Undocked windows take no track: the editor keeps its size under them.
+  const viewModes = useToolWindowLayout((s) => s.viewModes);
+  const docked = useMemo(() => {
+    const out = { ...visible };
+    for (const slot of SLOTS) if (undockedIn(visible, slot, viewModes)) out[slot] = null;
+    return out;
+  }, [visible, viewModes]);
   const sync = () => {
-    if (gridRef.current) syncTracks(gridRef.current, visible);
+    if (gridRef.current) syncTracks(gridRef.current, docked);
   };
-  useLayoutEffect(sync, [visible, sizes, maximized]);
+  useLayoutEffect(sync, [docked, sizes, maximized]);
+  useLayoutEffect(() => {
+    if (!maximized || !editorRef.current?.contains(document.activeElement)) return;
+    const id = visibleOn(visible, maximized)[0];
+    if (id) gridRef.current?.querySelector<HTMLElement>(`[data-toolwindow="${id}"]`)?.focus({ preventScroll: true });
+  }, [maximized, visible]);
 
   const gap = (anchor: ToolWindowAnchor) => (
     <GapHandle
       anchor={anchor}
-      visibleIds={visibleOn(visible, anchor)}
+      visibleIds={visibleOn(docked, anchor)}
+      maximized={maximized}
       gridRef={gridRef}
       editorRef={editorRef}
       sync={sync}
@@ -1015,10 +1361,14 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
     >
       {bars && stripe("left")}
       {bars && stripeHandle("left")}
-      <div ref={gridRef} className={clsx(styles.grid, widescreen && styles.widescreen)}>
+      <div
+        ref={gridRef}
+        className={clsx(styles.grid, widescreen && styles.widescreen)}
+        data-maximized={maximized ?? undefined}
+      >
         <SidePanel anchor="left" windows={windows} visible={visible} />
         {gap("left")}
-        <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)}>
+        <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)} hidden={!!maximized}>
           {editor}
         </div>
         {gap("right")}

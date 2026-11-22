@@ -1,4 +1,5 @@
-//! Integrated terminal sessions over a native PTY. Rendering is xterm.js.
+//! Integrated terminal sessions over a native PTY, or over a [`TerminalChannel`]
+//! such as an SSH shell. Rendering is xterm.js.
 
 mod integration;
 mod utf8;
@@ -6,12 +7,12 @@ mod utf8;
 pub use utf8::Utf8Decoder;
 
 use ide_core::{IdeError, IdeEvent, IdeResult, SharedSink, TerminalId};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,85 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(4);
 const BATCH_BYTES: usize = 64 * 1024;
 /// After the shell exits, how long to keep draining output still in flight.
 const EXIT_DRAIN: Duration = Duration::from_millis(250);
+/// High-water mark for output not yet consumed by the pump: producers (the PTY reader or a
+/// remote channel) block past it, which applies kernel pipe backpressure instead of letting
+/// a slow UI accumulate unbounded chunks in memory.
+const OUTPUT_HIGH_WATER: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct BudgetState {
+    pending: usize,
+    closed: bool,
+}
+
+/// Byte budget shared by the output producers and the pump that consumes them.
+#[derive(Clone, Default)]
+struct ByteBudget(Arc<(Mutex<BudgetState>, Condvar)>);
+
+impl ByteBudget {
+    /// Reserves `bytes` in the queue, waiting for the pump to catch up. An oversized chunk
+    /// is let through (waiting cannot free memory already allocated by its producer).
+    fn acquire(&self, bytes: usize) -> bool {
+        let (lock, cv) = &*self.0;
+        let mut state = lock.lock();
+        while !state.closed && bytes < OUTPUT_HIGH_WATER && state.pending + bytes > OUTPUT_HIGH_WATER {
+            cv.wait(&mut state);
+        }
+        if state.closed {
+            return false;
+        }
+        state.pending += bytes;
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        let (lock, cv) = &*self.0;
+        let mut state = lock.lock();
+        state.pending = state.pending.saturating_sub(bytes);
+        cv.notify_all();
+    }
+
+    fn close(&self) {
+        let (lock, cv) = &*self.0;
+        lock.lock().closed = true;
+        cv.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct OutputSender {
+    tx: mpsc::Sender<Msg>,
+    budget: ByteBudget,
+}
+
+struct OutputReceiver {
+    rx: mpsc::Receiver<Msg>,
+    budget: ByteBudget,
+}
+
+impl Drop for OutputReceiver {
+    fn drop(&mut self) {
+        // A panicking pump must not leave producers waiting on a budget nobody releases.
+        self.budget.close();
+    }
+}
+
+impl OutputSender {
+    fn data(&self, data: &[u8]) -> bool {
+        if !self.budget.acquire(data.len()) {
+            return false;
+        }
+        if self.tx.send(Msg::Data(data.to_vec())).is_err() {
+            self.budget.release(data.len());
+            return false;
+        }
+        true
+    }
+
+    fn exited(&self, code: Option<i32>) {
+        let _ = self.tx.send(Msg::Exited(code));
+    }
+}
 /// Grace period between SIGHUP and SIGKILL on [`TerminalManager::kill`].
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(1500);
@@ -52,12 +132,92 @@ pub struct TerminalInfo {
     pub pid: Option<u32>,
 }
 
+/// A terminal whose shell runs elsewhere (an SSH channel). Its output and exit
+/// arrive through the [`TerminalFeed`] paired with it by [`feed`].
+pub trait TerminalChannel: Send + Sync {
+    fn write(&self, data: &[u8]) -> IdeResult<()>;
+    fn resize(&self, cols: u16, rows: u16) -> IdeResult<()>;
+    /// Hangs up; the exit is still reported through the feed.
+    fn close(&self);
+}
+
+/// Where a [`TerminalChannel`] reports its output and exit.
+#[derive(Clone)]
+pub struct TerminalFeed(OutputSender);
+
+impl TerminalFeed {
+    pub fn output(&self, data: &[u8]) {
+        // A remote feed is called from a Tokio task: tell the runtime to park this worker
+        // so the byte-budget wait cannot starve other tasks (it spawns a replacement).
+        // Native PTY output comes from a dedicated thread, which blocks directly.
+        if matches!(
+            tokio::runtime::Handle::try_current(),
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| self.0.data(data));
+        } else {
+            self.0.data(data);
+        }
+    }
+
+    pub fn exited(&self, code: Option<i32>) {
+        self.0.exited(code);
+    }
+}
+
+/// The receiving end of a [`TerminalFeed`], handed to [`TerminalManager::attach`].
+pub struct FeedReceiver {
+    rx: Option<mpsc::Receiver<Msg>>,
+    budget: Option<ByteBudget>,
+}
+
+impl FeedReceiver {
+    fn into_parts(mut self) -> OutputReceiver {
+        OutputReceiver {
+            rx: self.rx.take().expect("feed not already attached"),
+            budget: self.budget.take().expect("feed not already attached"),
+        }
+    }
+}
+
+impl Drop for FeedReceiver {
+    fn drop(&mut self) {
+        // A channel that never attached must not leave its producers blocked on the budget.
+        if let Some(budget) = self.budget.take() {
+            budget.close();
+        }
+    }
+}
+
+/// A feed for a channel that is about to be opened.
+pub fn feed() -> (TerminalFeed, FeedReceiver) {
+    let (tx, rx) = mpsc::channel();
+    let budget = ByteBudget::default();
+    (TerminalFeed(OutputSender { tx, budget: budget.clone() }), FeedReceiver { rx: Some(rx), budget: Some(budget) })
+}
+
+enum Io {
+    Pty {
+        // Cancel input before dropping the master (ClosePseudoConsole on Windows).
+        writer: ide_core::input::InputWriter,
+        master: Mutex<Box<dyn MasterPty + Send>>,
+        killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    },
+    Channel {
+        channel: Box<dyn TerminalChannel>,
+        size: Mutex<(u16, u16)>,
+    },
+}
+
 struct Session {
+    /// The window that opened it: closing that window's project closes its terminals.
+    key: String,
     info: TerminalInfo,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    io: Io,
     exited: Arc<AtomicBool>,
+    started: Instant,
+    /// The first input was logged (startup diagnostics, see `spawn`).
+    input_logged: AtomicBool,
 }
 
 type Sessions = Arc<Mutex<HashMap<TerminalId, Arc<Session>>>>;
@@ -83,21 +243,71 @@ impl TerminalManager {
     pub fn spawn(
         &self,
         options: TerminalOptions,
+        key: String,
         sink: SharedSink,
         on_output: Box<dyn Fn(String) + Send>,
+    ) -> IdeResult<TerminalInfo> {
+        self.spawn_impl(options, key, sink, on_output, false)
+    }
+
+    /// Runs an approved absolute executable with exact arguments and cwd.
+    /// A missing project directory fails instead of falling back to the home directory.
+    pub fn spawn_program(
+        &self,
+        options: TerminalOptions,
+        key: String,
+        sink: SharedSink,
+        on_output: Box<dyn Fn(String) + Send>,
+    ) -> IdeResult<TerminalInfo> {
+        if !options.shell.as_deref().is_some_and(|p| Path::new(p).is_absolute())
+            || !options.cwd.is_absolute()
+            || !options.cwd.is_dir()
+        {
+            return Err(IdeError::invalid("a program PTY requires an absolute executable and an existing cwd"));
+        }
+        self.spawn_impl(options, key, sink, on_output, true)
+    }
+
+    fn spawn_impl(
+        &self,
+        options: TerminalOptions,
+        key: String,
+        sink: SharedSink,
+        on_output: Box<dyn Fn(String) + Send>,
+        exact: bool,
     ) -> IdeResult<TerminalInfo> {
         let size = pty_size(options.cols, options.rows);
         let pair = native_pty_system().openpty(size).map_err(|e| IdeError::internal(format!("openpty failed: {e}")))?;
 
-        let (shell, mut args) = resolve_shell(options.shell.as_deref(), &options.args);
+        let wsl = if cfg!(windows) && !exact { wsl_shell(&options) } else { None };
+        let (shell, mut args) = if exact {
+            (options.shell.clone().expect("spawn_program checked the executable"), options.args.clone())
+        } else {
+            wsl.clone().unwrap_or_else(|| resolve_shell(options.shell.as_deref(), &options.args))
+        };
         let mut env = terminal_env(&options.env);
-        if options.shell_integration {
+        if let Some(msystem) = default_msystem(&shell, &options.env, std::env::var("MSYSTEM").ok().as_deref()) {
+            env.insert("MSYSTEM".to_owned(), msystem.to_owned());
+        }
+        if default_chere_invoking(&shell, &options.env, std::env::var("CHERE_INVOKING").ok().as_deref()) {
+            env.insert("CHERE_INVOKING".to_owned(), "1".to_owned());
+        }
+        if options.shell_integration && !exact {
             integration::apply(&shell_title(&shell), &mut args, &mut env);
         }
         let mut cmd = CommandBuilder::new(&shell);
         cmd.args(&args);
-        cmd.cwd(resolve_cwd(&options.cwd));
-        for (k, v) in ide_core::process::host_env_fixes() {
+        // wsl.exe takes the directory through `--cd`; a UNC share is no valid process cwd.
+        let cwd = if exact {
+            options.cwd.0.clone()
+        } else if wsl.is_some() {
+            resolve_cwd(Path::new(""))
+        } else {
+            resolve_cwd(&options.cwd)
+        };
+        cmd.cwd(&cwd);
+        // In a project folder: the project's environment (its direnv `.envrc`) too.
+        for (k, v) in ide_core::process::host_env_fixes_in(&cwd) {
             match v {
                 Some(v) => cmd.env(k, v),
                 None => cmd.env_remove(k),
@@ -106,8 +316,18 @@ impl TerminalManager {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        apply_powershell_env(&shell, &mut cmd);
 
-        let child = pair
+        #[cfg(unix)]
+        let wait_writable = ide_core::input::nonblocking(
+            pair.master.as_raw_fd().ok_or_else(|| std::io::Error::other("PTY has no file descriptor"))?,
+        )?;
+        #[cfg(unix)]
+        let wait_readable = ide_core::input::readable(
+            pair.master.as_raw_fd().ok_or_else(|| std::io::Error::other("PTY has no file descriptor"))?,
+        )?;
+
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| IdeError::unavailable(format!("failed to start shell `{shell}`: {e}")))?;
@@ -120,44 +340,137 @@ impl TerminalManager {
         let id = TerminalId::next();
         let info = TerminalInfo { id, title: shell_title(&shell), pid: child.process_id() };
         let exited = Arc::new(AtomicBool::new(false));
+        let writer = ide_core::input::InputWriter::new(
+            format!("openidea-term-write-{}", id.0),
+            writer,
+            #[cfg(unix)]
+            wait_writable,
+            move |e| {
+                tracing::warn!(%id, "terminal input: {e}");
+            },
+        )
+        .inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let session = Arc::new(Session {
+            key,
             info: info.clone(),
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
-            killer: Mutex::new(child.clone_killer()),
+            io: Io::Pty { writer, master: Mutex::new(pair.master), killer: Mutex::new(child.clone_killer()) },
             exited: exited.clone(),
+            started: Instant::now(),
+            input_logged: AtomicBool::new(false),
         });
         self.sessions.lock().insert(id, session);
 
         let (tx, rx) = mpsc::channel::<Msg>();
-        let spawned = spawn_reader(id, reader, tx.clone())
-            .and_then(|_| spawn_waiter(id, child, tx))
-            .and_then(|_| spawn_pump(id, rx, on_output, exited, self.sessions.clone(), sink));
+        let budget = ByteBudget::default();
+        let out = OutputSender { tx: tx.clone(), budget: budget.clone() };
+        let spawned = spawn_reader(
+            id,
+            reader,
+            out.clone(),
+            #[cfg(unix)]
+            wait_readable,
+        )
+        .and_then(|_| spawn_waiter(id, child, out))
+        .and_then(|_| {
+            spawn_pump(
+                id,
+                OutputReceiver { rx, budget },
+                on_output,
+                exited,
+                self.sessions.clone(),
+                sink,
+                Instant::now(),
+            )
+        });
         if let Err(e) = spawned {
             if let Some(s) = self.sessions.lock().remove(&id) {
-                let _ = s.killer.lock().kill();
+                terminate(&s);
             }
             return Err(IdeError::internal(format!("failed to start terminal threads: {e}")));
         }
-        tracing::debug!(%id, shell, pid = ?info.pid, "terminal spawned");
+        // Info level, with the first output and input below: a session that starts but never shows a
+        // prompt can then be told apart in a user's log (no output, or no reply to the shell's query).
+        tracing::info!(%id, shell, pid = ?info.pid, cols = size.cols, rows = size.rows, "terminal spawned");
+        Ok(info)
+    }
+
+    /// Registers an opened `channel` as terminal `title`; its output (from `feed`)
+    /// is batched and decoded as a PTY's is, and its exit emits `IdeEvent::TerminalExited`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach(
+        &self,
+        title: String,
+        size: (u16, u16),
+        channel: Box<dyn TerminalChannel>,
+        feed: FeedReceiver,
+        key: String,
+        sink: SharedSink,
+        on_output: Box<dyn Fn(String) + Send>,
+    ) -> IdeResult<TerminalInfo> {
+        let id = TerminalId::next();
+        let info = TerminalInfo { id, title, pid: None };
+        let exited = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(Session {
+            key,
+            info: info.clone(),
+            io: Io::Channel { channel, size: Mutex::new(size) },
+            exited: exited.clone(),
+            started: Instant::now(),
+            input_logged: AtomicBool::new(false),
+        });
+        self.sessions.lock().insert(id, session);
+        let output = feed.into_parts();
+        let budget = output.budget.clone();
+        if let Err(e) = spawn_pump(id, output, on_output, exited, self.sessions.clone(), sink, Instant::now()) {
+            budget.close();
+            if let Some(s) = self.sessions.lock().remove(&id) {
+                terminate(&s);
+            }
+            return Err(IdeError::internal(format!("failed to start terminal threads: {e}")));
+        }
+        tracing::info!(%id, title = info.title, "terminal attached");
         Ok(info)
     }
 
     pub fn write(&self, id: TerminalId, data: &str) -> IdeResult<()> {
         let session = self.session(id)?;
-        let mut w = session.writer.lock();
-        w.write_all(data.as_bytes())?;
-        w.flush()?;
+        if !session.input_logged.swap(true, Ordering::Relaxed) {
+            let cursor_report = data.starts_with("\x1b[") && data.ends_with('R');
+            let ms = session.started.elapsed().as_millis();
+            tracing::info!(%id, ms, bytes = data.len(), cursor_report, "terminal first input");
+        }
+        match &session.io {
+            Io::Pty { writer, .. } => writer.write(data.as_bytes())?,
+            Io::Channel { channel, .. } => channel.write(data.as_bytes())?,
+        }
         Ok(())
     }
 
     pub fn resize(&self, id: TerminalId, cols: u16, rows: u16) -> IdeResult<()> {
         let session = self.session(id)?;
-        session
-            .master
-            .lock()
-            .resize(pty_size(cols, rows))
-            .map_err(|e| IdeError::internal(format!("resize failed: {e}")))
+        match &session.io {
+            Io::Pty { master, .. } => master
+                .lock()
+                .resize(pty_size(cols, rows))
+                .map_err(|e| IdeError::internal(format!("resize failed: {e}"))),
+            Io::Channel { channel, size } => {
+                let new = pty_size(cols, rows);
+                *size.lock() = (new.cols, new.rows);
+                channel.resize(new.cols, new.rows)
+            }
+        }
+    }
+
+    /// Closes the terminals `key` opened: the project of that window is closing.
+    pub fn kill_key(&self, key: &str) {
+        let ids: Vec<TerminalId> =
+            self.sessions.lock().iter().filter(|(_, s)| s.key == key).map(|(id, _)| *id).collect();
+        for id in ids {
+            let _ = self.kill(id);
+        }
     }
 
     pub fn kill(&self, id: TerminalId) -> IdeResult<()> {
@@ -178,6 +491,10 @@ impl TerminalManager {
         let Some(pid) = session.info.pid else { return Ok(false) };
         Ok(foreground_busy(&session, pid))
     }
+    /// Whether a terminal session is still registered.
+    pub fn contains(&self, id: TerminalId) -> bool {
+        self.sessions.lock().contains_key(&id)
+    }
 
     pub fn list(&self) -> Vec<TerminalInfo> {
         let mut out: Vec<TerminalInfo> = self.sessions.lock().values().map(|s| s.info.clone()).collect();
@@ -188,8 +505,13 @@ impl TerminalManager {
     /// Current PTY size of a session (for diagnostics and tests).
     pub fn size(&self, id: TerminalId) -> IdeResult<(u16, u16)> {
         let session = self.session(id)?;
-        let size = session.master.lock().get_size().map_err(|e| IdeError::internal(e.to_string()))?;
-        Ok((size.cols, size.rows))
+        match &session.io {
+            Io::Pty { master, .. } => {
+                let size = master.lock().get_size().map_err(|e| IdeError::internal(e.to_string()))?;
+                Ok((size.cols, size.rows))
+            }
+            Io::Channel { size, .. } => Ok(*size.lock()),
+        }
     }
 
     fn session(&self, id: TerminalId) -> IdeResult<Arc<Session>> {
@@ -217,7 +539,8 @@ fn not_found(id: TerminalId) -> IdeError {
 
 #[cfg(unix)]
 fn foreground_busy(session: &Session, pid: u32) -> bool {
-    let leader = session.master.lock().process_group_leader();
+    let Io::Pty { master, .. } = &session.io else { return false };
+    let leader = master.lock().process_group_leader();
     leader.is_some_and(|fg| u32::try_from(fg).ok() != Some(pid))
 }
 
@@ -287,10 +610,20 @@ mod win {
 
 /// Hangs up the shell (and its process group), escalating to SIGKILL if it lingers.
 fn terminate(session: &Session) {
+    let (writer, killer) = match &session.io {
+        Io::Pty { writer, killer, .. } => (writer, killer),
+        Io::Channel { channel, .. } => {
+            if !session.exited.load(Ordering::Acquire) {
+                channel.close();
+            }
+            return;
+        }
+    };
+    writer.close();
     if session.exited.load(Ordering::Acquire) {
         return;
     }
-    if let Err(e) = session.killer.lock().kill() {
+    if let Err(e) = killer.lock().kill() {
         tracing::debug!(id = %session.info.id, "terminal kill: {e}");
     }
     #[cfg(unix)]
@@ -318,20 +651,43 @@ fn terminate(session: &Session) {
     }
 }
 
-fn spawn_reader(id: TerminalId, mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Msg>) -> std::io::Result<()> {
+fn spawn_reader(
+    id: TerminalId,
+    mut reader: Box<dyn Read + Send>,
+    tx: OutputSender,
+    #[cfg(unix)] mut wait_readable: impl FnMut() -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<()> {
     std::thread::Builder::new().name(format!("openidea-term-read-{}", id.0)).spawn(move || {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.send(Msg::Data(buf[..n].to_vec())).is_err() {
+                    // Blocks past the byte high-water mark: a slow consumer stalls the
+                    // PTY reader, which lets the kernel pipe backpressure the shell.
+                    if !tx.data(&buf[..n]) {
                         break;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(unix)]
+                    if let Err(e) = wait_readable()
+                        && e.kind() != std::io::ErrorKind::Interrupted
+                    {
+                        tracing::warn!(%id, "terminal read: {e}");
+                        break;
+                    }
+                    #[cfg(not(unix))]
+                    std::thread::sleep(BATCH_INTERVAL);
+                }
                 // EIO is how Linux/macOS report "slave side closed".
-                Err(_) => break,
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => {
+                    tracing::warn!(%id, "terminal read: {e}");
+                    break;
+                }
             }
         }
     })?;
@@ -341,7 +697,7 @@ fn spawn_reader(id: TerminalId, mut reader: Box<dyn Read + Send>, tx: mpsc::Send
 fn spawn_waiter(
     id: TerminalId,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    tx: mpsc::Sender<Msg>,
+    tx: OutputSender,
 ) -> std::io::Result<()> {
     std::thread::Builder::new().name(format!("openidea-term-wait-{}", id.0)).spawn(move || {
         let code = match child.wait() {
@@ -352,20 +708,31 @@ fn spawn_waiter(
                 None
             }
         };
-        let _ = tx.send(Msg::Exited(code));
+        tx.exited(code);
     })?;
     Ok(())
 }
 
 fn spawn_pump(
     id: TerminalId,
-    rx: mpsc::Receiver<Msg>,
+    output: OutputReceiver,
     on_output: Box<dyn Fn(String) + Send>,
     exited: Arc<AtomicBool>,
     sessions: Sessions,
     sink: SharedSink,
+    started: Instant,
 ) -> std::io::Result<()> {
     std::thread::Builder::new().name(format!("openidea-term-pump-{}", id.0)).spawn(move || {
+        let first_output = std::cell::Cell::new(true);
+        let on_output = move |text: String| {
+            if first_output.replace(false) {
+                // ConPTY asks for the cursor position (`ESC[6n`) and waits for the answer.
+                let cursor_query = text.contains("\x1b[6n");
+                let ms = started.elapsed().as_millis();
+                tracing::info!(%id, ms, bytes = text.len(), cursor_query, "terminal first output");
+            }
+            on_output(text)
+        };
         let mut decoder = Utf8Decoder::new();
         let mut pending = String::new();
         let mut batch_started: Option<Instant> = None;
@@ -388,8 +755,10 @@ fn spawn_pump(
                 (Some(a), None) | (None, Some(a)) => a,
                 (None, None) => Duration::from_secs(3600),
             };
-            match rx.recv_timeout(wait) {
+            match output.rx.recv_timeout(wait) {
                 Ok(Msg::Data(bytes)) => {
+                    // The pump owns these bytes now; wake any producer waiting on the cap.
+                    output.budget.release(bytes.len());
                     decoder.decode_into(&bytes, &mut pending);
                     if !pending.is_empty() && batch_started.is_none() {
                         batch_started = Some(Instant::now());
@@ -416,6 +785,7 @@ fn spawn_pump(
         pending.push_str(&decoder.finish());
         flush(&mut pending, &mut batch_started);
         exited.store(true, Ordering::Release);
+        output.budget.close();
         sessions.lock().remove(&id);
         let code = exit.flatten();
         tracing::debug!(%id, ?code, "terminal exited");
@@ -431,6 +801,16 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
         pixel_width: 0,
         pixel_height: 0,
     }
+}
+
+/// `wsl.exe` in the distro of a `\\wsl.localhost\...` folder, so its terminal is a Linux
+/// shell and not PowerShell (#925). An explicitly chosen shell or arguments win.
+fn wsl_shell(options: &TerminalOptions) -> Option<(String, Vec<String>)> {
+    if options.shell.as_deref().is_some_and(|s| !s.trim().is_empty()) || !options.args.is_empty() {
+        return None;
+    }
+    let w = ide_core::wsl::parse(&options.cwd)?;
+    Some((ide_core::wsl::EXE.into(), vec!["-d".into(), w.distro, "--cd".into(), w.path]))
 }
 
 fn resolve_cwd(cwd: &Path) -> PathBuf {
@@ -481,7 +861,7 @@ pub fn available_shells() -> Vec<String> {
     }
     #[cfg(windows)]
     {
-        for exe in ["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"] {
+        for exe in ["pwsh.exe", "powershell.exe", "cmd.exe", ide_core::wsl::EXE] {
             if let Some(p) = find_in_path(exe) {
                 add(p);
             }
@@ -496,15 +876,19 @@ pub fn available_shells() -> Vec<String> {
 }
 
 /// Picks the shell binary and its arguments. A default (or explicitly chosen but
-/// argument-less) POSIX shell is started as a login shell, like Terminal.app/IDEA.
-fn resolve_shell(shell: Option<&str>, args: &[String]) -> (String, Vec<String>) {
+/// argument-less) POSIX shell is started as a login shell, like Terminal.app,
+/// the Git Bash shortcut and IDEA: login start-up is what loads the completions
+/// and prompts users expect (`/etc/profile`, Git for Windows' git-completion).
+/// `OPENIDEA_SKIP_SHELL_ENV` disables the implicit login argument; explicit
+/// arguments still take precedence, and interactive startup files still run.
+pub fn resolve_shell(shell: Option<&str>, args: &[String]) -> (String, Vec<String>) {
     let shell = shell.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(default_shell);
     if !args.is_empty() {
         return (shell, args.to_vec());
     }
-    let login =
-        matches!(shell_title(&shell).as_str(), "zsh" | "bash" | "sh" | "fish" | "ksh" | "dash" | "tcsh" | "csh");
-    let args = if login && cfg!(unix) { vec!["-l".to_owned()] } else { Vec::new() };
+    let login = std::env::var_os("OPENIDEA_SKIP_SHELL_ENV").is_none()
+        && matches!(shell_title(&shell).as_str(), "zsh" | "bash" | "sh" | "fish" | "ksh" | "dash" | "tcsh" | "csh");
+    let args = if login { vec!["-l".to_owned()] } else { Vec::new() };
     (shell, args)
 }
 
@@ -573,9 +957,116 @@ fn terminal_env(user: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env
 }
 
+/// Older pwsh versions can crash while formatting a localized update banner
+/// (PowerShell/PowerShell#28131). Keep explicit preferences in the final environment.
+fn apply_powershell_env(shell: &str, cmd: &mut CommandBuilder) {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    if cfg!(windows)
+        && (name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("pwsh.exe"))
+        && cmd.get_env("POWERSHELL_UPDATECHECK").is_none_or(|v| v.is_empty())
+    {
+        cmd.env("POWERSHELL_UPDATECHECK", "Off");
+    }
+}
+
+/// Git Bash's MSYSTEM profile on Windows, when nobody chose one. A bare
+/// `bash.exe` would run with the `MSYS` default, whose PATH leaves `git` and
+/// the mingw64 tools out unless `<Git>\cmd` happens to be inherited — the Git
+/// Bash shortcut instead sets `MSYSTEM=MINGW64`, and that is the environment
+/// users expect from a "git bash" terminal (needed for git's Tab completion).
+/// `None` for other shells and on Unix, or when the user or the launching
+/// process already set `MSYSTEM`.
+fn default_msystem(shell: &str, user: &BTreeMap<String, String>, inherited: Option<&str>) -> Option<&'static str> {
+    if !cfg!(windows) || !matches!(shell_title(shell).as_str(), "bash" | "sh") {
+        return None;
+    }
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+    if set(user.get("MSYSTEM").map(String::as_str)) || set(inherited) {
+        return None;
+    }
+    Some("MINGW64")
+}
+
+/// MSYS2 login shells `cd "$HOME"` in `/etc/profile` unless `CHERE_INVOKING`
+/// is set, so without it a login `bash` / `sh` project terminal (MSYS2's
+/// `bash.exe`, Git for Windows included) would open in the home directory
+/// instead of the project. `false` for other shells and on Unix, or when the
+/// user or the launching process already set it.
+fn default_chere_invoking(shell: &str, user: &BTreeMap<String, String>, inherited: Option<&str>) -> bool {
+    if !cfg!(windows) || !matches!(shell_title(shell).as_str(), "bash" | "sh") {
+        return false;
+    }
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+    !set(user.get("CHERE_INVOKING").map(String::as_str)) && !set(inherited)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_past_the_byte_budget_blocks_the_producer_until_the_pump_drains() {
+        let (feed, receiver) = feed();
+        let chunk = vec![b'x'; 16 * 1024];
+        let chunk_len = chunk.len();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let producer = std::thread::spawn(move || {
+            // 64 MiB, four times the high-water mark. With no pump draining it, only the
+            // budget's worth can be accepted; the producer then blocks.
+            for _ in 0..4096 {
+                if !feed.0.data(&chunk) {
+                    break;
+                }
+                count.fetch_add(chunk.len(), Ordering::Relaxed);
+            }
+        });
+        // Poll instead of sleeping a fixed time: a loaded CI box may schedule the
+        // producer late, but it must eventually fill the budget.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pending = loop {
+            let pending = receiver.budget.as_ref().unwrap().0.0.lock().pending;
+            if pending >= OUTPUT_HIGH_WATER || Instant::now() >= deadline {
+                break pending;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(pending <= OUTPUT_HIGH_WATER + chunk_len, "{pending}");
+        assert!(pending > OUTPUT_HIGH_WATER - chunk_len, "the producer should have filled the budget: {pending}");
+        // Closing the feed releases the blocked producer.
+        drop(receiver);
+        producer.join().unwrap();
+        assert!(accepted.load(Ordering::Relaxed) <= OUTPUT_HIGH_WATER + 2 * chunk_len);
+    }
+
+    #[test]
+    #[ignore = "prints the peak buffered output bytes; see issue #3936"]
+    fn output_backpressure_numbers() {
+        let (feed, receiver) = feed();
+        let chunk = vec![b'x'; 16 * 1024];
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..4096 {
+                if !feed.0.data(&chunk) {
+                    break;
+                }
+                count.fetch_add(chunk.len(), Ordering::Relaxed);
+            }
+        });
+        // No pump (no consumer) for this window: measure how much a fast producer can
+        // pile up before the budget stops it.
+        std::thread::sleep(Duration::from_millis(300));
+        let pending = receiver.budget.as_ref().unwrap().0.0.lock().pending;
+        drop(receiver);
+        producer.join().unwrap();
+        println!(
+            "peak pending {} bytes ({} MiB) of {} MiB produced",
+            pending,
+            pending / (1024 * 1024),
+            accepted.load(Ordering::Relaxed) / (1024 * 1024)
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -632,6 +1123,7 @@ mod tests {
             .manager
             .spawn(
                 opts,
+                "test".into(),
                 h.sink.clone(),
                 Box::new(move |s| {
                     let _ = tx.send(s);
@@ -661,6 +1153,56 @@ mod tests {
             }
         }
         all
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_input_returns_promptly_and_kill_does_not_wait_for_it() {
+        let h = harness();
+        let (info, output) = spawn_collect(&h, sh("stty raw -echo; printf READY; exec sleep 60"));
+        read_until(&output, "READY");
+        let started = Instant::now();
+        h.manager.write(info.id, &"x".repeat(512 * 1024)).unwrap();
+        h.manager.write(info.id, "\u{3}").unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        h.manager.kill(info.id).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        wait_exit(&h, info.id);
+        assert!(h.manager.write(info.id, "later").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_keeps_large_pastes_and_following_keystrokes_in_order() {
+        let h = harness();
+        let (info, output) = spawn_collect(&h, sh("stty raw -echo; printf READY; sleep 1; exec cat"));
+        read_until(&output, "READY");
+        let paste = "abé".repeat(128 * 1024);
+        let started = Instant::now();
+        h.manager.write(info.id, &paste).unwrap();
+        h.manager.write(info.id, "END-OF-INPUT").unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let actual = read_until(&output, "END-OF-INPUT");
+        h.manager.kill(info.id).unwrap();
+        assert_eq!(actual, format!("{paste}END-OF-INPUT"));
+    }
+
+    #[test]
+    fn program_sessions_never_fall_back_to_another_executable_or_cwd() {
+        let h = harness();
+        let mut options = sh("exit 0");
+        options.shell = None;
+        assert!(h.manager.spawn_program(options, "test".into(), h.sink.clone(), Box::new(|_| {})).is_err());
+        let mut options = sh("exit 0");
+        options.shell = Some("sh".into());
+        assert!(h.manager.spawn_program(options, "test".into(), h.sink.clone(), Box::new(|_| {})).is_err());
+        let mut options = sh("exit 0");
+        options.cwd = std::env::temp_dir().join(format!("openidea-missing-{}", std::process::id())).into();
+        assert!(!options.cwd.exists());
+        assert!(h.manager.spawn_program(options, "test".into(), h.sink.clone(), Box::new(|_| {})).is_err());
+        assert!(h.manager.list().is_empty());
     }
 
     #[test]
@@ -789,7 +1331,7 @@ mod tests {
         let h = harness();
         let (other_sink, other_events) = channel_sink();
         let (mine, _rx) = spawn_collect(&h, sh("exit 1"));
-        let theirs = h.manager.spawn(sh("exit 2"), other_sink, Box::new(|_| {})).expect("spawn");
+        let theirs = h.manager.spawn(sh("exit 2"), "other".into(), other_sink, Box::new(|_| {})).expect("spawn");
         match h.events.recv_timeout(Duration::from_secs(10)).expect("exit event") {
             IdeEvent::TerminalExited { terminal, code } => assert_eq!((terminal, code), (mine.id, Some(1))),
             e => panic!("unexpected {e:?}"),
@@ -803,16 +1345,207 @@ mod tests {
     }
 
     #[test]
+    fn wsl_folder_gets_the_distro_shell_unless_one_is_chosen() {
+        let mut o = sh("true");
+        o.shell = None;
+        o.args = vec![];
+        let (distro, linux_path) = ("Debian-12", "/srv/app");
+        let want = (ide_core::wsl::EXE.to_owned(), vec!["-d".into(), distro.into(), "--cd".into(), linux_path.into()]);
+        for host in ["wsl.localhost", "wsl$"] {
+            o.cwd = PathBuf::from(format!(r"\\{host}\{distro}{}", linux_path.replace('/', r"\"))).into();
+            assert_eq!(wsl_shell(&o), Some(want.clone()), "{host}");
+        }
+        o.shell = Some("pwsh.exe".into());
+        assert_eq!(wsl_shell(&o), None);
+        o.shell = None;
+        o.cwd = PathBuf::from("/tmp").into();
+        assert_eq!(wsl_shell(&o), None);
+    }
+
+    #[test]
     fn shell_resolution() {
         let (shell, args) = resolve_shell(Some("/bin/zsh"), &[]);
         assert_eq!((shell.as_str(), args), ("/bin/zsh", vec!["-l".to_owned()]));
         let (_, args) = resolve_shell(Some("/usr/bin/python3"), &[]);
         assert!(args.is_empty());
-        let (_, args) = resolve_shell(None, &[]);
-        assert_eq!(args, vec!["-l".to_owned()]);
+        for configured in [None, Some(""), Some(" \t ")] {
+            let (shell, args) = resolve_shell(configured, &[]);
+            assert_eq!(shell, default_shell_path());
+            assert_eq!(args, vec!["-l".to_owned()]);
+        }
+        assert_eq!(resolve_shell(Some(" /bin/bash "), &["-i".into()]), ("/bin/bash".into(), vec!["-i".into()]));
         assert_eq!(shell_title("C:\\Program Files\\PowerShell\\7\\pwsh.exe"), "pwsh");
         let env = terminal_env(&BTreeMap::from([("TERM".into(), "dumb".into())]));
         assert_eq!(env["TERM"], "dumb");
         assert_eq!(env["COLORTERM"], "truecolor");
+    }
+
+    #[derive(Default)]
+    struct FakeChannel {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TerminalChannel for FakeChannel {
+        fn write(&self, data: &[u8]) -> IdeResult<()> {
+            self.log.lock().push(format!("write {}", String::from_utf8_lossy(data)));
+            Ok(())
+        }
+        fn resize(&self, cols: u16, rows: u16) -> IdeResult<()> {
+            self.log.lock().push(format!("resize {cols}x{rows}"));
+            Ok(())
+        }
+        fn close(&self) {
+            self.log.lock().push("close".into());
+        }
+    }
+
+    #[test]
+    fn attached_channel_gets_input_and_resizes_and_reports_output_and_exit() {
+        let h = harness();
+        let channel = FakeChannel::default();
+        let log = channel.log.clone();
+        let (feed, rx) = feed();
+        let (tx, output) = mpsc::channel();
+        let info = h
+            .manager
+            .attach(
+                "host".into(),
+                (80, 24),
+                Box::new(channel),
+                rx,
+                "test".into(),
+                h.sink.clone(),
+                Box::new(move |s| {
+                    let _ = tx.send(s);
+                }),
+            )
+            .unwrap();
+        assert_eq!((info.title.as_str(), info.pid), ("host", None));
+        assert!(!h.manager.is_busy(info.id).unwrap());
+        h.manager.write(info.id, "ls\r").unwrap();
+        h.manager.resize(info.id, 120, 40).unwrap();
+        assert_eq!(h.manager.size(info.id).unwrap(), (120, 40));
+        // A character split across two chunks arrives whole.
+        feed.output("pr\u{e9}".as_bytes().split_at(3).0);
+        feed.output(&"pr\u{e9}mpt".as_bytes()[3..]);
+        assert_eq!(read_until(&output, "mpt"), "pr\u{e9}mpt");
+        feed.exited(Some(3));
+        assert_eq!(wait_exit(&h, info.id), Some(3));
+        assert!(!h.manager.contains(info.id));
+        assert_eq!(*log.lock(), ["write ls\r", "resize 120x40"]);
+    }
+
+    #[test]
+    fn killing_an_attached_channel_hangs_it_up() {
+        let h = harness();
+        let channel = FakeChannel::default();
+        let log = channel.log.clone();
+        let (feed, rx) = feed();
+        let info = h
+            .manager
+            .attach("host".into(), (80, 24), Box::new(channel), rx, "test".into(), h.sink.clone(), Box::new(|_| {}))
+            .unwrap();
+        h.manager.kill(info.id).unwrap();
+        assert_eq!(*log.lock(), ["close"]);
+        drop(feed);
+        assert_eq!(wait_exit(&h, info.id), None);
+    }
+}
+
+/// `resolve_shell` / `default_msystem` / `default_chere_invoking` behave the
+/// same on every platform, so their Windows side (Git Bash login start-up,
+/// MSYSTEM, CHERE_INVOKING) is tested everywhere.
+#[cfg(test)]
+mod shell_start_on_every_platform {
+    use super::*;
+
+    #[test]
+    fn powershell_update_notifications_default_to_off_on_windows() {
+        for shell in ["pwsh", "pwsh.exe", "PWSH.EXE", "C:\\Program Files\\PowerShell\\7\\PwSh.ExE", "C:/pwsh/pwsh.exe"]
+        {
+            for value in [None, Some("")] {
+                let mut cmd = CommandBuilder::new(shell);
+                cmd.env_clear();
+                if let Some(value) = value {
+                    cmd.env("POWERSHELL_UPDATECHECK", value);
+                }
+                apply_powershell_env(shell, &mut cmd);
+                let want = if cfg!(windows) { Some("Off") } else { value };
+                assert_eq!(cmd.get_env("POWERSHELL_UPDATECHECK"), want.map(std::ffi::OsStr::new), "{shell}");
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_update_notification_preferences_are_preserved() {
+        for value in ["Default", "LTS", "Off"] {
+            let mut cmd = CommandBuilder::new("pwsh.exe");
+            cmd.env_clear();
+            cmd.env("POWERSHELL_UPDATECHECK", value);
+            apply_powershell_env("pwsh.exe", &mut cmd);
+            assert_eq!(cmd.get_env("POWERSHELL_UPDATECHECK"), Some(std::ffi::OsStr::new(value)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_update_notification_preferences_ignore_key_case() {
+        let mut cmd = CommandBuilder::new("pwsh.exe");
+        cmd.env_clear();
+        cmd.env("POWERSHELL_UPDATECHECK", "Off");
+        cmd.env("powershell_updatecheck", "Default");
+        apply_powershell_env("pwsh.exe", &mut cmd);
+        assert_eq!(cmd.get_env("POWERSHELL_UPDATECHECK"), Some(std::ffi::OsStr::new("Default")));
+        assert_eq!(cmd.iter_full_env_as_str().count(), 1);
+    }
+
+    #[test]
+    fn other_shells_keep_their_update_notification_environment() {
+        for shell in ["powershell.exe", "cmd.exe", "wsl.exe", "bash.exe", "C:\\pwsh.exe\\other.exe", "other-pwsh.exe"] {
+            let mut cmd = CommandBuilder::new(shell);
+            cmd.env_clear();
+            apply_powershell_env(shell, &mut cmd);
+            assert_eq!(cmd.get_env("POWERSHELL_UPDATECHECK"), None, "{shell}");
+        }
+    }
+
+    #[test]
+    fn posix_shells_start_as_login_shells_everywhere() {
+        let (shell, args) = resolve_shell(Some("C:\\Program Files\\Git\\bin\\bash.exe"), &[]);
+        assert_eq!((shell.as_str(), args), ("C:\\Program Files\\Git\\bin\\bash.exe", vec!["-l".to_owned()]));
+        let (_, args) = resolve_shell(Some("D:\\msys64\\usr\\bin\\sh.exe"), &[]);
+        assert_eq!(args, vec!["-l".to_owned()]);
+        // Non-POSIX shells keep their plain start.
+        for shell in ["pwsh.exe", "C:\\Windows\\system32\\cmd.exe", "wsl.exe"] {
+            assert!(resolve_shell(Some(shell), &[]).1.is_empty(), "{shell} must start without arguments");
+        }
+    }
+
+    #[test]
+    fn windows_bash_defaults_to_the_mingw64_profile() {
+        let none: BTreeMap<String, String> = BTreeMap::new();
+        let chose = BTreeMap::from([("MSYSTEM".into(), "MSYS".into())]);
+        assert_eq!(default_msystem("pwsh.exe", &none, None), None);
+        assert_eq!(default_msystem("C:\\Windows\\system32\\cmd.exe", &none, None), None);
+        // An MSYSTEM the user (terminal env) or the launching process set wins.
+        assert_eq!(default_msystem("bash.exe", &chose, None), None);
+        assert_eq!(default_msystem("bash.exe", &none, Some("UCRT64")), None);
+        // On Unix there is no MSYSTEM concept: never defaulted.
+        let (inherited, want) = if cfg!(windows) { (None, Some("MINGW64")) } else { (Some("MSYS"), None) };
+        assert_eq!(default_msystem("bash.exe", &none, inherited), want);
+    }
+
+    #[test]
+    fn windows_bash_login_starts_in_the_working_directory() {
+        let none: BTreeMap<String, String> = BTreeMap::new();
+        let chose = BTreeMap::from([("CHERE_INVOKING".into(), "0".into())]);
+        assert!(!default_chere_invoking("pwsh.exe", &none, None));
+        assert!(!default_chere_invoking("C:\\Windows\\system32\\cmd.exe", &none, None));
+        // A CHERE_INVOKING the user (terminal env) or the launching process set wins.
+        assert!(!default_chere_invoking("bash.exe", &chose, None));
+        assert!(!default_chere_invoking("bash.exe", &none, Some("0")));
+        // On Unix there is no MSYS2 login cd: never defaulted.
+        let (inherited, want) = if cfg!(windows) { (None, true) } else { (Some("1"), false) };
+        assert_eq!(default_chere_invoking("bash.exe", &none, inherited), want);
     }
 }

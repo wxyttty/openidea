@@ -1,18 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import type { AgentTask } from "@/bindings";
+import * as actions from "@/platform/actions";
 import { registerActions } from "@/platform/actions";
-import type { EditorInput } from "@/workbench/contributions";
-import { confirmChecked, showError } from "@/workbench/messages";
-import { ContextMenuHost, hideContextMenu } from "@/ui";
-import { AgentsView } from "./AgentsView";
-import { SESSION_KIND } from "./model";
-import { archiveTask, unarchiveTask, deleteTask, openTask, useAgents } from "./store";
-import { taskActions } from "./taskActions";
+import { EDITOR_TAB_MIME, type EditorInput } from "@/workbench/contributions";
+import { confirm, confirmChecked, showError } from "@/workbench/messages";
+import { promptInput } from "@/workbench/inputDialogs";
+import { ContextMenuHost, dragSession, hideContextMenu } from "@/ui";
+import { AgentsHeaderActions, AgentsView } from "./AgentsView";
+import { SESSION_KIND, TASK_DRAG } from "./model";
+import { usePlatform } from "@/platform/platformInfo";
+import { archiveTask, unarchiveTask, deleteTask, dockTask, openTask, useAgents } from "./store";
+import { taskActions, taskMenu, useAgentsHeaderMenu } from "./taskActions";
+import styles from "./Agents.module.css";
 
 const editor = vi.hoisted(() => ({
   active: undefined as EditorInput | undefined,
   listener: undefined as ((input: EditorInput) => void) | undefined,
+  tabInput: undefined as ((paneId: string, tabId: string) => EditorInput | null) | undefined,
 }));
 
 vi.mock("@/workbench/contributions", async (original) => ({
@@ -25,6 +30,7 @@ vi.mock("@/workbench/contributions", async (original) => ({
         editor.listener = undefined;
       };
     },
+    tabInput: editor.tabInput,
   }),
 }));
 
@@ -34,12 +40,19 @@ vi.mock("./store", async (original) => ({
   archiveTask: vi.fn(async () => {}),
   unarchiveTask: vi.fn(async () => {}),
   deleteTask: vi.fn(async () => {}),
+  dockTask: vi.fn(),
+  setSessionLocation: vi.fn(),
 }));
 
+vi.mock("./SessionEditor", () => ({ SessionEditor: () => <div data-testid="docked-session" /> }));
+
 vi.mock("@/workbench/messages", () => ({
+  confirm: vi.fn(async () => true),
   confirmChecked: vi.fn(async () => ({ checked: false })),
   showError: vi.fn(async () => {}),
 }));
+
+vi.mock("@/workbench/inputDialogs", () => ({ promptInput: vi.fn(async () => null) }));
 
 function task(
   id: string,
@@ -67,7 +80,10 @@ function task(
   };
 }
 
-const row = (id: string) => screen.getByText(id).closest('[role="treeitem"]')!;
+const row = (id: string) =>
+  within(screen.getByRole("tree", { name: "Agent tasks" }))
+    .getByText(id)
+    .closest('[role="treeitem"]')!;
 const select = (id: string, modifiers: MouseEventInit = {}) =>
   fireEvent.mouseDown(row(id), { button: 0, ...modifiers });
 const selectedTasks = () =>
@@ -79,27 +95,45 @@ const context = (id: string) => {
   fireEvent.mouseDown(row(id), { button: 2 });
   fireEvent.contextMenu(row(id));
 };
+const treeRows = () => screen.getAllByRole("treeitem").map((item) => item.textContent ?? "");
+// jsdom has no elementFromPoint; the drop target is found through it.
+const pointAt = (el: Element) => {
+  const original = document.elementFromPoint;
+  document.elementFromPoint = () => el;
+  return () => {
+    document.elementFromPoint = original;
+  };
+};
 
 let dispose: () => void;
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(actions, "executeAction");
   editor.active = undefined;
+  editor.tabInput = undefined;
   vi.mocked(confirmChecked).mockResolvedValue({ checked: false });
   useAgents.setState({
     loaded: true,
     error: null,
     tasks: new Map([task("one"), task("two"), task("three"), task("four")].map((t) => [t.id, t])),
+    organize: { groups: [], groupOf: {}, pinned: [] },
+    organizeRoot: null,
+    docked: null,
+    homeOpen: false,
+    sessionLocation: "editor",
   });
   dispose = registerActions(taskActions);
 });
 afterEach(() => {
   dispose();
   hideContextMenu();
+  vi.restoreAllMocks();
 });
 
 function setup() {
   render(
     <>
+      <AgentsHeaderActions />
       <AgentsView />
       <ContextMenuHost />
     </>,
@@ -107,6 +141,42 @@ function setup() {
 }
 
 describe("Agents selection", () => {
+  it.each([SESSION_KIND, "file"])("right-clicking a task keeps the current %s view open", (kind) => {
+    editor.active = { kind, key: "current", data: { task: "one" } };
+    setup();
+    context("two");
+    expect(screen.getByRole("menuitem", { name: "Rename…" })).toBeTruthy();
+    expect(selectedTasks()).toEqual(["two"]);
+    expect(openTask).not.toHaveBeenCalled();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(openTask).not.toHaveBeenCalled();
+  });
+
+  it("preserves a multi-selection when opening its context menu without activating a task", () => {
+    setup();
+    select("one");
+    select("three", { shiftKey: true });
+    vi.mocked(openTask).mockClear();
+    context("two");
+    expect(selectedTasks()).toEqual(["one", "two", "three"]);
+    expect(screen.getByRole("menuitem", { name: "Delete (3)…" })).toBeTruthy();
+    expect(openTask).not.toHaveBeenCalled();
+  });
+
+  it("treats macOS Control-click as a context menu without opening the task", () => {
+    const os = usePlatform.getState().os;
+    usePlatform.setState({ os: "macos" });
+    try {
+      setup();
+      fireEvent.mouseDown(row("two"), { button: 0, ctrlKey: true });
+      fireEvent.contextMenu(row("two"), { button: 0, ctrlKey: true });
+      expect(screen.getByRole("menuitem", { name: "Rename…" })).toBeTruthy();
+      expect(openTask).not.toHaveBeenCalled();
+    } finally {
+      usePlatform.setState({ os });
+    }
+  });
+
   it("extends and shrinks a range without opening its lead or losing selection to an editor echo", () => {
     setup();
     select("one");
@@ -131,14 +201,101 @@ describe("Agents selection", () => {
     expect(openTask).not.toHaveBeenCalled();
   });
 
-  it.each(["metaKey", "ctrlKey"])("toggles individual tasks with %s", (modifier) => {
+  it.each([
+    { os: "macos", modifier: "metaKey" },
+    { os: "windows", modifier: "ctrlKey" },
+    { os: "linux", modifier: "ctrlKey" },
+  ])("toggles individual tasks with $modifier on $os", ({ os, modifier }) => {
+    const previousOs = usePlatform.getState().os;
+    usePlatform.setState({ os });
+    try {
+      setup();
+      select("one");
+      select("three", { [modifier]: true });
+      expect(selectedTasks()).toEqual(["one", "three"]);
+      select("three", { [modifier]: true });
+      expect(selectedTasks()).toEqual(["one"]);
+      expect(openTask).toHaveBeenCalledTimes(1);
+    } finally {
+      usePlatform.setState({ os: previousOs });
+    }
+  });
+});
+
+describe("Agents docked view", () => {
+  it("opens session history on demand and closes it after switching tasks", () => {
+    useAgents.setState({ docked: "one" });
     setup();
-    select("one");
-    select("three", { [modifier]: true });
-    expect(selectedTasks()).toEqual(["one", "three"]);
-    select("three", { [modifier]: true });
-    expect(selectedTasks()).toEqual(["one"]);
-    expect(openTask).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("docked-session")).toBeTruthy();
+    expect(openTask).not.toHaveBeenCalled();
+    expect(screen.queryByRole("tree", { name: "Agent tasks" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    fireEvent.click(within(screen.getByRole("tree", { name: "Agent tasks" })).getByText("two"));
+    expect(screen.queryByRole("dialog", { name: "Agent sessions" })).toBeNull();
+    expect(actions.executeAction).toHaveBeenCalledWith("agents.openTask", "two");
+    expect(openTask).toHaveBeenCalledWith("two");
+  });
+
+  it("lets keyboard users browse history before confirming a session", () => {
+    useAgents.setState({ docked: "one" });
+    setup();
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const tree = screen.getByRole("tree", { name: "Agent tasks" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(screen.getByRole("dialog", { name: "Agent sessions" })).toBeTruthy();
+    expect(openTask).not.toHaveBeenCalled();
+    fireEvent.keyDown(tree, { key: "Enter" });
+    expect(openTask).toHaveBeenCalledWith("two");
+    expect(screen.queryByRole("dialog", { name: "Agent sessions" })).toBeNull();
+  });
+
+  it("includes the current session in history and keeps the conversation mounted", () => {
+    useAgents.setState({ docked: "one" });
+    setup();
+    const session = screen.getByTestId("docked-session");
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const tree = within(screen.getByRole("tree", { name: "Agent tasks" }));
+    expect(tree.getByText("one")).toBeTruthy();
+    expect(tree.getByText("two")).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("tree", { name: "Agent tasks" })).toBeNull();
+    expect(screen.getByTestId("docked-session")).toBe(session);
+  });
+
+  it("gives the whole tool window to the conversation when the docked task is the only one", () => {
+    useAgents.setState({ tasks: new Map([task("one")].map((t) => [t.id, t])), docked: "one" });
+    setup();
+    expect(screen.queryByRole("tree", { name: "Agent tasks" })).toBeNull();
+    expect(screen.getByTestId("docked-session")).toBeTruthy();
+  });
+
+  it("offers placement in the Agents options menu, checked by the current one", () => {
+    useAgents.setState({ sessionLocation: "toolWindow" });
+    const { result } = renderHook(() => useAgentsHeaderMenu());
+    expect(result.current).toEqual([
+      { kind: "action", action: "agents.useToolWindow", icon: "", checked: true },
+      { kind: "action", action: "agents.useEditor", icon: "", checked: false },
+      { kind: "separator" },
+      { kind: "action", action: "agents.newTaskGroup", label: "New Group…", icon: "plus" },
+      { kind: "action", action: "agents.importSessions", icon: "download" },
+    ]);
+  });
+
+  it("lists Import Sessions from Other Apps in Find Action", () => {
+    const action = taskActions.find((a) => a.id === "agents.importSessions");
+    expect(action?.hidden).toBeFalsy();
+    expect(action?.when).toBe("projectOpen");
+    act(() => void action?.run({} as never));
+    expect(useAgents.getState().importOpen).toBe(true);
+    act(() => useAgents.setState({ importOpen: false }));
+  });
+
+  it("opens tabs as usual without a docked conversation", () => {
+    setup();
+    expect(screen.queryByRole("button", { name: "Open in Editor" })).toBeNull();
+    select("two");
+    expect(openTask).toHaveBeenCalledWith("two");
+    expect(dockTask).not.toHaveBeenCalled();
   });
 });
 
@@ -219,5 +376,217 @@ describe("Agents bulk actions", () => {
     await taskActions.find((action) => action.id === "agents.deleteTasks")!.run({ ctx: {}, arg: ["one", "two"] });
     expect(deleteTask).toHaveBeenCalledTimes(2);
     expect(showError).toHaveBeenCalledWith("Cannot delete agent tasks", "one: Cannot remove worktree");
+  });
+});
+
+describe("Agents task menu", () => {
+  it.each([null, "one"])("keeps placement out of session menus (docked: %s)", (docked) => {
+    useAgents.setState({ docked });
+    const menu = taskMenu([useAgents.getState().tasks.get("one")!]);
+    expect(menu).not.toContainEqual(expect.objectContaining({ action: "agents.dockTask" }));
+    expect(menu).not.toContainEqual(expect.objectContaining({ action: "agents.undockTask" }));
+    // A click opens the task: the menu doesn't repeat it.
+    expect(menu).not.toContainEqual(expect.objectContaining({ action: "agents.openTask" }));
+    expect(menu[0]).toMatchObject({ action: "agents.renameTask" });
+  });
+
+  it("offers Terminal for worktree or off-root tasks and hides it for local-checkout tasks at the project root", () => {
+    const localMenu = taskMenu([{ ...task("one", "ready", "local"), projectRoot: "/project", cwd: "/project" }]);
+    expect(localMenu).not.toContainEqual(expect.objectContaining({ action: "terminal.openAt" }));
+
+    const worktree = { ...task("two", "ready", "worktree"), cwd: "/worktrees/two" };
+    const worktreeMenu = taskMenu([worktree]);
+    expect(worktreeMenu).toContainEqual(
+      expect.objectContaining({ action: "terminal.openAt", label: "Terminal", arg: "/worktrees/two" }),
+    );
+
+    const subfolder = { ...task("three", "ready", "local"), projectRoot: "/project", cwd: "/project/packages/api" };
+    const subfolderMenu = taskMenu([subfolder]);
+    expect(subfolderMenu).toContainEqual(
+      expect.objectContaining({ action: "terminal.openAt", label: "Terminal", arg: "/project/packages/api" }),
+    );
+  });
+});
+
+describe("Agents drag & drop", () => {
+  it("docks a session editor tab dropped on the tool window and highlights while it hovers", () => {
+    editor.tabInput = (paneId, tabId) =>
+      paneId === "p" && tabId === "t" ? { kind: SESSION_KIND, key: "agent:one", data: { task: "one" } } : null;
+    setup();
+    const view = document.querySelector(`.${styles.view}`)!;
+    const restore = pointAt(view);
+    try {
+      const session = dragSession({ type: EDITOR_TAB_MIME, payload: JSON.stringify({ paneId: "p", tabId: "t" }) });
+      act(() => session.move(10, 10));
+      expect(view.className).toContain(styles.dropTarget);
+      act(() => session.drop(10, 10));
+      expect(actions.executeAction).toHaveBeenCalledWith("agents.dockTask", "one");
+      expect(dockTask).toHaveBeenCalledWith("one");
+      expect(view.className).not.toContain(styles.dropTarget);
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores editor tab drags that are not agent sessions", () => {
+    editor.tabInput = () => null;
+    setup();
+    const view = document.querySelector(`.${styles.view}`)!;
+    const restore = pointAt(view);
+    try {
+      const session = dragSession({ type: EDITOR_TAB_MIME, payload: JSON.stringify({ paneId: "p", tabId: "t" }) });
+      act(() => session.move(10, 10));
+      expect(view.className).not.toContain(styles.dropTarget);
+      act(() => session.drop(10, 10));
+      expect(dockTask).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("Agents pinned and grouped tasks", () => {
+  const frontend = { id: "g1", name: "Frontend" };
+
+  it("pins a task above the groups, and unpins it from the same menu", async () => {
+    setup();
+    context("two");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin" }));
+    await waitFor(() => expect(useAgents.getState().organize.pinned).toEqual(["two"]));
+    const rows = treeRows();
+    expect(rows[0]).toContain("Pinned");
+    expect(rows[1]).toContain("two");
+    // Pinned tasks are out of their status group.
+    expect(rows.filter((text) => text.includes("two"))).toHaveLength(1);
+
+    context("two");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin" }));
+    await waitFor(() => expect(useAgents.getState().organize.pinned).toEqual([]));
+    expect(treeRows().some((text) => text.includes("Pinned"))).toBe(false);
+  });
+
+  it("filters every section by the search, archived ones included, and highlights the match", () => {
+    const tasks = useAgents.getState().tasks;
+    const rename = (id: string, title: string, status: AgentTask["status"] = "ready") =>
+      tasks.set(id, { ...tasks.get(id)!, title, status });
+    rename("one", "Fix the lexer");
+    rename("two", "Refactor parser");
+    rename("three", "Lexer cleanup", "archived");
+    useAgents.setState({ tasks: new Map(tasks), organize: { groups: [frontend], groupOf: { two: "g1" }, pinned: [] } });
+    setup();
+    const field = screen.getByLabelText("Search tasks");
+    fireEvent.change(field, { target: { value: "lxr" } });
+    const rows = treeRows();
+    expect(rows.some((text) => text.includes("Fix the lexer"))).toBe(true);
+    // Archived is collapsed by default; a search looks inside it.
+    expect(rows.some((text) => text.includes("Lexer cleanup"))).toBe(true);
+    // The user group has no match: it goes.
+    expect(rows.some((text) => text.includes("Frontend") || text.includes("Refactor parser"))).toBe(false);
+    const lexer = screen.getAllByRole("treeitem").find((item) => item.textContent?.includes("Fix the lexer"))!;
+    expect([...lexer.querySelectorAll("mark")].map((m) => m.textContent).join("")).toBe("lxr");
+
+    fireEvent.change(field, { target: { value: "nothing like it" } });
+    expect(screen.getByText("No matching tasks")).toBeInTheDocument();
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(treeRows().some((text) => text.includes("Frontend"))).toBe(true);
+  });
+
+  it("shows a user group above the status groups, without its tasks in them too", () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: { two: "g1" }, pinned: [] } });
+    setup();
+    const rows = treeRows();
+    expect(rows[0]).toContain("Frontend");
+    expect(rows[1]).toContain("two");
+    expect(rows.filter((text) => text.includes("two"))).toHaveLength(1);
+    // The others stay under their status group.
+    expect(rows.some((text) => text.includes("one"))).toBe(true);
+  });
+
+  it("offers the groups, a new one and a way out in Move to Group", () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: { two: "g1" }, pinned: [] } });
+    const menu = taskMenu([useAgents.getState().tasks.get("two")!]);
+    const move = menu.find((item) => "label" in item && item.label === "Move to Group");
+    expect(move).toBeDefined();
+    const submenu = (move as { submenu: { label?: string; checked?: boolean }[] }).submenu;
+    expect(submenu.map((item) => item.label ?? "separator")).toEqual([
+      "Frontend",
+      "separator",
+      "New Group…",
+      "Remove from Group",
+    ]);
+    expect(submenu[0]).toMatchObject({ checked: true });
+  });
+
+  it("moves a pinned task into a group, out of the pinned section", () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: {}, pinned: ["two"] } });
+    const menu = taskMenu([useAgents.getState().tasks.get("two")!]);
+    const move = menu.find((item) => "label" in item && item.label === "Move to Group") as {
+      submenu: { label?: string; run?: () => void }[];
+    };
+    act(() => move.submenu.find((item) => item.label === "Frontend")!.run!());
+    expect(useAgents.getState().organize.groupOf.two).toBe("g1");
+    expect(useAgents.getState().organize.pinned).toEqual([]);
+  });
+
+  it("creates a group with the selected tasks", async () => {
+    vi.mocked(promptInput).mockResolvedValueOnce("Docs");
+    await taskActions.find((action) => action.id === "agents.newTaskGroup")!.run({ ctx: {}, arg: ["two"] });
+    const { organize } = useAgents.getState();
+    expect(organize.groups.map((group) => group.name)).toEqual(["Docs"]);
+    expect(organize.groupOf.two).toBe(organize.groups[0]!.id);
+    expect(promptInput).toHaveBeenCalledWith(expect.objectContaining({ title: "New Group" }));
+  });
+
+  it("removes a group from its row menu, returning its tasks to the status groups", async () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: { two: "g1" }, pinned: [] } });
+    setup();
+    const groupRow = screen.getByText("Frontend").closest('[role="treeitem"]')!;
+    fireEvent.mouseDown(groupRow, { button: 2 });
+    fireEvent.contextMenu(groupRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove Group" }));
+    await waitFor(() => expect(useAgents.getState().organize.groups).toEqual([]));
+    expect(useAgents.getState().organize.groupOf).toEqual({});
+    expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ title: "Remove Group" }));
+    await waitFor(() => expect(screen.queryByText("Frontend")).toBeNull());
+  });
+
+  it("renames a group from its row menu, trimming the name given", async () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: {}, pinned: [] } });
+    setup();
+    vi.mocked(promptInput).mockResolvedValueOnce(" Web ");
+    const groupRow = screen.getByText("Frontend").closest('[role="treeitem"]')!;
+    fireEvent.mouseDown(groupRow, { button: 2 });
+    fireEvent.contextMenu(groupRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename Group…" }));
+    await waitFor(() => expect(useAgents.getState().organize.groups[0]!.name).toBe("Web"));
+    expect(screen.getByText("Web")).toBeTruthy();
+  });
+
+  it("puts a task dropped on a group header into that group", () => {
+    useAgents.setState({ organize: { groups: [frontend], groupOf: {}, pinned: [] } });
+    setup();
+    const restore = pointAt(screen.getByText("Frontend"));
+    try {
+      const session = dragSession({ type: TASK_DRAG, payload: "two" });
+      act(() => session.move(10, 10));
+      act(() => session.drop(10, 10));
+      expect(useAgents.getState().organize.groupOf.two).toBe("g1");
+    } finally {
+      restore();
+    }
+  });
+
+  it("pins a task dropped on the pinned header", () => {
+    useAgents.setState({ organize: { groups: [], groupOf: {}, pinned: ["one"] } });
+    setup();
+    const restore = pointAt(screen.getByText("Pinned"));
+    try {
+      const session = dragSession({ type: TASK_DRAG, payload: "two" });
+      act(() => session.move(10, 10));
+      act(() => session.drop(10, 10));
+      expect(useAgents.getState().organize.pinned).toEqual(["one", "two"]);
+    } finally {
+      restore();
+    }
   });
 });

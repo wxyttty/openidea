@@ -49,21 +49,60 @@ export function mergeDiagnostics(
 
 const SEVERITY_ORDER: Record<Severity, number> = { error: 0, warning: 1, info: 2, hint: 3 };
 
+// A file's sources map is replaced whenever its diagnostics change, so it keys the merged list.
+const merged = new WeakMap<FileDiagnostics, readonly Diagnostic[]>();
+
 /** All diagnostics of a file across sources, ordered by position then severity. */
-export function fileDiagnostics(map: ProblemsMap, path: string): Diagnostic[] {
+export function fileDiagnostics(map: ProblemsMap, path: string): readonly Diagnostic[] {
   const sources = map.get(path);
   if (!sources) return [];
-  return [...sources.values()]
-    .flat()
-    .sort(
-      (a, b) =>
-        a.range.start.line - b.range.start.line ||
-        a.range.start.col - b.range.start.col ||
-        SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
-    );
+  let items = merged.get(sources);
+  if (!items) {
+    items = [...sources.values()]
+      .flat()
+      .sort(
+        (a, b) =>
+          a.range.start.line - b.range.start.line ||
+          a.range.start.col - b.range.start.col ||
+          SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
+      );
+    merged.set(sources, items);
+  }
+  return items;
 }
 
 /** The producer (inspection) that reported `d`, one of `path`'s problems in `map`. */
+/**
+ * The file the Problems "File" tab shows: the active text editor's, or the active tab's
+ * own path when it is another editor kind (a notebook keeps its cells' diagnostics there).
+ */
+export function currentProblemsPath(
+  textPath: string | null,
+  activeInput: { kind: string; path?: string | null } | null,
+): string | null {
+  if (activeInput && activeInput.kind !== "file" && activeInput.kind !== "virtual" && activeInput.path)
+    return activeInput.path;
+  return textPath;
+}
+
+const CELL_SCHEME = "vscode-notebook-cell:";
+
+/** The notebook a cell's diagnostics key (`vscode-notebook-cell:<notebook path>#<cell>`) belongs to. */
+function cellNotebook(key: string): string | null {
+  if (!key.startsWith(CELL_SCHEME)) return null;
+  const rest = key.slice(CELL_SCHEME.length);
+  const hash = rest.indexOf("#");
+  const path = decodeURIComponent(hash < 0 ? rest : rest.slice(0, hash));
+  return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
+}
+
+/** The diagnostics keys of one file: the file itself and, for a notebook, its cells. */
+export function filePaths(map: ProblemsMap, path: string): string[] {
+  const out = map.has(path) ? [path] : [];
+  for (const key of map.keys()) if (cellNotebook(key) === path) out.push(key);
+  return out;
+}
+
 export function producerFor(map: ProblemsMap, path: string, d: Diagnostic): string | null {
   for (const [source, items] of map.get(path) ?? []) if (items.includes(d)) return source;
   return null;
@@ -127,21 +166,34 @@ interface ProblemsState {
   raw: ProblemsMap;
   /** What the views show. */
   map: ProblemsMap;
+  /** `projectCounts(map)`, kept up to date per event. */
+  counts: SeverityCounts;
 }
 
-export const useProblems = create<ProblemsState>(() => ({ raw: new Map(), map: new Map() }));
+const NO_COUNTS: SeverityCounts = { error: 0, warning: 0, info: 0, hint: 0 };
+
+export const useProblems = create<ProblemsState>(() => ({ raw: new Map(), map: new Map(), counts: NO_COUNTS }));
+
+function recount(counts: SeverityCounts, removed: readonly Diagnostic[], added: readonly Diagnostic[]) {
+  const c = { ...counts };
+  for (const d of removed) c[d.severity]--;
+  for (const d of added) c[d.severity]++;
+  return c;
+}
 
 export function applyDiagnosticsEvent(path: string, source: string, items: readonly Diagnostic[]) {
   useProblems.setState((s) => {
     const raw = mergeDiagnostics(s.raw, path, source, items);
     if (raw === s.raw) return s;
     const map = mergeDiagnostics(s.map, path, source, applyProfile(inspectionProfile(), source, items));
-    return { raw, map };
+    if (map === s.map) return { raw };
+    const before = s.map.get(path)?.get(source) ?? [];
+    return { raw, map, counts: recount(s.counts, before, map.get(path)?.get(source) ?? []) };
   });
 }
 
 export function clearProblems() {
-  useProblems.setState({ raw: new Map(), map: new Map() });
+  useProblems.setState({ raw: new Map(), map: new Map(), counts: NO_COUNTS });
 }
 
 export function installProblemsEvents(): () => void {
@@ -149,11 +201,36 @@ export function installProblemsEvents(): () => void {
   // Typo, file references, SQL: inspections the editor runs itself.
   const offLocal = onLocalDiagnostics(applyDiagnosticsEvent);
   const offProfile = subscribeInspectionProfile(() =>
-    useProblems.setState((s) => ({ map: profiledProblems(s.raw, inspectionProfile()) })),
+    useProblems.setState((s) => {
+      const map = profiledProblems(s.raw, inspectionProfile());
+      return { map, counts: projectCounts(map) };
+    }),
   );
   return () => {
     off();
     offLocal();
     offProfile();
   };
+}
+
+/**
+ * Errors and warnings as `rel:line:col: severity: message (source)` lines, errors first, at most
+ * `max`; null when there are none. For an agent's context.
+ */
+export function problemsReport(map: ProblemsMap, root: string, max = 60): string | null {
+  const rows: { severity: Severity; text: string }[] = [];
+  for (const path of map.keys()) {
+    const rel = path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path;
+    for (const d of fileDiagnostics(map, path)) {
+      if (d.severity !== "error" && d.severity !== "warning") continue;
+      const at = `${rel}:${d.range.start.line + 1}:${d.range.start.col + 1}`;
+      const source = d.source ? ` (${d.source})` : "";
+      rows.push({ severity: d.severity, text: `${at}: ${d.severity}: ${d.message.split("\n")[0]}${source}` });
+    }
+  }
+  if (!rows.length) return null;
+  rows.sort((a, b) => Number(a.severity !== "error") - Number(b.severity !== "error"));
+  const shown = rows.slice(0, max).map((r) => r.text);
+  if (rows.length > max) shown.push(`… ${rows.length - max} more`);
+  return shown.join("\n");
 }
