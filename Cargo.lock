@@ -6828,6 +6828,7 @@ dependencies = [
  "ide-lsp",
  "ide-notebook",
  "ide-plugin",
+ "ide-remote",
  "ide-run",
  "ide-search",
  "ide-terminal",

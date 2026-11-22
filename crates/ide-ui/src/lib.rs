@@ -27,6 +27,7 @@ pub mod breakpoints;
 pub mod db;
 pub mod debug;
 pub mod dock;
+pub mod deploy;
 pub mod diff;
 pub mod duplicates;
 pub mod editor;

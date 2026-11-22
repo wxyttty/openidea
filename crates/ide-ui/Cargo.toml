@@ -29,6 +29,7 @@ ide-notebook.workspace = true
 ide-analysis.workspace = true
 ide-language.workspace = true
 ide-tools.workspace = true
+ide-remote.workspace = true
 encoding_rs.workspace = true
 ide-plugin.workspace = true
 lsp-types.workspace = true
@@ -45,5 +46,6 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 tokio.workspace = true
 ide-language.workspace = true
 ide-tools.workspace = true
+ide-remote.workspace = true
 encoding_rs.workspace = true
 tempfile.workspace = true

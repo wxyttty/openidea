@@ -62,6 +62,7 @@ gpui_kit::actions!(
         ShowStructural,
         ShowStructure,
         ShowSsh,
+        ShowDeploy,
         Undo,
         Redo,
         Cut,
