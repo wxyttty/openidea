@@ -438,7 +438,7 @@ enum BottomTab {
 }
 
 impl BottomTab {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             BottomTab::Problems => "Problems",
             BottomTab::Terminal => "Terminal",
@@ -1486,6 +1486,65 @@ impl Workbench {
             }
         }
         self.editor.update(cx, |editor, cx| editor.open_file(argument, window, cx));
+        cx.notify();
+    }
+
+    /// Whether a project is open.
+    pub fn has_project(&self) -> bool {
+        self.project.is_some()
+    }
+
+    /// The status bar's message.
+    pub fn status_text(&self) -> String {
+        self.status.to_string()
+    }
+
+    /// Selects a bottom tool window by its label, as the View menu does.
+    pub fn select_bottom_by_label(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = match label {
+            "Problems" => BottomTab::Problems,
+            "Terminal" => BottomTab::Terminal,
+            "Diff" => BottomTab::Diff,
+            "Run" => BottomTab::Run,
+            "Debug" => BottomTab::Debug,
+            "Database" => BottomTab::Db,
+            "HTTP" => BottomTab::Http,
+            "Notebook" => BottomTab::Notebook,
+            "Agents" => BottomTab::Agents,
+            "Duplicates" => BottomTab::Duplicates,
+            "Structural Search" => BottomTab::Structural,
+            "Structure" => BottomTab::Structure,
+            "SSH" => BottomTab::Ssh,
+            "Deployment" => BottomTab::Deploy,
+            "Remote Host" => BottomTab::RemoteHost,
+            _ => BottomTab::Notifications,
+        };
+        self.show_bottom = true;
+        self.bottom = tab;
+        self.sync_dock_selection(window, cx);
+        cx.notify();
+    }
+
+    /// Opens the Settings dialog (what File › Settings does).
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(Cmd::Settings, window, cx);
+    }
+
+    /// The label of the selected bottom tool window.
+    pub fn selected_bottom_label(&self) -> &'static str {
+        self.bottom.label()
+    }
+
+    /// Whether the Terminal tool window is selected.
+    pub fn terminal_is_selected(&self) -> bool {
+        self.bottom == BottomTab::Terminal
+    }
+
+    /// Suppresses notifications with `title` (what a balloon's "Don't show
+    /// again" button does).
+    pub fn suppress_title(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.suppressed.suppress(title);
+        self.notifications.update(cx, |log, cx| log.suppress(title.to_owned(), cx));
         cx.notify();
     }
 
@@ -2605,6 +2664,7 @@ impl Workbench {
             bar = bar.child(
                 div()
                     .id(ElementId::Name(format!("menu-{}", kind.label()).into()))
+                    .test_support()
                     .h(px(22.))
                     .px_2()
                     .flex()
@@ -2864,8 +2924,16 @@ impl Workbench {
             .border_t_1()
             .border_color(theme.status_bar_border)
             .text_size(px(11.));
-        bar =
-            bar.child(div().flex_1().min_w_0().truncate().text_color(theme.fg_secondary()).child(self.status.clone()));
+        bar = bar.child(
+            div()
+                .id("status-message")
+                .test_support()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.fg_secondary())
+                .child(self.status.clone()),
+        );
         if let Some(branch) = self.vcs.read(cx).branch() {
             bar = bar.child(
                 div()
@@ -2962,6 +3030,7 @@ impl Workbench {
                     .child(
                         div()
                             .id("welcome-new-project")
+                            .test_support()
                             .h(px(28.))
                             .px_3()
                             .flex()
@@ -3862,6 +3931,7 @@ impl Render for Workbench {
                         .child(
                             div()
                                 .id("settings-done")
+                                .test_support()
                                 .px_3()
                                 .py_1()
                                 .rounded(px(4.))
